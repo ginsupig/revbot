@@ -1,0 +1,125 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+
+
+class MLSignalLearner:
+    def __init__(self):
+        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+
+    def prepare_features(self, bars):
+        bars = bars.copy()
+        close = bars["close"].astype(float)
+
+        fast_sma = close.rolling(window=9).mean()
+        slow_sma = close.rolling(window=21).mean()
+        # Normalize SMAs relative to close so features are price-scale invariant
+        bars["fast_sma_ratio"] = fast_sma / close.replace(0.0, np.nan) - 1.0
+        bars["slow_sma_ratio"] = slow_sma / close.replace(0.0, np.nan) - 1.0
+        bars["sma_diff_ratio"] = (fast_sma - slow_sma) / close.replace(0.0, np.nan)
+
+        bars["volatility_pct"] = close.rolling(window=14).std() / close.replace(0.0, np.nan)
+
+        bars["rsi"] = self.compute_rsi(close, window=14)
+
+        ema_fast = close.ewm(span=12, adjust=False).mean()
+        ema_slow = close.ewm(span=26, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+        # Normalize MACD by close price
+        bars["macd_line_ratio"] = macd_line / close.replace(0.0, np.nan)
+        bars["macd_signal_ratio"] = macd_signal / close.replace(0.0, np.nan)
+        bars["macd_hist_ratio"] = (macd_line - macd_signal) / close.replace(0.0, np.nan)
+
+        bars["momentum_pct"] = (close - close.shift(10)) / close.shift(10).replace(0.0, np.nan)
+
+        trend_ema = close.ewm(span=50, adjust=False).mean()
+        bars["trend_following"] = (
+            (close > trend_ema) & (macd_line > macd_signal)
+        ).astype(int)
+        bars["trend_ema_ratio"] = trend_ema / close.replace(0.0, np.nan) - 1.0
+
+        if "volume" not in bars.columns:
+            bars["volume"] = 0
+        avg_vol = bars["volume"].rolling(window=20).mean().replace(0.0, np.nan)
+        bars["volume_ratio"] = bars["volume"].astype(float) / avg_vol
+
+        bars["high_low_pct"] = (bars["high"].astype(float) - bars["low"].astype(float)) / close.replace(0.0, np.nan)
+        bars["close_open_pct"] = (close - bars["open"].astype(float)) / bars["open"].astype(float).replace(0.0, np.nan)
+
+        rolling_max = close.rolling(window=20).max()
+        rolling_min = close.rolling(window=20).min()
+        bars["price_position"] = (close - rolling_min) / (rolling_max - rolling_min + 1e-9)
+
+        bars["return"] = close.pct_change().shift(-1)
+        bars["target"] = np.where(bars["return"] > 0, 1, 0)
+
+        bars = bars.dropna()
+
+        X = bars[
+            [
+                "fast_sma_ratio",
+                "slow_sma_ratio",
+                "sma_diff_ratio",
+                "volatility_pct",
+                "rsi",
+                "macd_line_ratio",
+                "macd_signal_ratio",
+                "macd_hist_ratio",
+                "momentum_pct",
+                "trend_following",
+                "trend_ema_ratio",
+                "volume_ratio",
+                "high_low_pct",
+                "close_open_pct",
+                "price_position",
+            ]
+        ]
+        y = bars["target"]
+
+        return X, y
+
+    @staticmethod
+    def compute_rsi(series, window=14):
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0).rolling(window=window).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.fillna(50.0)
+
+    def fit(self, bars):
+        X, y = self.prepare_features(bars)
+        if len(X) >= 10 and y.nunique() >= 2:
+            self.model.fit(X, y)
+
+    def predict(self, bars):
+        X, _ = self.prepare_features(bars)
+        if len(X) == 0:
+            return np.array([])
+        return self.model.predict(X)
+
+    def predict_proba(self, bars):
+        X, _ = self.prepare_features(bars)
+        if len(X) == 0:
+            return np.array([])
+        try:
+            proba = self.model.predict_proba(X)
+            return proba
+        except Exception:
+            return np.array([])
+
+    def safe_predict_proba(self, X) -> float:
+        """Return P(class=1) for the last row of X, defaulting to 0.5 on any error."""
+        try:
+            if not hasattr(self.model, "classes_"):
+                return 0.5
+            proba = self.model.predict_proba(X)
+            if len(proba) == 0:
+                return 0.5
+            row = proba[-1]
+            if len(row) < 2:
+                return 0.5
+            return float(row[1])
+        except Exception:
+            return 0.5

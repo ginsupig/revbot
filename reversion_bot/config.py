@@ -1,0 +1,103 @@
+from __future__ import annotations
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ReversionConfig:
+    trendfail_window: int = 20
+    trendfail_threshold: float = 0.005
+    band_length: int = 20
+    band_std_1: float = 1.0
+    band_std_2: float = 2.0
+    ri_length: int = 20
+    ri_threshold: float = -0.5
+
+    adx_length: int = 14
+    adx_max: float = 40.0
+    adx_hard_max: float = 50.0
+
+    rsi_length: int = 14
+    rsi_max: float = 48.0
+    rsi_hard_max: float = 70.0
+
+    min_history: int = 160
+
+    require_reclaim_lb1: bool = False
+    require_bullish_close: bool = False
+    require_volume_expansion: bool = False
+
+    volume_lookback: int = 20
+    volume_multiplier_min: float = 1.0
+
+    use_vwap_filter: bool = False
+    max_vwap_extension_pct: float = 0.012
+
+    use_trend_filter: bool = False
+    trend_ema_length: int = 50
+
+    max_spread_bps: float = 40.0
+    min_dollar_volume: float = 750_000.0
+    min_price: float = 5.0
+
+
+@dataclass(frozen=True)
+class RiskConfig:
+    risk_per_trade_pct: float = 0.005
+    max_position_value_pct: float = 0.20
+
+    stop_atr_multiple: float = 1.20
+    target_atr_multiple: float = 2.00
+
+    trend_stop_atr_multiple: float = 1.20
+    trend_target_atr_multiple: float = 3.00
+
+    trendfail_stop_atr_multiple: float = 1.10
+    trendfail_target_atr_multiple: float = 2.20
+
+    min_rr: float = 1.00
+
+    atr_length: int = 14
+    atr_floor_pct: float = 0.0035
+
+    round_lot: int = 1
+    min_qty: int = 1
+    min_position_value: float = 100.0
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    slippage_bps_buffer: float = 5.0
+    limit_entry_offset_bps: float = 8.0
+    use_limit_entry: bool = False
+    tif: str = "day"
+    paper: bool = True
+    base_url: str = ""
+
+
+@dataclass(frozen=True)
+class PerformanceConfig:
+    state_dir: str = "state/performance"
+    enable_adaptive_threshold: bool = True
+    min_samples: int = 20
+    max_threshold_adj: float = 0.05
+
+
+@dataclass(frozen=True)
+class PortfolioConfig:
+    max_open_positions: int = 4
+    max_trades_per_cycle: int = 2
+    max_total_exposure_pct: float = 0.95
+    max_positions_per_bucket: int = 2
+
+    max_portfolio_heat_pct: float = 0.02
+    max_daily_new_positions: int = 12
+    max_reversion_positions: int = 3
+    max_trend_positions: int = 2
+    max_trendfail_positions: int = 1
+    max_positions_per_regime: int = 3
+
+    drawdown_pause_pct: float = 0.025
+    reduce_size_after_drawdown_pct: float = 0.01
+    reduced_risk_multiplier: float = 0.60
+
+    symbol_cooldown_minutes: int = 30

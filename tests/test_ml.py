@@ -12,7 +12,10 @@ def test_ml_signal_learner_fit_predict():
     np.random.seed(42)
     close = np.cumsum(np.random.randn(n)) + 100
     volume = np.random.randint(1000, 2000, n)
-    df = pd.DataFrame({'close': close, 'volume': volume})
+    open_ = close + np.random.normal(0, 0.1, n)
+    high = np.maximum(open_, close) + 0.1
+    low = np.minimum(open_, close) - 0.1
+    df = pd.DataFrame({'open': open_, 'high': high, 'low': low, 'close': close, 'volume': volume})
     learner = MLSignalLearner()
     learner.fit(df)
     # Prepare features to get the number of valid rows after dropna

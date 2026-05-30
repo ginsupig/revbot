@@ -36,3 +36,5 @@ state/
 
 # Generated backtest artifacts
 backtest_equity.png
+backtest_equity.png
+__pycache__/

@@ -16,7 +16,10 @@ class AlpacaExecutor:
 
         self.client = REST(api_key, secret_key, exec_config.base_url)
         self._order_ids = set()
-        self._tif = "day"
+        self._tif = getattr(exec_config, "tif", "day") or "day"
+        # Limit-entry settings (important for wide-spread leveraged ETFs).
+        self._use_limit_entry = bool(getattr(exec_config, "use_limit_entry", False))
+        self._limit_entry_offset_bps = float(getattr(exec_config, "limit_entry_offset_bps", 8.0))
 
     def scan_symbols(self, min_price=5.0, min_dollar_volume=750000.0, max_count=30):
         """
@@ -109,6 +112,14 @@ class AlpacaExecutor:
             "take_profit": {"limit_price": round(plan.target_price, 2)},
             "stop_loss": {"stop_price": round(plan.stop_price, 2)}
         }
+
+        # Use a marketable limit entry to cap slippage on wide-spread (leveraged) names.
+        # Buy limit is set slightly ABOVE the planned entry so it still crosses the
+        # spread and fills, while bounding the worst-case fill price.
+        if self._use_limit_entry:
+            limit_price = round(plan.entry_price * (1.0 + self._limit_entry_offset_bps / 10_000.0), 2)
+            order_data["type"] = "limit"
+            order_data["limit_price"] = limit_price
 
         response = self.client.submit_order(**order_data)
         self._order_ids.add(order_key)

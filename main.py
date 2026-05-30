@@ -100,9 +100,17 @@ async def execute_candidates(governor, executor, portfolio_state, candidates):
 # --- EOD Liquidation ---
 
 def is_eod_liquidation_window() -> bool:
-    """True during the last 10 minutes of the trading day (2:50–3:00 PM CT)."""
+    """True during the final stretch before the regular close (3:00 PM CT / 4:00 PM ET).
+
+    Window length is configurable via EOD_LIQUIDATION_MINUTES (minutes before close
+    to start flattening; default 10). Note: assumes the regular 3:00 PM CT close and
+    does not adjust for half-day early closes.
+    """
+    lead_minutes = int(os.getenv("EOD_LIQUIDATION_MINUTES", 10))
     now_ct = datetime.now(ZoneInfo("America/Chicago"))
-    return now_ct.hour == 14 and now_ct.minute >= 50
+    close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+    start_ct = close_ct - timedelta(minutes=lead_minutes)
+    return start_ct <= now_ct < close_ct
 
 
 async def liquidate_all_positions(executor):

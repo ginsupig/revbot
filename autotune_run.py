@@ -55,7 +55,7 @@ def main():
     if env_symbols:
         symbols = [s.strip() for s in env_symbols.split(',') if s.strip()]
     else:
-        symbols = ["MU", "WDC", "ASTS", "NVDA", "AMD", "SMCI", "CRWD", "AAPL", "TSLA", "APP", "META", "INOD"]
+        symbols = ["TQQQ", "SOXL", "TECL", "NVDL", "TSLL", "AAPU", "METU", "GGLL", "MSFU", "AMZU"]
 
     # Lookback window: CLI arg (days) > AUTOTUNE_DAYS env var > default 30
     days = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.getenv('AUTOTUNE_DAYS', 30))

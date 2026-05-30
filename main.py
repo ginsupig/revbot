@@ -19,17 +19,6 @@ from reversion_bot.governor import ExecutionGovernor
 from reversion_bot.portfolio import PortfolioState
 from run_real_backtest import fetch_alpaca_bars
 
-# --- Trading Universe ---
-# Leveraged tech universe (replaces the dynamic Alpaca market scan).
-#   3x sector/index ETFs: TQQQ (Nasdaq-100), SOXL (Semiconductors), TECL (Tech Select)
-#   2x single-stock ETFs: NVDL (NVDA), TSLL (TSLA), AAPU (AAPL), METU (META),
-#                         GGLL (GOOGL), MSFU (MSFT), AMZU (AMZN)
-# Note: US single-stock leveraged ETFs top out at 2x; only index/sector ETFs offer 3x.
-LEVERAGED_TECH_UNIVERSE = [
-    "TQQQ", "SOXL", "TECL",
-    "NVDL", "TSLL", "AAPU", "METU", "GGLL", "MSFU", "AMZU",
-]
-
 # --- Helper Functions ---
 
 def is_market_open(executor) -> bool:
@@ -196,13 +185,18 @@ async def main():
 
     # 3. Initialize Executor and Symbol List
     executor = AlpacaExecutor(api_key, api_secret, exec_config)
+    
+    # Attempt dynamic scan
+    symbols = executor.scan_symbols(
+        min_price=strategy_config.min_price,
+        min_dollar_volume=strategy_config.min_dollar_volume,
+        max_count=20
+    )
 
-    # Fixed leveraged tech universe (dynamic scan replaced). Override via TRADE_SYMBOL.
-    env_symbols = os.getenv("TRADE_SYMBOL", "")
-    if env_symbols:
-        symbols = [s.strip().upper() for s in env_symbols.split(",") if s.strip()]
-    else:
-        symbols = list(LEVERAGED_TECH_UNIVERSE)
+    # Patched: Clean fallback watchlist with high-probability mean-reversion tickers
+    if not symbols:
+        print("[WARN] Scanner returned no symbols. Using fallback watchlist.")
+        symbols = ["MU", "WDC", "ASTS", "NVDA", "AMD", "SMCI", "CRWD", "AAPL", "TSLA", "APP", "META", "INOD"]
 
     # 4. Initialize Remaining Services
     perf_config = PerformanceConfig(state_dir="state/performance")

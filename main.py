@@ -192,10 +192,6 @@ async def main():
     exec_config = ExecutionConfig(
         paper=True if "paper" in base_url.lower() else False,
         base_url=base_url,
-        # Leveraged ETFs trade with wide spreads -> default to marketable limit entries.
-        use_limit_entry=parse_bool(os.getenv("USE_LIMIT_ENTRY", "True")),
-        limit_entry_offset_bps=float(os.getenv("LIMIT_ENTRY_OFFSET_BPS", 8.0)),
-        tif=os.getenv("TRADE_TIF", "day"),
     )
 
     # 3. Initialize Executor and Symbol List

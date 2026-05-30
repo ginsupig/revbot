@@ -33,3 +33,6 @@ build/
 
 # State files (runtime data)
 state/
+
+# Generated backtest artifacts
+backtest_equity.png

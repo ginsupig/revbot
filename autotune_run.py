@@ -11,16 +11,16 @@ load_dotenv()
 
 # Maps walk-forward param names to .env keys
 PARAM_TO_ENV = {
-    'band_length':  'BAND_LENGTH',
-    'band_std_1':   'BAND_STD_1',
-    'band_std_2':   'BAND_STD_2',
-    'ri_threshold': 'RI_THRESHOLD',
-    'rsi_max':      'RSI_MAX',
-    'adx_max':      'ADX_MAX',
-    'min_history':  'TRADE_LOOKBACK',
+    'band_length':            'BAND_LENGTH',
+    'ri_threshold':           'RI_THRESHOLD',
+    'use_vwap_filter':        'USE_VWAP_FILTER',
+    'max_vwap_extension_pct': 'MAX_VWAP_EXTENSION_PCT',
+    'rsi_max':                'RSI_MAX',
+    'min_history':            'TRADE_LOOKBACK',
 }
 
 INTEGER_PARAMS = {'band_length', 'min_history'}
+BOOL_PARAMS = {'use_vwap_filter'}
 
 
 def update_env_file(env_path, updates):
@@ -68,14 +68,16 @@ def main():
 
     print(f"Autotune | symbols={len(symbols)} | window={days}d ({start} → {end})")
 
+    # Task 4: tune deep-oversold RI x VWAP extension (the dimensions that matter
+    # for fast 3x leveraged assets), not the lagging Bollinger width. Centered so
+    # the optimum sits inside the grid and folds actually contain trades.
     param_grid = {
-        'band_length':  [20, 50],
-        'band_std_1':   [1.5, 2.0],
-        'band_std_2':   [2.5, 3.0],
-        'ri_threshold': [-1.0, -0.5, 0.0],
-        'rsi_max':      [30, 35],
-        'adx_max':      [25, 30],
-        'min_history':  [160],
+        'band_length':            [20],
+        'ri_threshold':           [-1.0, -0.5, 0.0],
+        'use_vwap_filter':        [True],
+        'max_vwap_extension_pct': [0.008, 0.012, 0.018, 0.025],
+        'rsi_max':                [35, 48],
+        'min_history':            [160],
     }
 
     all_best_params = []
@@ -108,12 +110,16 @@ def main():
         print("\nNo valid results — .env not updated.")
         return
 
-    # Aggregate: median across all symbols for each tunable param
+    # Aggregate across symbols: median for numerics, majority vote for bools.
     aggregated = {}
     for param in PARAM_TO_ENV:
         values = [p[param] for p in all_best_params if param in p]
-        if values:
-            aggregated[param] = np.median(values)
+        if not values:
+            continue
+        if param in BOOL_PARAMS:
+            aggregated[param] = sum(bool(v) for v in values) >= (len(values) / 2)
+        else:
+            aggregated[param] = float(np.median([float(v) for v in values]))
 
     # Format for .env
     env_updates = {}
@@ -121,7 +127,14 @@ def main():
         if param not in aggregated:
             continue
         val = aggregated[param]
-        env_updates[env_key] = str(int(round(val))) if param in INTEGER_PARAMS else f"{val:.1f}"
+        if param in BOOL_PARAMS:
+            env_updates[env_key] = "True" if val else "False"
+        elif param in INTEGER_PARAMS:
+            env_updates[env_key] = str(int(round(val)))
+        else:
+            # General float formatting (e.g. RI -1.0, VWAP 0.012) without
+            # truncating small fractions to a single decimal.
+            env_updates[env_key] = f"{val:g}"
 
     print("\n--- Aggregated best params (median across symbols) ---")
     for env_key, val in env_updates.items():

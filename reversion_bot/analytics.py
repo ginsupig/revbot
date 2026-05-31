@@ -4,11 +4,29 @@ from typing import Optional
 
 import numpy as np
 
+# Configs that barely trade produce a zero-loss fold -> PF=inf, which lets the
+# optimizer "win" by not trading. Require at least this many round-trip trades
+# for a profit_factor to count; below it, the score is neutralized.
+MIN_TRADES_FOR_SCORE = 5
+
+
+def _trade_count(trades) -> int:
+    """Number of completed round-trip trades (nonzero strategy_return bars)."""
+    col = "strategy_return" if "strategy_return" in trades else "pnl"
+    series = trades[col].dropna()
+    return int((series != 0).sum())
+
+
 def profit_factor(trades):
     gross_profit = trades[trades['pnl'] > 0]['pnl'].sum()
     gross_loss = -trades[trades['pnl'] < 0]['pnl'].sum()
+    # Too few trades to be meaningful -> neutral score, never inf.
+    if _trade_count(trades) < MIN_TRADES_FOR_SCORE:
+        return 0.0
     if gross_loss == 0:
-        return float('inf')
+        # Profitable with no losers but enough trades: cap instead of inf so the
+        # optimizer can still rank it without an unbounded value dominating.
+        return 10.0 if gross_profit > 0 else 0.0
     return gross_profit / gross_loss
 
 def sharpe_ratio(trades, risk_free_rate=0.0):

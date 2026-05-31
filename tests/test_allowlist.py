@@ -1,4 +1,10 @@
-from reversion_bot.allowlist import select_allowlist, parse_allowlist, filter_symbols
+from reversion_bot.allowlist import (
+    select_allowlist,
+    parse_allowlist,
+    filter_symbols,
+    parse_symbol_csv,
+    apply_watchlist,
+)
 
 
 # --- select_allowlist -------------------------------------------------------
@@ -59,3 +65,51 @@ def test_filter_partitions_and_preserves_original_case():
     kept, dropped = filter_symbols(["tqqq", "AMZU", "Tecl"], {"TQQQ", "TECL"})
     assert kept == ["tqqq", "Tecl"]
     assert dropped == ["AMZU"]
+
+
+# --- parse_symbol_csv -------------------------------------------------------
+
+def test_parse_symbol_csv_blank_is_empty_set():
+    assert parse_symbol_csv(None) == set()
+    assert parse_symbol_csv("") == set()
+    assert parse_symbol_csv("  ,  ") == set()
+
+
+def test_parse_symbol_csv_uppercases_and_strips():
+    assert parse_symbol_csv(" poet, avgo ,Pltr") == {"POET", "AVGO", "PLTR"}
+
+
+# --- apply_watchlist --------------------------------------------------------
+
+def test_apply_watchlist_force_includes_missing_names():
+    out = apply_watchlist(["MU", "NVDA"], include={"POET", "AVGO"})
+    assert out[:2] == ["MU", "NVDA"]
+    assert set(out) == {"MU", "NVDA", "POET", "AVGO"}
+
+
+def test_apply_watchlist_excludes_chronic_losers():
+    out = apply_watchlist(["MU", "TSLA", "AMZN"], exclude={"TSLA", "AMZN"})
+    assert out == ["MU"]
+
+
+def test_apply_watchlist_exclude_wins_over_include():
+    out = apply_watchlist(["MU"], include={"AMZN"}, exclude={"AMZN"})
+    assert out == ["MU"]
+
+
+def test_apply_watchlist_dedups_case_insensitively():
+    out = apply_watchlist(["MU", "mu"], include={"MU"})
+    assert out == ["MU"]
+
+
+def test_apply_watchlist_roster_change_keeps_pl():
+    # The real change: add 5, drop the 5 biggest losers but keep PL.
+    universe = ["TSLA", "MU", "WDC", "AMZN", "SOFI", "MP", "PL", "ASTS", "NVDA"]
+    out = apply_watchlist(
+        universe,
+        include={"POET", "AVGO", "RXT", "PLTR", "QBTS"},
+        exclude={"AMZN", "TSLA", "WDC", "MP", "SOFI"},
+    )
+    assert "PL" in out                    # kept on purpose
+    assert not ({"AMZN", "TSLA", "WDC", "MP", "SOFI"} & set(out))
+    assert {"POET", "AVGO", "RXT", "PLTR", "QBTS"} <= set(out)

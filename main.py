@@ -17,7 +17,12 @@ from reversion_bot.execution import AlpacaExecutor
 from reversion_bot.models import PositionPlan
 from reversion_bot.governor import ExecutionGovernor
 from reversion_bot.portfolio import PortfolioState
-from reversion_bot.allowlist import parse_allowlist, filter_symbols
+from reversion_bot.allowlist import (
+    parse_allowlist,
+    filter_symbols,
+    parse_symbol_csv,
+    apply_watchlist,
+)
 from run_real_backtest import fetch_alpaca_bars
 
 # --- Helper Functions ---
@@ -205,7 +210,23 @@ async def main():
     # Patched: Clean fallback watchlist with high-probability mean-reversion tickers
     if not symbols:
         print("[WARN] Scanner returned no symbols. Using fallback watchlist.")
-        symbols = ["MU", "WDC", "ASTS", "NVDA", "AMD", "SMCI", "CRWD", "AAPL", "TSLA", "APP", "META", "INOD"]
+        symbols = ["MU", "ASTS", "NVDA", "AMD", "SMCI", "CRWD", "AAPL", "APP", "META", "INOD",
+                   "POET", "AVGO", "RXT", "PLTR", "QBTS"]
+
+    # 3a-bis. Force-include watchlist / force-exclude blocklist. These wrap the
+    # scanner (and run before the allowlist gate) so curated names trade even if
+    # the liquidity scan misses them, and chronic losers never trade even if the
+    # scan keeps surfacing them. Both are optional comma-separated .env values.
+    include = parse_symbol_csv(os.getenv("TRADE_WATCHLIST"))
+    exclude = parse_symbol_csv(os.getenv("TRADE_BLOCKLIST"))
+    if include or exclude:
+        before = {str(s).upper() for s in symbols}
+        symbols = apply_watchlist(symbols, include, exclude)
+        added = [s for s in symbols if str(s).upper() not in before]
+        if added:
+            print(f"[WATCHLIST] Force-including {len(added)} name(s): {', '.join(added)}")
+        if exclude:
+            print(f"[BLOCKLIST] Excluding: {', '.join(sorted(exclude))}")
 
     # 3b. Per-symbol allowlist gate (autotune_run.py writes TRADE_ALLOWLIST with
     # only the names whose OOS profit factor cleared the threshold). Unset means

@@ -49,6 +49,50 @@ def parse_allowlist(raw: str | None) -> set[str] | None:
     return {s.strip().upper() for s in raw.split(",") if s.strip()}
 
 
+def parse_symbol_csv(raw: str | None) -> set[str]:
+    """Parse a comma-separated symbol list into an uppercased set.
+
+    Unlike :func:`parse_allowlist`, an unset/blank value yields an *empty* set
+    (meaning "no change"), which is the right default for the optional
+    force-include watchlist and force-exclude blocklist.
+    """
+    if not raw:
+        return set()
+    return {s.strip().upper() for s in raw.split(",") if s.strip()}
+
+
+def apply_watchlist(
+    symbols: Iterable[str],
+    include: set[str] | None = None,
+    exclude: set[str] | None = None,
+) -> list[str]:
+    """Force ``include`` names into ``symbols`` and drop ``exclude`` names.
+
+    Runs *before* the allowlist gate so a curated name reaches the universe
+    even when the liquidity scanner misses it (``include``), and a chronic
+    loser never trades even when the scanner keeps surfacing it (``exclude``).
+    Order is preserved (appended includes go last), duplicates are removed,
+    and matching is case-insensitive. ``exclude`` wins over ``include``.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    ex = {s.upper() for s in (exclude or set())}
+    for sym in symbols:
+        key = str(sym).upper()
+        if key in ex or key in seen:
+            continue
+        out.append(sym)
+        seen.add(key)
+    for sym in sorted(include or set()):
+        key = sym.upper()
+        if key in ex or key in seen:
+            continue
+        out.append(sym)
+        seen.add(key)
+    return out
+
+
+
 def filter_symbols(
     symbols: Iterable[str],
     allowlist: set[str] | None,

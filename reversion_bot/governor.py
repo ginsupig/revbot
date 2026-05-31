@@ -153,6 +153,34 @@ class ExecutionGovernor:
             print(f"[GOVERNOR] account fetch failed: {e}")
             return False
 
+        # Real-time intraday margin gate (FINRA Notice 26-10, eff. 2026-06-04).
+        # The broker computes the intraday margin requirement; we simply respect
+        # the buying power Alpaca reports, which already reflects current exposure.
+        # Prefer day-trading buying power when available, else regular buying power.
+        live_buying_power = None
+        for attr in ("daytrading_buying_power", "buying_power"):
+            val = getattr(account, attr, None)
+            if val is not None:
+                try:
+                    live_buying_power = float(val)
+                    break
+                except (TypeError, ValueError):
+                    continue
+        if live_buying_power is not None and new_position_value > live_buying_power:
+            print(
+                f"[GOVERNOR] {symbol} rejected: insufficient buying power "
+                f"(need {new_position_value:.2f}, have {live_buying_power:.2f})"
+            )
+            return False
+
+        # Hard block if the broker has flagged the account (e.g. unmet intraday
+        # margin deficit triggers a trading restriction under the new rules).
+        if bool(getattr(account, "trading_blocked", False)) or bool(
+            getattr(account, "account_blocked", False)
+        ):
+            print(f"[GOVERNOR] {symbol} rejected: broker trading_blocked flag set")
+            return False
+
         open_symbols = [str(p.symbol).upper() for p in positions]
         open_styles: Dict[str, int] = {}
         open_regimes: Dict[str, int] = {}

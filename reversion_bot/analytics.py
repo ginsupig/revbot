@@ -34,7 +34,12 @@ def sharpe_ratio(trades, risk_free_rate=0.0):
     if len(returns) < 2:
         return 0.0
     excess = returns - risk_free_rate / 252
-    return excess.mean() / excess.std(ddof=0) * np.sqrt(252)
+    std = excess.std(ddof=0)
+    # No dispersion (e.g. an all-zero / no-trade fold) -> undefined Sharpe.
+    # Return 0.0 rather than nan so it doesn't poison out-of-sample averages.
+    if std == 0 or np.isnan(std):
+        return 0.0
+    return excess.mean() / std * np.sqrt(252)
 
 def max_drawdown(trades):
     equity = trades['pnl'].cumsum()

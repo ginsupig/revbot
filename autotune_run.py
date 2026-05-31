@@ -73,10 +73,10 @@ def main():
     # the optimum sits inside the grid and folds actually contain trades.
     param_grid = {
         'band_length':            [20],
-        'ri_threshold':           [-1.0, -0.5, 0.0],
-        'use_vwap_filter':        [True],
-        'max_vwap_extension_pct': [0.008, 0.012, 0.018, 0.025],
-        'rsi_max':                [35, 48],
+        'ri_threshold':           [-1.0, -0.5, 0.0, 0.5],
+        'use_vwap_filter':        [True, False],
+        'max_vwap_extension_pct': [0.012, 0.020, 0.030],
+        'rsi_max':                [40, 48, 55],
         'min_history':            [160],
     }
 

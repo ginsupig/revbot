@@ -140,10 +140,10 @@ def run_walkforward_backtest(df, param_grid=None, n_splits=5):
     # that matter for fast 3x leveraged assets (Bollinger width is too lagging).
     if param_grid is None:
         param_grid = {
-            "ri_threshold": [-1.5, -1.0, -0.75, -0.5],
-            "use_vwap_filter": [True],
-            "max_vwap_extension_pct": [0.008, 0.012, 0.018, 0.025],
-            "rsi_max": [30.0, 40.0],
+            "ri_threshold": [-1.0, -0.5, 0.0, 0.5],
+            "use_vwap_filter": [True, False],
+            "max_vwap_extension_pct": [0.012, 0.020, 0.030],
+            "rsi_max": [40.0, 48.0, 55.0],
             "band_length": [20],
         }
     tuner = AutoTuner(mean_reversion_strategy, df, param_grid)

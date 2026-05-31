@@ -26,6 +26,7 @@ class SymbolRow:
     realized_pnl: float
     traded_notional: float
     weight: float          # share of total traded notional, 0..1
+    efficiency: float      # realized_pnl / traded_notional (return on notional)
     buy_qty: float
     sell_qty: float
     fills: int
@@ -94,8 +95,22 @@ def symbol_weights(notional: Dict[str, float]) -> Dict[str, float]:
     return {sym: val / total for sym, val in notional.items()}
 
 
-def build_report(fills: List[dict]) -> dict:
-    """Assemble a per-symbol report sorted by traded notional (desc)."""
+# Sort keys -> (SymbolRow attribute, descending?). "symbol" sorts A..Z.
+SORT_KEYS = {
+    "notional": ("traded_notional", True),
+    "pnl": ("realized_pnl", True),
+    "efficiency": ("efficiency", True),
+    "weight": ("weight", True),
+    "fills": ("fills", True),
+    "symbol": ("symbol", False),
+}
+
+
+def build_report(fills: List[dict], sort_by: str = "notional") -> dict:
+    """Assemble a per-symbol report.
+
+    ``sort_by`` is one of ``SORT_KEYS`` (default ``notional``, descending).
+    """
     pnl = realized_pnl_fifo(fills)
     notional = traded_notional(fills)
     weights = symbol_weights(notional)
@@ -110,19 +125,25 @@ def build_report(fills: List[dict]) -> dict:
         else:
             sells[f["symbol"]] += abs(float(f["qty"]))
 
-    rows = [
-        SymbolRow(
-            symbol=sym,
-            realized_pnl=pnl.get(sym, 0.0),
-            traded_notional=notional.get(sym, 0.0),
-            weight=weights.get(sym, 0.0),
-            buy_qty=buys.get(sym, 0.0),
-            sell_qty=sells.get(sym, 0.0),
-            fills=counts.get(sym, 0),
+    rows = []
+    for sym in notional:
+        sym_notional = notional.get(sym, 0.0)
+        sym_pnl = pnl.get(sym, 0.0)
+        rows.append(
+            SymbolRow(
+                symbol=sym,
+                realized_pnl=sym_pnl,
+                traded_notional=sym_notional,
+                weight=weights.get(sym, 0.0),
+                efficiency=(sym_pnl / sym_notional) if sym_notional else 0.0,
+                buy_qty=buys.get(sym, 0.0),
+                sell_qty=sells.get(sym, 0.0),
+                fills=counts.get(sym, 0),
+            )
         )
-        for sym in notional
-    ]
-    rows.sort(key=lambda r: r.traded_notional, reverse=True)
+
+    attr, desc = SORT_KEYS.get(sort_by, SORT_KEYS["notional"])
+    rows.sort(key=lambda r: getattr(r, attr), reverse=desc)
 
     return {
         "rows": rows,
@@ -141,12 +162,33 @@ def format_report(report: dict, days: int) -> str:
         f"  total realized PnL: ${report['total_realized_pnl']:,.2f}",
         f"  total traded notional: ${report['total_notional']:,.2f}",
         "",
-        f"  {'SYMBOL':<8}{'WEIGHT':>9}{'NOTIONAL':>16}{'REALIZED PnL':>16}{'FILLS':>7}",
-        f"  {'-'*8:<8}{'-'*8:>9}{'-'*15:>16}{'-'*15:>16}{'-'*6:>7}",
+        f"  {'SYMBOL':<8}{'WEIGHT':>9}{'NOTIONAL':>16}{'REALIZED PnL':>16}{'RET/NOT':>10}{'FILLS':>7}",
+        f"  {'-'*8:<8}{'-'*8:>9}{'-'*15:>16}{'-'*15:>16}{'-'*9:>10}{'-'*6:>7}",
     ]
     for r in rows:
         lines.append(
             f"  {r.symbol:<8}{r.weight*100:>8.2f}%"
-            f"{r.traded_notional:>16,.2f}{r.realized_pnl:>16,.2f}{r.fills:>7}"
+            f"{r.traded_notional:>16,.2f}{r.realized_pnl:>16,.2f}"
+            f"{r.efficiency*100:>9.2f}%{r.fills:>7}"
         )
     return "\n".join(lines)
+
+
+def format_csv(report: dict) -> str:
+    """Render the per-symbol rows as CSV (header + one line per symbol)."""
+    import csv
+    import io
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        ["symbol", "weight", "traded_notional", "realized_pnl",
+         "efficiency", "buy_qty", "sell_qty", "fills"]
+    )
+    for r in report["rows"]:
+        writer.writerow(
+            [r.symbol, f"{r.weight:.6f}", f"{r.traded_notional:.2f}",
+             f"{r.realized_pnl:.2f}", f"{r.efficiency:.6f}",
+             f"{r.buy_qty:g}", f"{r.sell_qty:g}", r.fills]
+        )
+    return buf.getvalue()

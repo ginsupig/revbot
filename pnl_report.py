@@ -18,7 +18,12 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import List
 
-from reversion_bot.trade_report import build_report, format_report
+from reversion_bot.trade_report import (
+    SORT_KEYS,
+    build_report,
+    format_csv,
+    format_report,
+)
 
 
 def _load_env() -> None:
@@ -99,18 +104,26 @@ def fetch_fills(client, days: int) -> List[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Alpaca realized-PnL / symbol-weight report")
     parser.add_argument("--days", type=int, default=60, help="lookback window in days (default 60)")
-    parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    parser.add_argument(
+        "--sort", choices=sorted(SORT_KEYS), default="notional",
+        help="sort rows by this column (default notional)",
+    )
+    out_group = parser.add_mutually_exclusive_group()
+    out_group.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    out_group.add_argument("--csv", action="store_true", help="emit CSV instead of a table")
     args = parser.parse_args()
 
     _load_env()
     client = _make_client()
     fills = fetch_fills(client, args.days)
-    report = build_report(fills)
+    report = build_report(fills, sort_by=args.sort)
 
     if args.json:
         rows = [vars(r) for r in report["rows"]]
         out = {**report, "rows": rows, "days": args.days}
         print(json.dumps(out, indent=2))
+    elif args.csv:
+        print(format_csv(report), end="")
     else:
         print(format_report(report, args.days))
 

@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reversion_bot.trade_report import (
     build_report,
+    format_csv,
     realized_pnl_fifo,
     symbol_weights,
     traded_notional,
@@ -78,8 +79,48 @@ def test_build_report_sorted_and_totals():
     assert report["total_realized_pnl"] == 100.0
 
 
+def test_efficiency_is_pnl_over_notional():
+    fills = [
+        _fill("A", "buy", 10, 100.0, "t1"),   # notional 1000
+        _fill("A", "sell", 10, 110.0, "t2"),  # notional 1100 -> 2100 total, pnl +100
+    ]
+    row = build_report(fills)["rows"][0]
+    assert abs(row.efficiency - (100.0 / 2100.0)) < 1e-12
+
+
+def test_sort_by_pnl_and_efficiency():
+    fills = [
+        # Big notional, small PnL.
+        _fill("BIG", "buy", 100, 100.0, "t1"),
+        _fill("BIG", "sell", 100, 100.1, "t2"),   # pnl +10, notional ~20010
+        # Small notional, bigger PnL and far better efficiency.
+        _fill("SML", "buy", 1, 100.0, "t3"),
+        _fill("SML", "sell", 1, 150.0, "t4"),     # pnl +50, notional 250
+    ]
+    by_notional = build_report(fills, sort_by="notional")["rows"]
+    assert by_notional[0].symbol == "BIG"
+
+    by_pnl = build_report(fills, sort_by="pnl")["rows"]
+    assert by_pnl[0].symbol == "SML"
+
+    by_eff = build_report(fills, sort_by="efficiency")["rows"]
+    assert by_eff[0].symbol == "SML"
+
+
+def test_format_csv_has_header_and_rows():
+    fills = [
+        _fill("A", "buy", 10, 100.0, "t1"),
+        _fill("A", "sell", 10, 110.0, "t2"),
+    ]
+    csv_text = format_csv(build_report(fills))
+    lines = csv_text.strip().splitlines()
+    assert lines[0].startswith("symbol,weight,traded_notional,realized_pnl,efficiency")
+    assert lines[1].startswith("A,")
+
+
 def test_empty():
     report = build_report([])
     assert report["rows"] == []
     assert report["total_notional"] == 0
     assert symbol_weights({}) == {}
+    assert format_csv(report).strip().startswith("symbol,")

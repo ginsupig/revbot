@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from reversion_bot.walkforward import run_walkforward_backtest
+from reversion_bot.allowlist import select_allowlist
 from run_real_backtest import fetch_alpaca_bars
 from datetime import datetime, timedelta
 
@@ -81,6 +82,7 @@ def main():
     }
 
     all_best_params = []
+    symbol_scores = {}  # symbol -> {"profit_factor": avg, "sharpe": avg} (OOS)
 
     for symbol in symbols:
         try:
@@ -100,6 +102,11 @@ def main():
             print(f"Best params: {best_params}")
             if oos_metrics:
                 print(f"Best OOS metrics: {oos_metrics[-1]}")
+                # Average OOS metrics across folds -> the symbol's scorecard.
+                symbol_scores[symbol] = {
+                    "profit_factor": float(np.mean([m["profit_factor"] for m in oos_metrics])),
+                    "sharpe": float(np.mean([m["sharpe"] for m in oos_metrics])),
+                }
 
             all_best_params.append(best_params)
 
@@ -135,6 +142,23 @@ def main():
             # General float formatting (e.g. RI -1.0, VWAP 0.012) without
             # truncating small fractions to a single decimal.
             env_updates[env_key] = f"{val:g}"
+
+    # Per-symbol allowlist gate: only trade names whose OOS profit factor (and
+    # risk-adjusted Sharpe) cleared the threshold this tune. Thresholds are
+    # configurable; defaults reject break-even/losing names.
+    min_pf = float(os.getenv('ALLOWLIST_MIN_PF', 1.10))
+    min_sharpe = float(os.getenv('ALLOWLIST_MIN_SHARPE', 0.0))
+    allowlist = select_allowlist(symbol_scores, min_pf, min_sharpe)
+
+    print(f"\n--- Per-symbol OOS scorecard (gate: PF>={min_pf:g}, Sharpe>={min_sharpe:g}) ---")
+    for sym, m in sorted(symbol_scores.items(), key=lambda kv: kv[1]['profit_factor'], reverse=True):
+        mark = "PASS" if sym in allowlist else "drop"
+        print(f"  [{mark}] {sym:<6} PF={m['profit_factor']:.2f}  Sharpe={m['sharpe']:.2f}")
+    if allowlist:
+        print(f"Allowlist: {', '.join(allowlist)}")
+    else:
+        print("Allowlist: (empty) — no symbol cleared the gate; the bot will trade nothing.")
+    env_updates['TRADE_ALLOWLIST'] = ','.join(allowlist)
 
     print("\n--- Aggregated best params (median across symbols) ---")
     for env_key, val in env_updates.items():

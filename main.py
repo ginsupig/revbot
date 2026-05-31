@@ -17,6 +17,7 @@ from reversion_bot.execution import AlpacaExecutor
 from reversion_bot.models import PositionPlan
 from reversion_bot.governor import ExecutionGovernor
 from reversion_bot.portfolio import PortfolioState
+from reversion_bot.allowlist import parse_allowlist, filter_symbols
 from run_real_backtest import fetch_alpaca_bars
 
 # --- Helper Functions ---
@@ -205,6 +206,17 @@ async def main():
     if not symbols:
         print("[WARN] Scanner returned no symbols. Using fallback watchlist.")
         symbols = ["MU", "WDC", "ASTS", "NVDA", "AMD", "SMCI", "CRWD", "AAPL", "TSLA", "APP", "META", "INOD"]
+
+    # 3b. Per-symbol allowlist gate (autotune_run.py writes TRADE_ALLOWLIST with
+    # only the names whose OOS profit factor cleared the threshold). Unset means
+    # gating is off; explicitly empty means nothing qualified -> trade nothing.
+    allowlist = parse_allowlist(os.getenv("TRADE_ALLOWLIST"))
+    if allowlist is not None:
+        symbols, dropped = filter_symbols(symbols, allowlist)
+        if dropped:
+            print(f"[ALLOWLIST] Skipping {len(dropped)} name(s) not in TRADE_ALLOWLIST: {', '.join(dropped)}")
+        if not symbols:
+            print("[ALLOWLIST] No symbols passed the allowlist gate — nothing to trade this session.")
 
     # 4. Initialize Remaining Services
     perf_config = PerformanceConfig(state_dir="state/performance")

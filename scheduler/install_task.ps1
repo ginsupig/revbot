@@ -35,7 +35,17 @@ if ($RepoPath -ne "C:\revbot") {
     $xml = $xml -replace 'C:\\revbot', ($RepoPath -replace '\\', '\\')
 }
 
-Register-ScheduledTask -TaskName $TaskName -Xml $xml -Force | Out-Null
+# Task Scheduler reparses the XML from this in-memory (UTF-16) string and
+# chokes on the file's `encoding="UTF-8"` declaration ("unable to switch the
+# encoding"). Strip the declaration so it parses regardless of file encoding.
+$xml = $xml -replace '^\s*<\?xml.*?\?>\s*', ''
+
+try {
+    Register-ScheduledTask -TaskName $TaskName -Xml $xml -Force -ErrorAction Stop | Out-Null
+} catch {
+    Write-Error "Failed to register scheduled task '$TaskName': $_"
+    exit 1
+}
 
 Write-Host ""
 Write-Host "Registered scheduled task '$TaskName'." -ForegroundColor Green

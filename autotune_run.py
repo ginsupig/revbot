@@ -1,3 +1,4 @@
+import argparse
 import sys
 import os
 import numpy as np
@@ -51,15 +52,35 @@ def update_env_file(env_path, updates):
 
 
 def main():
-    # Symbols: from TRADE_SYMBOL env var, else fallback watchlist
-    env_symbols = os.getenv('TRADE_SYMBOL', '')
-    if env_symbols:
-        symbols = [s.strip() for s in env_symbols.split(',') if s.strip()]
-    else:
-        symbols = ["MU", "WDC", "ASTS", "NVDA", "AMD", "SMCI", "CRWD", "AAPL", "TSLA", "APP", "META", "INOD"]
+    parser = argparse.ArgumentParser(
+        description="Walk-forward autotuner + per-symbol allowlist gate."
+    )
+    parser.add_argument(
+        'days', nargs='?', type=int, default=None,
+        help='lookback window in days (default: AUTOTUNE_DAYS env or 30)',
+    )
+    parser.add_argument(
+        '--symbols', type=str, default=None,
+        help='comma-separated symbols to tune (overrides TRADE_SYMBOL / fallback list)',
+    )
+    parser.add_argument(
+        '--dry-run', action='store_true',
+        help='score symbols and print the scorecard WITHOUT writing .env',
+    )
+    args = parser.parse_args()
 
-    # Lookback window: CLI arg (days) > AUTOTUNE_DAYS env var > default 30
-    days = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.getenv('AUTOTUNE_DAYS', 30))
+    # Symbols: --symbols flag > TRADE_SYMBOL env var > fallback watchlist
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(',') if s.strip()]
+    else:
+        env_symbols = os.getenv('TRADE_SYMBOL', '')
+        if env_symbols:
+            symbols = [s.strip() for s in env_symbols.split(',') if s.strip()]
+        else:
+            symbols = ["MU", "WDC", "ASTS", "NVDA", "AMD", "SMCI", "CRWD", "AAPL", "TSLA", "APP", "META", "INOD"]
+
+    # Lookback window: positional days arg > AUTOTUNE_DAYS env var > default 30
+    days = args.days if args.days is not None else int(os.getenv('AUTOTUNE_DAYS', 30))
 
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=days)
@@ -163,6 +184,11 @@ def main():
     print("\n--- Aggregated best params (median across symbols) ---")
     for env_key, val in env_updates.items():
         print(f"  {env_key}={val}")
+
+    if args.dry_run:
+        print("\n[dry-run] .env NOT modified.")
+        print(f"[dry-run] Would set TRADE_ALLOWLIST={env_updates['TRADE_ALLOWLIST']}")
+        return
 
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
     update_env_file(env_path, env_updates)

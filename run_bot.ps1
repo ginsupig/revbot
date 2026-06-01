@@ -68,8 +68,15 @@ try {
         $start = Get-Date
 
         # Run the bot; append all streams (stdout + stderr) to the daily log.
+        # Python's logging writes INFO lines to stderr, and under
+        # ErrorActionPreference='Stop' PowerShell escalates native stderr to a
+        # terminating NativeCommandError that would kill the supervisor. Switch
+        # to 'Continue' around the call so normal log output can't abort us.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
         & $Python "main.py" *>> $botLog
         $code = $LASTEXITCODE
+        $ErrorActionPreference = $prevEAP
 
         $ranSeconds = [int]((Get-Date) - $start).TotalSeconds
         Write-Log "main.py exited (code=$code) after ${ranSeconds}s"

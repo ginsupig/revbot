@@ -4,6 +4,7 @@ from reversion_bot.engine import ReversionEngine
 from reversion_bot.config import ReversionConfig
 from reversion_bot.autotune import AutoTuner
 from reversion_bot.analytics import profit_factor, sharpe_ratio, max_drawdown
+from reversion_bot.cost_model import passes_cost_gate, in_cooldown
 
 # --- Live-execution constants (mirror risk.py / main.py) ---
 STOP_ATR_MULTIPLE = 1.20        # risk.py RiskConfig.stop_atr_multiple
@@ -34,7 +35,19 @@ def mean_reversion_strategy(df, **kwargs):
     Entries use the ReversionEngine LONG_REVERSION decision. Exits mirror the
     live bracket: dynamic ATR stop/target, morning-blackout entry filter, and
     EOD liquidation at 14:50 CT. Round-trip friction is applied per trade.
+
+    Cost/churn controls (popped before building the engine config; all default
+    to the prior behavior so existing results are unchanged):
+        reentry_cooldown_bars : block re-entry for N bars after an exit (live
+            parity: 30-min cooldown == 6 bars on 5-min data). Default 0 (off).
+        min_reward_cost_ratio : skip entries whose bracket reward doesn't clear
+            cost by this multiple. Default 0.0 (off).
+        cost_pct : round-trip friction applied to each trade. Default 8 bps.
     """
+    reentry_cooldown_bars = int(kwargs.pop("reentry_cooldown_bars", 0))
+    min_reward_cost_ratio = float(kwargs.pop("min_reward_cost_ratio", 0.0))
+    cost_pct = float(kwargs.pop("cost_pct", SLIPPAGE_PCT))
+
     config_defaults = dict(
         band_length=20,
         band_std_1=1.0,
@@ -76,6 +89,7 @@ def mean_reversion_strategy(df, **kwargs):
     in_trade = False
     entry_price = stop_price = target_price = 0.0
     prev_close = None
+    last_exit_idx = None
 
     for i in range(len(enriched)):
         row = enriched.iloc[i]
@@ -102,8 +116,9 @@ def mean_reversion_strategy(df, **kwargs):
 
             if exit_price is not None:
                 # Round-trip return from entry to exit, minus friction (Task 3).
-                bar_return = (exit_price / entry_price - 1.0) - SLIPPAGE_PCT
+                bar_return = (exit_price / entry_price - 1.0) - cost_pct
                 in_trade = False
+                last_exit_idx = i
                 enriched.at[enriched.index[i], "position"] = 0
             else:
                 bar_return = (close / prev_close - 1.0) if prev_close else 0.0
@@ -114,7 +129,8 @@ def mean_reversion_strategy(df, **kwargs):
             eod = (h > EOD_LIQUIDATION_HOUR_CT) or (
                 h == EOD_LIQUIDATION_HOUR_CT and m >= EOD_LIQUIDATION_MINUTE_CT
             )
-            if not morning_blackout and not eod:
+            cooldown = in_cooldown(i, last_exit_idx, reentry_cooldown_bars)
+            if not morning_blackout and not eod and not cooldown:
                 dec = engine.get_decision(enriched.iloc[: i + 1])
                 if dec.signal == "LONG_REVERSION":
                     atr = float(dec.atr or 0.0)
@@ -122,7 +138,11 @@ def mean_reversion_strategy(df, **kwargs):
                     entry_price = close
                     stop_price = round(entry_price - atr * STOP_ATR_MULTIPLE, 4)
                     target_price = round(entry_price + atr * TARGET_ATR_MULTIPLE, 4)
-                    if stop_price < entry_price < target_price:
+                    # Skip entries too small to clear round-trip cost (churn).
+                    cost_ok = passes_cost_gate(
+                        entry_price, target_price, cost_pct, min_reward_cost_ratio
+                    )
+                    if stop_price < entry_price < target_price and cost_ok:
                         in_trade = True
                         enriched.at[enriched.index[i], "signal"] = 1
                         enriched.at[enriched.index[i], "position"] = 1

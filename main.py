@@ -207,11 +207,14 @@ async def main():
         max_count=20
     )
 
-    # Patched: Clean fallback watchlist with high-probability mean-reversion tickers
+    # Fallback watchlist = the names that cleared the walk-forward gate in the
+    # last 90-day autotune (PF >= 1.10, Sharpe >= 0 out of sample). Keeping the
+    # fallback in sync with the allowlist means a scanner whiff still trades only
+    # vetted symbols. Re-run autotune_run.py to refresh both this list and
+    # TRADE_ALLOWLIST.
     if not symbols:
         print("[WARN] Scanner returned no symbols. Using fallback watchlist.")
-        symbols = ["MU", "ASTS", "NVDA", "AMD", "SMCI", "CRWD", "AAPL", "APP", "META", "INOD",
-                   "POET", "AVGO", "RXT", "PLTR", "QBTS"]
+        symbols = ["TQQQ", "SOXL", "TECL", "NVDL", "METU", "MSFU", "QQQ", "EEM"]
 
     # 3a-bis. Force-include watchlist / force-exclude blocklist. These wrap the
     # scanner (and run before the allowlist gate) so curated names trade even if

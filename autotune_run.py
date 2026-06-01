@@ -4,7 +4,7 @@ import os
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from reversion_bot.walkforward import run_walkforward_backtest
+from reversion_bot.walkforward import run_walkforward_backtest, evaluate_fixed_params
 from reversion_bot.allowlist import select_allowlist
 from run_real_backtest import fetch_alpaca_bars
 from datetime import datetime, timedelta
@@ -103,7 +103,8 @@ def main():
     }
 
     all_best_params = []
-    symbol_scores = {}  # symbol -> {"profit_factor": avg, "sharpe": avg} (OOS)
+    symbol_scores = {}      # symbol -> tune-best OOS PF/Sharpe (informational)
+    bars_by_symbol = {}     # cache bars for the as-traded validation pass
 
     for symbol in symbols:
         try:
@@ -115,6 +116,7 @@ def main():
                 continue
 
             print(f"Fetched {len(bars)} bars.")
+            bars_by_symbol[symbol] = bars
 
             results, oos_metrics, best_params = run_walkforward_backtest(
                 bars, param_grid=param_grid, n_splits=3
@@ -164,17 +166,47 @@ def main():
             # truncating small fractions to a single decimal.
             env_updates[env_key] = f"{val:g}"
 
-    # Per-symbol allowlist gate: only trade names whose OOS profit factor (and
-    # risk-adjusted Sharpe) cleared the threshold this tune. Thresholds are
-    # configurable; defaults reject break-even/losing names.
+    # As-traded validation pass: re-score every symbol with the AGGREGATE params
+    # the bot will actually trade with (not each symbol's bespoke best). A name
+    # that only wins under its own optimum but loses under the shared median
+    # params must NOT make the allowlist — otherwise the bot trades a live loser
+    # (e.g. QQQ passing on its own params but losing on the median ones).
+    as_traded_params = {}
+    for param in PARAM_TO_ENV:
+        if param not in aggregated:
+            continue
+        val = aggregated[param]
+        if param in BOOL_PARAMS:
+            as_traded_params[param] = bool(val)
+        elif param in INTEGER_PARAMS:
+            as_traded_params[param] = int(round(val))
+        else:
+            as_traded_params[param] = float(val)
+
+    as_traded_scores = {}
+    for symbol, bars in bars_by_symbol.items():
+        try:
+            m = evaluate_fixed_params(bars, as_traded_params, n_splits=3)
+            as_traded_scores[symbol] = {
+                "profit_factor": float(np.mean([x["profit_factor"] for x in m])),
+                "sharpe": float(np.mean([x["sharpe"] for x in m])),
+            }
+        except Exception as e:
+            print(f"As-traded scoring failed for {symbol}: {e}")
+
+    # Per-symbol allowlist gate, scored AS TRADED. Thresholds are configurable;
+    # defaults reject break-even/losing names.
     min_pf = float(os.getenv('ALLOWLIST_MIN_PF', 1.10))
     min_sharpe = float(os.getenv('ALLOWLIST_MIN_SHARPE', 0.0))
-    allowlist = select_allowlist(symbol_scores, min_pf, min_sharpe)
+    allowlist = select_allowlist(as_traded_scores, min_pf, min_sharpe)
 
-    print(f"\n--- Per-symbol OOS scorecard (gate: PF>={min_pf:g}, Sharpe>={min_sharpe:g}) ---")
-    for sym, m in sorted(symbol_scores.items(), key=lambda kv: kv[1]['profit_factor'], reverse=True):
+    print(f"\n--- As-traded scorecard (shared median params; gate: PF>={min_pf:g}, Sharpe>={min_sharpe:g}) ---")
+    print(f"    params: {as_traded_params}")
+    for sym, m in sorted(as_traded_scores.items(), key=lambda kv: kv[1]['profit_factor'], reverse=True):
         mark = "PASS" if sym in allowlist else "drop"
-        print(f"  [{mark}] {sym:<6} PF={m['profit_factor']:.2f}  Sharpe={m['sharpe']:.2f}")
+        tune_pf = symbol_scores.get(sym, {}).get('profit_factor', float('nan'))
+        print(f"  [{mark}] {sym:<6} as-traded PF={m['profit_factor']:.2f}  Sharpe={m['sharpe']:.2f}"
+              f"   (tune-best PF={tune_pf:.2f})")
     if allowlist:
         print(f"Allowlist: {', '.join(allowlist)}")
     else:

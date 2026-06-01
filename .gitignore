@@ -15,6 +15,7 @@ env/
 
 # Logs
 *.log
+logs/
 
 # Test cache
 .pytest_cache/

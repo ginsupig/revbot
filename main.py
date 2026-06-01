@@ -1,6 +1,7 @@
 import os
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -24,7 +25,12 @@ from reversion_bot.allowlist import (
     apply_watchlist,
 )
 from reversion_bot.symbol_params import load_symbol_params, build_symbol_configs
+from reversion_bot.single_instance import acquire_lock, release_lock
 from run_real_backtest import fetch_alpaca_bars
+
+# Lock scoped to this checkout (not cwd), so a separate deployment can still
+# run its own bot — only a duplicate of *this* one is refused.
+LOCK_PATH = Path(__file__).resolve().parent / "state" / "revbot.lock"
 
 # --- Helper Functions ---
 
@@ -162,6 +168,13 @@ async def liquidate_all_positions(executor):
 
 async def main():
     load_dotenv()
+
+    # 0. Single-instance guard: refuse to start if another bot from this
+    # checkout is already running (prevents duplicate orders on the account).
+    acquired, holder_pid = acquire_lock(LOCK_PATH)
+    if not acquired:
+        print(f"[LOCK] Another revbot instance is already running (PID {holder_pid}). Exiting.")
+        return
 
     # 1. Environment and Credentials
     api_key = os.getenv("APCA_API_KEY_ID")
@@ -325,6 +338,10 @@ async def main():
             
     except KeyboardInterrupt:
         print("\n[STOP] Shutting down...")
+    finally:
+        # On close, free the single-instance lock so the next launch can start.
+        release_lock(LOCK_PATH)
+        print("[LOCK] Released single-instance lock.")
 
 if __name__ == "__main__":
     asyncio.run(main())

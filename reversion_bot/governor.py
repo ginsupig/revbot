@@ -26,6 +26,17 @@ class ExecutionGovernor:
         self.buckets = buckets or DEFAULT_BUCKETS
         self.portfolio_state = portfolio_state or PortfolioState()
 
+    @staticmethod
+    def total_drawdown_heat(positions: Iterable) -> float:
+        """Capital currently at risk = sum of open *drawdown* only.
+
+        Counts underwater positions (negative unrealized P&L) as positive heat;
+        winners contribute 0, so a profitable book doesn't block new entries.
+        """
+        return sum(
+            max(0.0, -float(getattr(p, "unrealized_pl", 0.0))) for p in positions
+        )
+
     def symbol_buckets(self, symbol: str) -> List[str]:
         symbol = symbol.upper()
         return [name for name, members in self.buckets.items() if symbol in members]
@@ -185,9 +196,7 @@ class ExecutionGovernor:
         open_styles: Dict[str, int] = {}
         open_regimes: Dict[str, int] = {}
         current_total_exposure = sum(abs(float(p.market_value)) for p in positions)
-        current_total_heat = sum(
-            abs(float(getattr(p, "unrealized_pl", 0.0))) for p in positions
-        )
+        current_total_heat = self.total_drawdown_heat(positions)
 
         self.portfolio_state.update_equity(account_equity)
 

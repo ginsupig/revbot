@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 import os
 import numpy as np
@@ -103,8 +104,9 @@ def main():
     }
 
     all_best_params = []
-    symbol_scores = {}      # symbol -> tune-best OOS PF/Sharpe (informational)
-    bars_by_symbol = {}     # cache bars for the as-traded validation pass
+    symbol_scores = {}          # symbol -> own-params OOS PF/Sharpe (the gate)
+    best_params_by_symbol = {}  # symbol -> its own best params (for per-symbol file)
+    bars_by_symbol = {}         # cache bars for the as-traded comparison pass
 
     for symbol in symbols:
         try:
@@ -132,6 +134,7 @@ def main():
                 }
 
             all_best_params.append(best_params)
+            best_params_by_symbol[symbol] = best_params
 
         except Exception as e:
             print(f"Error tuning {symbol}: {e}")
@@ -166,11 +169,9 @@ def main():
             # truncating small fractions to a single decimal.
             env_updates[env_key] = f"{val:g}"
 
-    # As-traded validation pass: re-score every symbol with the AGGREGATE params
-    # the bot will actually trade with (not each symbol's bespoke best). A name
-    # that only wins under its own optimum but loses under the shared median
-    # params must NOT make the allowlist — otherwise the bot trades a live loser
-    # (e.g. QQQ passing on its own params but losing on the median ones).
+    # Comparison pass: score every symbol with the shared MEDIAN params too, so
+    # the scorecard shows how much each name gains from trading its OWN params
+    # vs the one-size-fits-all median (the reason per-symbol params exist).
     as_traded_params = {}
     for param in PARAM_TO_ENV:
         if param not in aggregated:
@@ -183,48 +184,55 @@ def main():
         else:
             as_traded_params[param] = float(val)
 
-    as_traded_scores = {}
+    median_scores = {}
     for symbol, bars in bars_by_symbol.items():
         try:
             m = evaluate_fixed_params(bars, as_traded_params, n_splits=3)
-            as_traded_scores[symbol] = {
-                "profit_factor": float(np.mean([x["profit_factor"] for x in m])),
-                "sharpe": float(np.mean([x["sharpe"] for x in m])),
-            }
+            median_scores[symbol] = float(np.mean([x["profit_factor"] for x in m]))
         except Exception as e:
-            print(f"As-traded scoring failed for {symbol}: {e}")
+            print(f"Median-param scoring failed for {symbol}: {e}")
 
-    # Per-symbol allowlist gate, scored AS TRADED. Thresholds are configurable;
-    # defaults reject break-even/losing names.
+    # Allowlist gate: score each symbol on ITS OWN params — exactly what the bot
+    # will trade it with now (per-symbol configs). Thresholds are configurable.
     min_pf = float(os.getenv('ALLOWLIST_MIN_PF', 1.10))
     min_sharpe = float(os.getenv('ALLOWLIST_MIN_SHARPE', 0.0))
-    allowlist = select_allowlist(as_traded_scores, min_pf, min_sharpe)
+    allowlist = select_allowlist(symbol_scores, min_pf, min_sharpe)
 
-    print(f"\n--- As-traded scorecard (shared median params; gate: PF>={min_pf:g}, Sharpe>={min_sharpe:g}) ---")
-    print(f"    params: {as_traded_params}")
-    for sym, m in sorted(as_traded_scores.items(), key=lambda kv: kv[1]['profit_factor'], reverse=True):
+    print(f"\n--- Per-symbol scorecard (own params; gate: PF>={min_pf:g}, Sharpe>={min_sharpe:g}) ---")
+    for sym, m in sorted(symbol_scores.items(), key=lambda kv: kv[1]['profit_factor'], reverse=True):
         mark = "PASS" if sym in allowlist else "drop"
-        tune_pf = symbol_scores.get(sym, {}).get('profit_factor', float('nan'))
-        print(f"  [{mark}] {sym:<6} as-traded PF={m['profit_factor']:.2f}  Sharpe={m['sharpe']:.2f}"
-              f"   (tune-best PF={tune_pf:.2f})")
+        med = median_scores.get(sym, float('nan'))
+        print(f"  [{mark}] {sym:<6} own PF={m['profit_factor']:.2f}  Sharpe={m['sharpe']:.2f}"
+              f"   (median-param PF={med:.2f})")
     if allowlist:
         print(f"Allowlist: {', '.join(allowlist)}")
     else:
         print("Allowlist: (empty) — no symbol cleared the gate; the bot will trade nothing.")
     env_updates['TRADE_ALLOWLIST'] = ','.join(allowlist)
 
-    print("\n--- Aggregated best params (median across symbols) ---")
+    # Per-symbol params for the live bot: each allowlisted name -> its own params.
+    symbol_params = {sym: best_params_by_symbol[sym]
+                     for sym in allowlist if sym in best_params_by_symbol}
+
+    print("\n--- Aggregated fallback params (median across symbols) ---")
     for env_key, val in env_updates.items():
         print(f"  {env_key}={val}")
+    print(f"Per-symbol params written for: {', '.join(symbol_params) or '(none)'}")
 
     if args.dry_run:
-        print("\n[dry-run] .env NOT modified.")
+        print("\n[dry-run] .env / symbol_params.json NOT modified.")
         print(f"[dry-run] Would set TRADE_ALLOWLIST={env_updates['TRADE_ALLOWLIST']}")
         return
 
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    here = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(here, '.env')
     update_env_file(env_path, env_updates)
     print(f"\n.env updated: {env_path}")
+
+    params_path = os.path.join(here, 'symbol_params.json')
+    with open(params_path, 'w') as f:
+        json.dump(symbol_params, f, indent=2, sort_keys=True)
+    print(f"symbol_params.json updated: {params_path}")
 
 
 if __name__ == "__main__":

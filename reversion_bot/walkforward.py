@@ -155,6 +155,29 @@ def mean_reversion_strategy(df, **kwargs):
     return enriched
 
 
+def evaluate_fixed_params(df, params, n_splits=3):
+    """Out-of-sample metrics for ONE fixed param set (no per-symbol tuning).
+
+    Scores a symbol the way the live bot actually trades it — with the shared,
+    aggregated params — rather than with its own bespoke best params. This is
+    what the allowlist should gate on: a name can win under its own optimum yet
+    lose under the median params every symbol is forced to use.
+    """
+    from sklearn.model_selection import TimeSeriesSplit
+
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    metrics = []
+    for fold, (_train_idx, test_idx) in enumerate(tscv.split(df)):
+        res = mean_reversion_strategy(df.iloc[test_idx], **params)
+        metrics.append({
+            "fold": fold + 1,
+            "profit_factor": profit_factor(res),
+            "sharpe": sharpe_ratio(res),
+            "max_drawdown": max_drawdown(res),
+        })
+    return metrics
+
+
 def run_walkforward_backtest(df, param_grid=None, n_splits=5):
     # Task 4: focus the grid on deep-oversold RI + VWAP extension, the dimensions
     # that matter for fast 3x leveraged assets (Bollinger width is too lagging).

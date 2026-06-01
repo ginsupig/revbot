@@ -24,6 +24,7 @@ from reversion_bot.allowlist import (
     parse_symbol_csv,
     apply_watchlist,
 )
+from reversion_bot.symbol_params import load_symbol_params, build_symbol_configs
 from reversion_bot.single_instance import acquire_lock, release_lock
 from run_real_backtest import fetch_alpaca_bars
 
@@ -274,7 +275,20 @@ async def main():
         symbol_cooldown_minutes=int(os.getenv("SYMBOL_COOLDOWN_MINUTES", 30)),
     )
     
-    service = ReversionService(strategy_config, risk_config, perf_config)
+    # Per-symbol params: each allowlisted name trades with its OWN tuned config
+    # (written by autotune_run.py), falling back to the global strategy_config
+    # for anything without a stored entry. Missing file -> empty -> prior behavior.
+    params_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        os.getenv("SYMBOL_PARAMS_FILE", "symbol_params.json"),
+    )
+    symbol_configs = build_symbol_configs(load_symbol_params(params_path), strategy_config)
+    if symbol_configs:
+        covered = [s for s in symbols if str(s).upper() in symbol_configs]
+        print(f"[PARAMS] Per-symbol configs loaded: {len(symbol_configs)} "
+              f"({len(covered)} of {len(symbols)} in today's universe use their own params).")
+
+    service = ReversionService(strategy_config, risk_config, perf_config, symbol_configs=symbol_configs)
     portfolio_state = PortfolioState()
     governor = ExecutionGovernor(config=portfolio_config, portfolio_state=portfolio_state)
 

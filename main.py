@@ -26,11 +26,13 @@ from reversion_bot.allowlist import (
 )
 from reversion_bot.symbol_params import load_symbol_params, build_symbol_configs
 from reversion_bot.single_instance import acquire_lock, release_lock
+from reversion_bot.heartbeat import write_heartbeat
 from run_real_backtest import fetch_alpaca_bars
 
 # Lock scoped to this checkout (not cwd), so a separate deployment can still
 # run its own bot — only a duplicate of *this* one is refused.
 LOCK_PATH = Path(__file__).resolve().parent / "state" / "revbot.lock"
+HEARTBEAT_PATH = Path(__file__).resolve().parent / "state" / "heartbeat.json"
 
 # --- Helper Functions ---
 
@@ -296,10 +298,24 @@ async def main():
     print(f"Timeframe: {timeframe} | Lookback: {lookback} | Mode: {'PAPER' if exec_config.paper else 'LIVE'}")
     print(f"Monitoring: {', '.join(symbols)}")
 
+    cycle = 0
     try:
         while True:
             market_open = await asyncio.to_thread(is_market_open, executor)
-            
+            cycle += 1
+
+            # Liveness heartbeat: written every cycle (in all branches) so a
+            # headless/logged-off bot can be health-checked without log access.
+            try:
+                write_heartbeat(str(HEARTBEAT_PATH), {
+                    "cycle": cycle,
+                    "market_open": bool(market_open),
+                    "monitoring": len(symbols),
+                    "mode": "PAPER" if exec_config.paper else "LIVE",
+                })
+            except Exception:
+                pass
+
             if not market_open:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Market Closed. Sleeping...")
                 await asyncio.sleep(poll_interval)

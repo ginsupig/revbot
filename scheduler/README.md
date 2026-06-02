@@ -10,6 +10,8 @@ it by hand each day.
 | `../run_bot.ps1` | Supervisor. Launches `python main.py` and **restarts it on crash** with backoff. A global mutex ensures only **one** instance runs, so duplicate triggers can't place duplicate orders. Logs to `../logs/`. |
 | `revbot-task.xml` | Scheduled-task definition: starts the supervisor **weekdays at 08:25 local time** (before US open) and **at logon** (so a reboot brings it back). Includes Task Scheduler's own restart-on-failure. |
 | `install_task.ps1` | Registers/updates the task named `revbot`. |
+| `run_autotune.ps1` | Weekly tuner wrapper. Runs `autotune_run.py 90 --symbols …`, which rewrites `.env` (`TRADE_ALLOWLIST` + fallback params) and `symbol_params.json`. Single-instance guarded; logs to `../logs/autotune_*.log`. |
+| `install_autotune_task.ps1` | Registers the **weekly** task `revbot-autotune` (Sundays), so Monday's bot starts on fresh candidates. |
 
 ## Install
 
@@ -47,8 +49,34 @@ Get-Content .\logs\bot_$(Get-Date -Format yyyyMMdd).log -Wait
 - **Time zone.** The 08:25 trigger uses the machine's local time. Adjust the
   `StartBoundary` time in `revbot-task.xml` if you're not on US Central.
 
+## Weekly auto-tune (fresh candidates without daily noise)
+
+The bot reads `TRADE_ALLOWLIST` + `symbol_params.json` **only at startup** — it
+never re-selects intraday. To refresh candidates on a cadence, register the
+weekly tuner. It runs Sundays, so Monday's 08:25 launch starts on a freshly
+tuned allowlist and per-symbol params.
+
+```powershell
+# Elevated PowerShell (headless task needs it). Prompts for your Windows password.
+.\scheduler\install_autotune_task.ps1 -RepoPath C:\3rev
+
+# Smoke-test now (takes a while — full walk-forward over the universe):
+Start-ScheduledTask -TaskName revbot-autotune
+Get-Content .\logs\autotune_$(Get-Date -Format yyyyMMdd).log -Wait
+```
+
+- **Weekly, not daily — on purpose.** A 90-day walk-forward is stable; daily
+  re-tuning would churn the universe on run-to-run noise (we've seen a single
+  name's PF swing wildly between adjacent runs). Weekly adapts without chasing
+  snapshots.
+- **No conflict with a running bot.** The tune only writes files; the bot picks
+  them up at its next (Monday) start. Running them at the same time is harmless.
+- **`TRADE_BLOCKLIST` still wins.** Anything you've blocklisted stays out even
+  if a tune re-allowlists it.
+
 ## Uninstall
 
 ```powershell
 Unregister-ScheduledTask -TaskName revbot -Confirm:$false
+Unregister-ScheduledTask -TaskName revbot-autotune -Confirm:$false
 ```

@@ -4,9 +4,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reversion_bot.trade_report import (
+    build_daily_timeline,
     build_report,
     build_scoreboard,
     format_csv,
+    format_daily_csv,
+    format_daily_timeline,
     format_scoreboard,
     realized_pnl_by_day,
     realized_pnl_fifo,
@@ -204,3 +207,48 @@ def test_scoreboard_empty():
     assert report["rows"] == []
     assert report["days_in_window"] == 0
     assert report["total_realized_pnl"] == 0
+
+
+# --- Daily timeline -------------------------------------------------------
+
+def test_daily_timeline_groups_by_day_with_tickers():
+    fills = [
+        # Day 1: A +100, B -20
+        _fill("A", "buy", 10, 100.0, "2026-06-01T14:00:00Z"),
+        _fill("A", "sell", 10, 110.0, "2026-06-01T15:00:00Z"),
+        _fill("B", "buy", 10, 100.0, "2026-06-01T14:00:00Z"),
+        _fill("B", "sell", 10, 98.0, "2026-06-01T15:00:00Z"),
+        # Day 2: A +50
+        _fill("A", "buy", 10, 100.0, "2026-06-02T14:00:00Z"),
+        _fill("A", "sell", 10, 105.0, "2026-06-02T15:00:00Z"),
+    ]
+    report = build_daily_timeline(fills)  # newest first by default
+    assert report["days_in_window"] == 2
+    assert report["rows"][0]["date"] == "2026-06-02"
+    assert report["rows"][1]["date"] == "2026-06-01"
+
+    day1 = report["rows"][1]
+    assert abs(day1["realized_pnl"] - 80.0) < 1e-9      # +100 - 20
+    assert day1["fills"] == 4
+    # Symbols sorted by contribution: A (+100) before B (-20).
+    assert [s for s, _ in day1["symbols"]] == ["A", "B"]
+    assert abs(report["total_realized_pnl"] - 130.0) < 1e-9
+
+
+def test_daily_timeline_csv_has_total_rows():
+    fills = [
+        _fill("A", "buy", 10, 100.0, "2026-06-01T14:00:00Z"),
+        _fill("A", "sell", 10, 110.0, "2026-06-01T15:00:00Z"),
+    ]
+    csv_text = format_daily_csv(build_daily_timeline(fills))
+    lines = csv_text.strip().splitlines()
+    assert lines[0] == "date,symbol,realized_pnl"
+    assert any(line.startswith("2026-06-01,A,") for line in lines)
+    assert any(line.startswith("2026-06-01,TOTAL,") for line in lines)
+
+
+def test_daily_timeline_empty():
+    report = build_daily_timeline([])
+    assert report["rows"] == []
+    assert report["days_in_window"] == 0
+    assert "Daily PnL timeline" in format_daily_timeline(report, days=60)

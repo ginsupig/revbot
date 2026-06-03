@@ -123,22 +123,46 @@ def _fill_day(fill: dict) -> str:
 
 
 def realized_pnl_by_day(fills: Iterable[dict]) -> Dict[str, Dict[str, float]]:
-    """Realized PnL per symbol, broken out by trading day.
+    """Realized PnL per symbol, attributed to the day each position was *closed*.
 
-    The bot flattens every position at EOD, so each day's fills form a
-    self-contained set of round-trips: running FIFO within a single day is
-    exact and needs no cross-day inventory carry. Returns
-    ``{symbol: {day: realized_pnl}}``.
+    Runs a single global FIFO across the whole window (positions may be held
+    overnight — the bot does not always flatten at EOD), booking each realized
+    chunk on the date of the closing fill. This makes the per-day totals sum
+    exactly to ``realized_pnl_fifo`` over the same fills; a naive
+    partition-by-day-then-FIFO would silently drop every round-trip that crosses
+    a day boundary. Returns ``{symbol: {day: realized_pnl}}``.
     """
-    by_day: Dict[str, List[dict]] = defaultdict(list)
-    for f in fills:
-        by_day[_fill_day(f)].append(f)
+    ordered = sorted(fills, key=lambda f: f.get("time") or "")
+    lots: Dict[str, deque] = defaultdict(deque)
+    out: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
 
-    out: Dict[str, Dict[str, float]] = defaultdict(dict)
-    for day, day_fills in by_day.items():
-        for sym, pnl in realized_pnl_fifo(day_fills).items():
-            out[sym][day] = pnl
-    return dict(out)
+    for f in ordered:
+        sym = f["symbol"]
+        price = float(f["price"])
+        qty = _signed_qty(f)
+        day = _fill_day(f)
+        book = lots[sym]
+
+        # Close opposing inventory first; realized PnL is booked on this fill's day.
+        while qty != 0 and book and (book[0][0] > 0) != (qty > 0):
+            lot_qty, lot_price = book[0]
+            match = min(abs(lot_qty), abs(qty))
+            if lot_qty > 0:                      # closing a long
+                out[sym][day] += (price - lot_price) * match
+            else:                                # covering a short
+                out[sym][day] += (lot_price - price) * match
+
+            new_lot_qty = lot_qty - match if lot_qty > 0 else lot_qty + match
+            if new_lot_qty == 0:
+                book.popleft()
+            else:
+                book[0][0] = new_lot_qty
+            qty = qty - match if qty > 0 else qty + match
+
+        if qty != 0:
+            book.append([qty, price])
+
+    return {sym: dict(days) for sym, days in out.items()}
 
 
 # Sort keys -> (SymbolRow attribute, descending?). "symbol" sorts A..Z.

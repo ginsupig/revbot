@@ -148,6 +148,33 @@ def test_realized_pnl_by_day_partitions_by_date():
     assert by_day["AAPL"]["2026-06-02"] == -50.0
 
 
+def test_realized_pnl_by_day_attributes_overnight_to_closing_day():
+    # Bought day 1, sold day 2 -> PnL booked on the closing day, not dropped.
+    fills = [
+        _fill("X", "buy", 10, 100.0, "2026-06-01T15:00:00Z"),
+        _fill("X", "sell", 10, 112.0, "2026-06-02T14:00:00Z"),
+    ]
+    by_day = realized_pnl_by_day(fills)
+    assert "2026-06-01" not in by_day.get("X", {})        # open only -> no realized
+    assert abs(by_day["X"]["2026-06-02"] - 120.0) < 1e-9  # (112-100)*10 on close day
+
+
+def test_daily_breakdown_reconciles_with_global_fifo():
+    # The sum of per-day realized must equal the cross-day FIFO total — this is
+    # the invariant the old partition-by-day method violated for overnight holds.
+    fills = [
+        _fill("X", "buy", 10, 100.0, "2026-06-01T15:00:00Z"),
+        _fill("X", "sell", 5, 108.0, "2026-06-01T15:30:00Z"),   # same-day partial
+        _fill("X", "sell", 5, 115.0, "2026-06-03T14:00:00Z"),   # rest sold 2 days later
+        _fill("Y", "sell", 4, 50.0, "2026-06-02T14:00:00Z"),    # short
+        _fill("Y", "buy", 4, 44.0, "2026-06-04T14:00:00Z"),     # covered later
+    ]
+    by_day = realized_pnl_by_day(fills)
+    per_day_total = sum(p for days in by_day.values() for p in days.values())
+    global_total = sum(realized_pnl_fifo(fills).values())
+    assert abs(per_day_total - global_total) < 1e-9
+
+
 def test_scoreboard_cumulative_equals_sum_of_days():
     fills = [
         _fill("X", "buy", 10, 100.0, "2026-06-01T14:00:00Z"),

@@ -21,8 +21,10 @@ from typing import List
 from reversion_bot.trade_report import (
     SORT_KEYS,
     build_report,
+    build_scoreboard,
     format_csv,
     format_report,
+    format_scoreboard,
 )
 
 
@@ -108,6 +110,11 @@ def main() -> None:
         "--sort", choices=sorted(SORT_KEYS), default="notional",
         help="sort rows by this column (default notional)",
     )
+    parser.add_argument(
+        "--scoreboard", action="store_true",
+        help="per-day rolling scoreboard (consistency + cut-candidate flags) "
+             "instead of the aggregate summary table",
+    )
     out_group = parser.add_mutually_exclusive_group()
     out_group.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     out_group.add_argument("--csv", action="store_true", help="emit CSV instead of a table")
@@ -116,6 +123,16 @@ def main() -> None:
     _load_env()
     client = _make_client()
     fills = fetch_fills(client, args.days)
+
+    if args.scoreboard:
+        report = build_scoreboard(fills)
+        if args.json:
+            rows = [vars(r) for r in report["rows"]]
+            print(json.dumps({**report, "rows": rows, "days": args.days}, indent=2))
+        else:
+            print(format_scoreboard(report, args.days))
+        return
+
     report = build_report(fills, sort_by=args.sort)
 
     if args.json:

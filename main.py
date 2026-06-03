@@ -227,7 +227,10 @@ async def main():
     # TRADE_ALLOWLIST.
     if not symbols:
         print("[WARN] Scanner returned no symbols. Using fallback watchlist.")
-        symbols = ["TQQQ", "SOXL", "TECL", "NVDL", "METU", "MSFU", "QQQ", "EEM"]
+        symbols = [
+            "ARM", "ASTS", "NVDA", "TSM", "LRCX",
+            "AMD", "AMAT", "MU", "AVGO", "SMCI",
+        ]
 
     # 3a-bis. Force-include watchlist / force-exclude blocklist. These wrap the
     # scanner (and run before the allowlist gate) so curated names trade even if

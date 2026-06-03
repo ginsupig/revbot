@@ -20,9 +20,12 @@ from typing import List
 
 from reversion_bot.trade_report import (
     SORT_KEYS,
+    build_daily_timeline,
     build_report,
     build_scoreboard,
     format_csv,
+    format_daily_csv,
+    format_daily_timeline,
     format_report,
     format_scoreboard,
 )
@@ -115,6 +118,10 @@ def main() -> None:
         help="per-day rolling scoreboard (consistency + cut-candidate flags) "
              "instead of the aggregate summary table",
     )
+    parser.add_argument(
+        "--daily", action="store_true",
+        help="per-day timeline: each day's total realized PnL and the tickers traded",
+    )
     out_group = parser.add_mutually_exclusive_group()
     out_group.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     out_group.add_argument("--csv", action="store_true", help="emit CSV instead of a table")
@@ -123,6 +130,16 @@ def main() -> None:
     _load_env()
     client = _make_client()
     fills = fetch_fills(client, args.days)
+
+    if args.daily:
+        report = build_daily_timeline(fills)
+        if args.json:
+            print(json.dumps({**report, "days": args.days}, indent=2))
+        elif args.csv:
+            print(format_daily_csv(report), end="")
+        else:
+            print(format_daily_timeline(report, args.days))
+        return
 
     if args.scoreboard:
         report = build_scoreboard(fills)

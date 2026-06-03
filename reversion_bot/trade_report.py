@@ -333,3 +333,73 @@ def format_scoreboard(report: dict, days: int, min_days: int = 5) -> str:
             "before acting on a flag (one bad session is noise)."
         )
     return "\n".join(lines)
+
+
+def build_daily_timeline(fills: List[dict], newest_first: bool = True) -> dict:
+    """Per-day realized PnL with the tickers traded each day.
+
+    The other axis from the scoreboard: one entry per trading day, each listing
+    that day's total realized PnL, fill count, and the symbols traded (with their
+    individual realized PnL, sorted by contribution).
+    """
+    by_sym_day = realized_pnl_by_day(fills)        # {symbol: {day: pnl}}
+    per_day: Dict[str, Dict[str, float]] = defaultdict(dict)
+    for sym, day_map in by_sym_day.items():
+        for day, pnl in day_map.items():
+            per_day[day][sym] = pnl
+
+    fills_per_day: Dict[str, int] = defaultdict(int)
+    for f in fills:
+        fills_per_day[_fill_day(f)] += 1
+
+    days = sorted(per_day.keys(), reverse=newest_first)
+    rows = []
+    for day in days:
+        sym_pnls = sorted(per_day[day].items(), key=lambda kv: kv[1], reverse=True)
+        rows.append(
+            {
+                "date": day,
+                "realized_pnl": sum(v for _, v in sym_pnls),
+                "fills": fills_per_day.get(day, 0),
+                "symbols": sym_pnls,                # list of (symbol, pnl)
+            }
+        )
+
+    return {
+        "rows": rows,
+        "total_realized_pnl": sum(r["realized_pnl"] for r in rows),
+        "total_fills": len(fills),
+        "days_in_window": len(rows),
+    }
+
+
+def format_daily_timeline(report: dict, days: int) -> str:
+    rows = report["rows"]
+    lines = [
+        f"Daily PnL timeline — last {days} days ({report['days_in_window']} trading day(s))",
+        f"  total realized PnL: ${report['total_realized_pnl']:,.2f}   fills: {report['total_fills']}",
+        "",
+        f"  {'DATE':<12}{'REALIZED':>13}{'FILLS':>7}   TICKERS (realized PnL)",
+        f"  {'-'*10:<12}{'-'*12:>13}{'-'*6:>7}   {'-'*40}",
+    ]
+    for r in rows:
+        tickers = ", ".join(f"{sym} {pnl:+,.0f}" for sym, pnl in r["symbols"])
+        lines.append(
+            f"  {r['date']:<12}{r['realized_pnl']:>13,.2f}{r['fills']:>7}   {tickers}"
+        )
+    return "\n".join(lines)
+
+
+def format_daily_csv(report: dict) -> str:
+    """Long-format CSV: one row per (date, symbol) plus a daily TOTAL row."""
+    import csv
+    import io
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["date", "symbol", "realized_pnl"])
+    for r in report["rows"]:
+        for sym, pnl in r["symbols"]:
+            writer.writerow([r["date"], sym, f"{pnl:.2f}"])
+        writer.writerow([r["date"], "TOTAL", f"{r['realized_pnl']:.2f}"])
+    return buf.getvalue()

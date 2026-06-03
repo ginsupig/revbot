@@ -5,7 +5,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reversion_bot.trade_report import (
     build_report,
+    build_scoreboard,
     format_csv,
+    format_scoreboard,
+    realized_pnl_by_day,
     realized_pnl_fifo,
     symbol_weights,
     traded_notional,
@@ -124,3 +127,80 @@ def test_empty():
     assert report["total_notional"] == 0
     assert symbol_weights({}) == {}
     assert format_csv(report).strip().startswith("symbol,")
+
+
+# --- Rolling scoreboard ---------------------------------------------------
+
+def test_realized_pnl_by_day_partitions_by_date():
+    fills = [
+        # Day 1: AAPL +100
+        _fill("AAPL", "buy", 10, 100.0, "2026-06-01T14:00:00Z"),
+        _fill("AAPL", "sell", 10, 110.0, "2026-06-01T15:00:00Z"),
+        # Day 2: AAPL -50
+        _fill("AAPL", "buy", 10, 110.0, "2026-06-02T14:00:00Z"),
+        _fill("AAPL", "sell", 10, 105.0, "2026-06-02T15:00:00Z"),
+    ]
+    by_day = realized_pnl_by_day(fills)
+    assert by_day["AAPL"]["2026-06-01"] == 100.0
+    assert by_day["AAPL"]["2026-06-02"] == -50.0
+
+
+def test_scoreboard_cumulative_equals_sum_of_days():
+    fills = [
+        _fill("X", "buy", 10, 100.0, "2026-06-01T14:00:00Z"),
+        _fill("X", "sell", 10, 110.0, "2026-06-01T15:00:00Z"),   # +100
+        _fill("X", "buy", 10, 100.0, "2026-06-02T14:00:00Z"),
+        _fill("X", "sell", 10, 97.0, "2026-06-02T15:00:00Z"),    # -30
+    ]
+    report = build_scoreboard(fills)
+    row = report["rows"][0]
+    assert row.symbol == "X"
+    assert abs(row.realized_pnl - 70.0) < 1e-9
+    assert row.days_traded == 2
+    assert row.days_positive == 1
+    assert row.days_negative == 1
+    assert row.best_day == 100.0
+    assert row.worst_day == -30.0
+    assert row.last_day == -30.0          # most recent day
+    assert report["days_in_window"] == 2
+
+
+def test_scoreboard_flags_consistent_bleeder_not_noisy_winner():
+    fills = []
+    # WIN: net positive across 2 days -> never flagged.
+    fills += [
+        _fill("WIN", "buy", 10, 100.0, "2026-06-01T14:00:00Z"),
+        _fill("WIN", "sell", 10, 130.0, "2026-06-01T15:00:00Z"),   # +300
+        _fill("WIN", "buy", 10, 100.0, "2026-06-02T14:00:00Z"),
+        _fill("WIN", "sell", 10, 99.0, "2026-06-02T15:00:00Z"),    # -10
+    ]
+    # BLEED: small but negative every day, efficiently bad -> flagged.
+    fills += [
+        _fill("BLEED", "buy", 10, 100.0, "2026-06-01T14:00:00Z"),
+        _fill("BLEED", "sell", 10, 99.0, "2026-06-01T15:00:00Z"),  # -10
+        _fill("BLEED", "buy", 10, 100.0, "2026-06-02T14:00:00Z"),
+        _fill("BLEED", "sell", 10, 98.0, "2026-06-02T15:00:00Z"),  # -20
+    ]
+    report = build_scoreboard(fills)
+    flagged = {r.symbol for r in report["rows"] if r.probation}
+    assert "BLEED" in flagged
+    assert "WIN" not in flagged
+    # Worst first ordering.
+    assert report["rows"][0].symbol == "BLEED"
+
+
+def test_scoreboard_note_when_insufficient_days():
+    fills = [
+        _fill("Q", "buy", 10, 100.0, "2026-06-03T14:00:00Z"),
+        _fill("Q", "sell", 10, 99.0, "2026-06-03T15:00:00Z"),
+    ]
+    text = format_scoreboard(build_scoreboard(fills), days=5, min_days=5)
+    assert "only 1 trading day" in text
+    assert "CUT?" in text  # legend present
+
+
+def test_scoreboard_empty():
+    report = build_scoreboard([])
+    assert report["rows"] == []
+    assert report["days_in_window"] == 0
+    assert report["total_realized_pnl"] == 0

@@ -32,6 +32,22 @@ class SymbolRow:
     fills: int
 
 
+@dataclass
+class ScoreRow:
+    symbol: str
+    realized_pnl: float    # cumulative over the window (sum of daily)
+    traded_notional: float
+    efficiency: float      # cumulative realized / traded notional
+    fills: int
+    days_traded: int
+    days_positive: int
+    days_negative: int
+    best_day: float
+    worst_day: float
+    last_day: float        # realized PnL on the most recent trading day in window
+    probation: bool        # cumulative-negative AND bottom-N by return-on-notional
+
+
 def _signed_qty(fill: dict) -> float:
     qty = abs(float(fill["qty"]))
     return qty if str(fill["side"]).lower() == "buy" else -qty
@@ -93,6 +109,36 @@ def symbol_weights(notional: Dict[str, float]) -> Dict[str, float]:
     if total <= 0:
         return {sym: 0.0 for sym in notional}
     return {sym: val / total for sym, val in notional.items()}
+
+
+def _fill_day(fill: dict) -> str:
+    """Trading-day key from a fill's ISO timestamp (the date portion).
+
+    US regular hours (13:30–20:00 UTC) all fall on a single UTC calendar date,
+    so the date prefix is a safe trading-day key without pulling in a timezone
+    dependency. Fills with no/short timestamp collapse into one "" bucket.
+    """
+    t = str(fill.get("time") or "")
+    return t[:10] if len(t) >= 10 else ""
+
+
+def realized_pnl_by_day(fills: Iterable[dict]) -> Dict[str, Dict[str, float]]:
+    """Realized PnL per symbol, broken out by trading day.
+
+    The bot flattens every position at EOD, so each day's fills form a
+    self-contained set of round-trips: running FIFO within a single day is
+    exact and needs no cross-day inventory carry. Returns
+    ``{symbol: {day: realized_pnl}}``.
+    """
+    by_day: Dict[str, List[dict]] = defaultdict(list)
+    for f in fills:
+        by_day[_fill_day(f)].append(f)
+
+    out: Dict[str, Dict[str, float]] = defaultdict(dict)
+    for day, day_fills in by_day.items():
+        for sym, pnl in realized_pnl_fifo(day_fills).items():
+            out[sym][day] = pnl
+    return dict(out)
 
 
 # Sort keys -> (SymbolRow attribute, descending?). "symbol" sorts A..Z.
@@ -192,3 +238,98 @@ def format_csv(report: dict) -> str:
              f"{r.buy_qty:g}", f"{r.sell_qty:g}", r.fills]
         )
     return buf.getvalue()
+
+
+def build_scoreboard(fills: List[dict], bottom_n: int = 3) -> dict:
+    """Per-symbol rolling scoreboard for the cut/keep decision.
+
+    Beyond aggregate PnL, this surfaces *consistency*: how many days a name
+    traded, its win/loss day split, worst single day, and most recent day. The
+    cumulative total is summed from the daily breakdown so it reconciles
+    exactly with the per-day cells.
+
+    A name is flagged ``probation`` (a cut candidate) when it is both
+    cumulative-negative over the window AND ranks in the bottom ``bottom_n`` by
+    return-on-notional — i.e. it loses *and* loses efficiently per dollar
+    churned. The flag is advisory; callers should still require a minimum
+    number of trading days before acting.
+    """
+    by_day = realized_pnl_by_day(fills)
+    notional = traded_notional(fills)
+
+    counts: Dict[str, int] = defaultdict(int)
+    for f in fills:
+        counts[f["symbol"]] += 1
+
+    rows: List[ScoreRow] = []
+    for sym in notional:
+        days = by_day.get(sym, {})
+        daily = [days[d] for d in sorted(days)]   # ascending by date
+        total = sum(daily)
+        sym_notional = notional.get(sym, 0.0)
+        rows.append(
+            ScoreRow(
+                symbol=sym,
+                realized_pnl=total,
+                traded_notional=sym_notional,
+                efficiency=(total / sym_notional) if sym_notional else 0.0,
+                fills=counts.get(sym, 0),
+                days_traded=len(daily),
+                days_positive=sum(1 for v in daily if v > 0),
+                days_negative=sum(1 for v in daily if v < 0),
+                best_day=max(daily) if daily else 0.0,
+                worst_day=min(daily) if daily else 0.0,
+                last_day=daily[-1] if daily else 0.0,
+                probation=False,
+            )
+        )
+
+    # Flag the worst-bleeding names: cumulative-negative, ranked by the most
+    # negative return-on-notional (loses the most per dollar traded).
+    losers = sorted(
+        (r for r in rows if r.realized_pnl < 0), key=lambda r: r.efficiency
+    )
+    for r in losers[:bottom_n]:
+        r.probation = True
+
+    rows.sort(key=lambda r: r.realized_pnl)   # worst first — this is a watch view
+
+    return {
+        "rows": rows,
+        "total_realized_pnl": sum(r.realized_pnl for r in rows),
+        "total_notional": sum(notional.values()),
+        "total_fills": len(fills),
+        "symbols": len(rows),
+        "days_in_window": len({_fill_day(f) for f in fills if _fill_day(f)}),
+    }
+
+
+def format_scoreboard(report: dict, days: int, min_days: int = 5) -> str:
+    rows: List[ScoreRow] = report["rows"]
+    n_days = report["days_in_window"]
+    lines = [
+        f"Rolling scoreboard — last {days} days ({n_days} trading day(s) with fills)",
+        f"  fills: {report['total_fills']}   symbols: {report['symbols']}",
+        f"  total realized PnL: ${report['total_realized_pnl']:,.2f}",
+        "",
+        f"  {'SYMBOL':<8}{'REALIZED':>13}{'RET/NOT':>10}{'DAYS':>6}{'W-L':>8}"
+        f"{'WORST DAY':>13}{'LAST DAY':>13}{'FILLS':>7}  FLAG",
+        f"  {'-'*8:<8}{'-'*12:>13}{'-'*9:>10}{'-'*5:>6}{'-'*7:>8}"
+        f"{'-'*12:>13}{'-'*12:>13}{'-'*6:>7}  ----",
+    ]
+    for r in rows:
+        wl = f"{r.days_positive}-{r.days_negative}"
+        flag = "CUT?" if r.probation else ""
+        lines.append(
+            f"  {r.symbol:<8}{r.realized_pnl:>13,.2f}{r.efficiency*100:>9.2f}%"
+            f"{r.days_traded:>6}{wl:>8}{r.worst_day:>13,.2f}"
+            f"{r.last_day:>13,.2f}{r.fills:>7}  {flag}"
+        )
+    lines.append("")
+    lines.append("  CUT? = cumulative-negative AND bottom-3 by return-on-notional.")
+    if n_days < min_days:
+        lines.append(
+            f"  NOTE: only {n_days} trading day(s) of data — wait for >= {min_days} "
+            "before acting on a flag (one bad session is noise)."
+        )
+    return "\n".join(lines)

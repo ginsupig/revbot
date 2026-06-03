@@ -4,7 +4,15 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict
+from zoneinfo import ZoneInfo
 import json
+
+
+# Circuit-breaker drawdown is measured per trading *session*. The bot flattens
+# every position at the close, so it's flat overnight; anchoring the breaker to
+# a single day's high-water mark (reset each morning) protects against a bad day
+# without an immortal all-time peak that can latch the bot off permanently.
+_SESSION_TZ = ZoneInfo("America/Chicago")
 
 
 @dataclass(frozen=True)
@@ -22,40 +30,65 @@ class PortfolioState:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.state_dir / "portfolio_state.json"
 
+    def _default_state(self) -> Dict[str, Any]:
+        return {
+            "peak_equity": None,          # all-time high, kept for reporting only
+            "session_date": None,         # date the session high-water mark belongs to
+            "session_peak_equity": None,  # intraday high-water mark (drives the breaker)
+            "last_equity": None,
+            "daily_new_positions": [],
+            "last_trade_ts_by_symbol": {},
+        }
+
     def _load(self) -> Dict[str, Any]:
         if not self.state_path.exists():
-            return {
-                "peak_equity": None,
-                "last_equity": None,
-                "daily_new_positions": [],
-                "last_trade_ts_by_symbol": {},
-            }
+            return self._default_state()
         try:
             return json.loads(self.state_path.read_text(encoding="utf-8"))
         except Exception:
-            return {
-                "peak_equity": None,
-                "last_equity": None,
-                "daily_new_positions": [],
-                "last_trade_ts_by_symbol": {},
-            }
+            return self._default_state()
+
+    @staticmethod
+    def _session_today() -> str:
+        return datetime.now(_SESSION_TZ).date().isoformat()
 
     def _save(self, data: Dict[str, Any]) -> None:
         self.state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    def update_equity(self, account_equity: float) -> Dict[str, Any]:
+    def update_equity(self, account_equity: float, today: str | None = None) -> Dict[str, Any]:
         data = self._load()
+        today = today or self._session_today()
+
+        # All-time peak — retained for reporting; no longer drives the breaker.
         peak = data.get("peak_equity")
         if peak is None or account_equity > peak:
             peak = account_equity
         data["peak_equity"] = peak
+
+        # Session high-water mark: reset to current equity on a new trading day,
+        # otherwise ratchet up. This is what the drawdown breaker measures against.
+        if data.get("session_date") != today:
+            data["session_date"] = today
+            data["session_peak_equity"] = account_equity
+        elif data.get("session_peak_equity") is None or account_equity > data["session_peak_equity"]:
+            data["session_peak_equity"] = account_equity
+
         data["last_equity"] = account_equity
         self._save(data)
         return data
 
-    def get_drawdown_pct(self, account_equity: float) -> float:
+    def get_drawdown_pct(self, account_equity: float, today: str | None = None) -> float:
+        """Drawdown from *today's* session high-water mark (0 on a fresh day).
+
+        Resetting per session means a 2.5% intraday slide halts new entries for
+        the rest of the day, but the next morning starts flat — so a bad day can
+        never permanently latch the bot off, unlike an all-time-peak anchor.
+        """
         data = self._load()
-        peak = data.get("peak_equity")
+        today = today or self._session_today()
+        if data.get("session_date") != today:
+            return 0.0
+        peak = data.get("session_peak_equity")
         if not peak or peak <= 0:
             return 0.0
         return max(0.0, (peak - account_equity) / peak)

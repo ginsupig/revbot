@@ -24,13 +24,16 @@ from reversion_bot.allowlist import (
     parse_symbol_csv,
     apply_watchlist,
 )
+from reversion_bot.symbol_params import load_symbol_params, build_symbol_configs
 from reversion_bot.single_instance import acquire_lock, release_lock
 from reversion_bot.schedule import session_done
+from reversion_bot.heartbeat import write_heartbeat
 from run_real_backtest import fetch_alpaca_bars
 
 # Lock scoped to this checkout (not cwd), so a separate deployment can still
 # run its own bot — only a duplicate of *this* one is refused.
 LOCK_PATH = Path(__file__).resolve().parent / "state" / "revbot.lock"
+HEARTBEAT_PATH = Path(__file__).resolve().parent / "state" / "heartbeat.json"
 
 # --- Helper Functions ---
 
@@ -294,7 +297,20 @@ async def main():
         symbol_cooldown_minutes=int(os.getenv("SYMBOL_COOLDOWN_MINUTES", 30)),
     )
     
-    service = ReversionService(strategy_config, risk_config, perf_config)
+    # Per-symbol params: each allowlisted name trades with its OWN tuned config
+    # (written by autotune_run.py), falling back to the global strategy_config
+    # for anything without a stored entry. Missing file -> empty -> prior behavior.
+    params_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        os.getenv("SYMBOL_PARAMS_FILE", "symbol_params.json"),
+    )
+    symbol_configs = build_symbol_configs(load_symbol_params(params_path), strategy_config)
+    if symbol_configs:
+        covered = [s for s in symbols if str(s).upper() in symbol_configs]
+        print(f"[PARAMS] Per-symbol configs loaded: {len(symbol_configs)} "
+              f"({len(covered)} of {len(symbols)} in today's universe use their own params).")
+
+    service = ReversionService(strategy_config, risk_config, perf_config, symbol_configs=symbol_configs)
     portfolio_state = PortfolioState()
     governor = ExecutionGovernor(config=portfolio_config, portfolio_state=portfolio_state)
 
@@ -302,9 +318,23 @@ async def main():
     print(f"Timeframe: {timeframe} | Lookback: {lookback} | Mode: {'PAPER' if exec_config.paper else 'LIVE'}")
     print(f"Monitoring: {', '.join(symbols)}")
 
+    cycle = 0
     try:
         while True:
             market_open = await asyncio.to_thread(is_market_open, executor)
+            cycle += 1
+
+            # Liveness heartbeat: written every cycle (in all branches) so a
+            # headless/logged-off bot can be health-checked without log access.
+            try:
+                write_heartbeat(str(HEARTBEAT_PATH), {
+                    "cycle": cycle,
+                    "market_open": bool(market_open),
+                    "monitoring": len(symbols),
+                    "mode": "PAPER" if exec_config.paper else "LIVE",
+                })
+            except Exception:
+                pass
 
             if not market_open:
                 # End-of-day: once the session is over, flatten anything still

@@ -29,8 +29,16 @@ class ReversionService:
         risk_config: RiskConfig | None = None,
         performance_config: PerformanceConfig | None = None,
         log_file: str = "reversion_service.log",
+        symbol_configs: Dict[str, ReversionConfig] | None = None,
     ) -> None:
         self.engine = ReversionEngine(strategy_config)
+        # Per-symbol engines (each with its own tuned config). Read-only after
+        # construction, so they're safe to share across the concurrent
+        # evaluate_symbol calls main.py issues via asyncio.gather/to_thread.
+        self._symbol_engines = {
+            str(sym).upper(): ReversionEngine(cfg)
+            for sym, cfg in (symbol_configs or {}).items()
+        }
         self.risk = RiskManager(risk_config)
         self.ml_learner = MLSignalLearner()
         self.perf_cfg = performance_config or PerformanceConfig()
@@ -60,15 +68,20 @@ class ReversionService:
             self.logger.addHandler(fh)
             self.logger.addHandler(ch)
 
+    def _engine_for(self, symbol: str) -> ReversionEngine:
+        """The symbol's own tuned engine, or the shared default."""
+        return self._symbol_engines.get(str(symbol).upper(), self.engine)
+
     def evaluate_symbol(self, symbol: str, df: pd.DataFrame, account_equity: float) -> Dict[str, Any]:
         self.logger.info("Evaluating symbol=%s rows=%s", symbol, len(df))
 
-        enriched = self.engine.calculate_indicators(df)
-        decision = self.engine.get_decision(enriched, symbol=symbol)
+        engine = self._engine_for(symbol)
+        enriched = engine.calculate_indicators(df)
+        decision = engine.get_decision(enriched, symbol=symbol)
 
-        mean_reversion_score = self._score_mean_reversion(decision, enriched)
+        mean_reversion_score = self._score_mean_reversion(decision, enriched, engine)
         ml_probability = self._get_ml_probability(df)
-        trendfail_score = self._get_trendfail_score(df)
+        trendfail_score = self._get_trendfail_score(df, engine)
         trend_following_score = self._get_trend_following_score(enriched)
 
         component_scores = {
@@ -78,7 +91,7 @@ class ReversionService:
             "trend_following": round(trend_following_score, 4),
         }
 
-        regime = self._classify_regime(enriched)
+        regime = self._classify_regime(enriched, engine)
         entry_style, router_reason = self._route_style(component_scores, regime, decision.signal)
 
         threshold = self.min_trade_score
@@ -227,11 +240,12 @@ class ReversionService:
             )
         )
 
-    def _classify_regime(self, enriched: pd.DataFrame) -> str:
+    def _classify_regime(self, enriched: pd.DataFrame, engine: ReversionEngine | None = None) -> str:
+        engine = engine or self.engine
         row = enriched.iloc[-1]
         adx = float(row["adx"]) if pd.notna(row["adx"]) else 0.0
         trend_signal = int(row["trend_following_signal"]) if "trend_following_signal" in enriched.columns and pd.notna(row["trend_following_signal"]) else 0
-        hard_max = getattr(self.engine.config, "adx_hard_max", 50.0)
+        hard_max = getattr(engine.config, "adx_hard_max", 50.0)
         if adx >= hard_max:
             return "trend"
         if adx >= 25 and trend_signal == 1:
@@ -266,7 +280,8 @@ class ReversionService:
             return best_style[0], "best_style_edge_trendfail"
         return best_style[0], "best_style_edge_mean_reversion"
 
-    def _score_mean_reversion(self, decision, enriched: pd.DataFrame) -> float:
+    def _score_mean_reversion(self, decision, enriched: pd.DataFrame, engine: ReversionEngine | None = None) -> float:
+        engine = engine or self.engine
         score = 0.20
         if decision.signal == "LONG_REVERSION":
             score += 0.25
@@ -275,14 +290,14 @@ class ReversionService:
             depth = (decision.lb1 - decision.close) / zone_width
             score += min(max(depth, 0.0), 1.0) * 0.20
         if decision.ri is not None:
-            threshold = getattr(self.engine.config, "ri_threshold", -0.5)
+            threshold = getattr(engine.config, "ri_threshold", -0.5)
             oversold_distance = max(threshold - decision.ri, 0.0)
             score += min(oversold_distance / 0.75, 1.0) * 0.15
         if decision.rsi is not None:
-            softness = max((self.engine.config.rsi_max + 10) - decision.rsi, 0.0)
+            softness = max((engine.config.rsi_max + 10) - decision.rsi, 0.0)
             score += min(softness / 25.0, 1.0) * 0.10
         if decision.adx is not None:
-            adx_buffer = max((self.engine.config.adx_max + 5) - decision.adx, 0.0)
+            adx_buffer = max((engine.config.adx_max + 5) - decision.adx, 0.0)
             score += min(adx_buffer / 20.0, 1.0) * 0.10
         return max(0.0, min(score, 1.0))
 
@@ -321,12 +336,13 @@ class ReversionService:
             self.logger.warning("ML probability error: %s", exc)
             return 0.5
 
-    def _get_trendfail_score(self, df: pd.DataFrame) -> float:
+    def _get_trendfail_score(self, df: pd.DataFrame, engine: ReversionEngine | None = None) -> float:
+        engine = engine or self.engine
         try:
             tf_out = trend_fail_continue_strategy(
                 df,
-                window=getattr(self.engine.config, "trendfail_window", 20),
-                threshold=getattr(self.engine.config, "trendfail_threshold", 0.005),
+                window=getattr(engine.config, "trendfail_window", 20),
+                threshold=getattr(engine.config, "trendfail_threshold", 0.005),
             )
             signal = int(tf_out["signal"].iloc[-1])
             if signal == 1:

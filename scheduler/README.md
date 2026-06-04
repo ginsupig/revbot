@@ -1,14 +1,25 @@
 # Scheduling revbot (Windows Task Scheduler + restart-on-failure)
 
-These files make revbot launch automatically and stay alive, without running
-it by hand each day.
+These files make revbot **fire at the open and stop at the close**, every
+trading day, without running it by hand.
+
+## Lifecycle
+
+The task starts the supervisor **weekdays at 08:25 CT** (5 min before the open).
+`main.py` then runs the whole session itself: it sleeps until the bell, trades,
+liquidates at EOD, and — once the market has **closed for the day** — flattens
+any stragglers and **exits cleanly (code 0)**. The supervisor treats a clean
+exit as "done for the day" and stops, so the task finishes. Tomorrow's 08:25
+trigger starts a fresh run. A **crash** (non-zero exit) is restarted with
+backoff; a clean close is not. A `PT7H` execution-time-limit backstops the
+self-exit (force-stop ~15:25 CT) in case the clock check ever fails.
 
 ## Pieces
 
 | File | Role |
 |------|------|
-| `../run_bot.ps1` | Supervisor. Launches `python main.py` and **restarts it on crash** with backoff. A global mutex ensures only **one** instance runs, so duplicate triggers can't place duplicate orders. Logs to `../logs/`. |
-| `revbot-task.xml` | Scheduled-task definition: starts the supervisor **weekdays at 08:25 local time** (before US open) and **at logon** (so a reboot brings it back). Includes Task Scheduler's own restart-on-failure. |
+| `../run_bot.ps1` | Supervisor. Launches `python main.py`, **restarts it on crash** with backoff, and **stops on a clean (code 0) exit** so it shuts down at the close. A global mutex ensures only **one** instance runs, so duplicate triggers can't place duplicate orders. Logs to `../logs/`. |
+| `revbot-task.xml` | Scheduled-task definition: starts the supervisor **weekdays at 08:25 CT** (before US open) and **at logon** (a reboot mid-session brings it back; after hours it self-exits at once). `PT7H` time-limit backstop. |
 | `install_task.ps1` | Registers/updates the task named `revbot`. |
 
 ## Install

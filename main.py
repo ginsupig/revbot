@@ -25,6 +25,7 @@ from reversion_bot.allowlist import (
     apply_watchlist,
 )
 from reversion_bot.single_instance import acquire_lock, release_lock
+from reversion_bot.schedule import session_done
 from run_real_backtest import fetch_alpaca_bars
 
 # Lock scoped to this checkout (not cwd), so a separate deployment can still
@@ -44,6 +45,22 @@ def is_morning_blackout() -> bool:
     """Block new entries during the first 30 minutes after open (8:30–9:00 AM CT)."""
     now_ct = datetime.now(ZoneInfo("America/Chicago"))
     return now_ct.hour < 9
+
+def is_session_over(executor) -> bool:
+    """True once today's session has ended (drives the clean end-of-day exit).
+
+    Uses the broker clock so it's correct on half-days/holidays. On any clock
+    error it returns False — we'd rather keep sleeping than shut down blind.
+    """
+    try:
+        clock = executor.client.get_clock()
+        if bool(clock.is_open):
+            return False
+        now_ct = datetime.now(ZoneInfo("America/Chicago"))
+        next_open_ct = clock.next_open.astimezone(ZoneInfo("America/Chicago"))
+        return session_done(False, next_open_ct, now_ct)
+    except Exception:
+        return False
 
 def get_account_equity(executor):
     account = executor.client.get_account()
@@ -173,7 +190,7 @@ async def main():
     acquired, holder_pid = acquire_lock(LOCK_PATH)
     if not acquired:
         print(f"[LOCK] Another revbot instance is already running (PID {holder_pid}). Exiting.")
-        return
+        return 0
 
     # 1. Environment and Credentials
     api_key = os.getenv("APCA_API_KEY_ID")
@@ -288,9 +305,17 @@ async def main():
     try:
         while True:
             market_open = await asyncio.to_thread(is_market_open, executor)
-            
+
             if not market_open:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Market Closed. Sleeping...")
+                # End-of-day: once the session is over, flatten anything still
+                # open (covers half-days where the 14:50 CT EOD window never
+                # fired) and exit cleanly (code 0) so the supervisor stops until
+                # tomorrow's open trigger. Pre-open, just sleep until the bell.
+                if await asyncio.to_thread(is_session_over, executor):
+                    await liquidate_all_positions(executor)
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [SESSION] Market closed for the day. Exiting cleanly.")
+                    break
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed (pre-open). Sleeping...")
                 await asyncio.sleep(poll_interval)
                 continue
 
@@ -324,13 +349,19 @@ async def main():
             await execute_candidates(governor, executor, portfolio_state, candidates)
             
             await asyncio.sleep(poll_interval)
-            
+
+        # Clean end-of-day exit (loop broke after the session closed).
+        return 0
     except KeyboardInterrupt:
         print("\n[STOP] Shutting down...")
+        return 0
     finally:
         # On close, free the single-instance lock so the next launch can start.
         release_lock(LOCK_PATH)
         print("[LOCK] Released single-instance lock.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    # Exit code 0 = clean (session over / duplicate) -> supervisor stops.
+    # A crash raises -> non-zero exit -> supervisor restarts with backoff.
+    sys.exit(asyncio.run(main()) or 0)

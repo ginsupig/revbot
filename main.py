@@ -39,10 +39,41 @@ def is_market_open(executor) -> bool:
     except Exception:
         return False
 
-def is_morning_blackout() -> bool:
-    """Block new entries during the first 30 minutes after open (8:30–9:00 AM CT)."""
+def parse_session_time(env_name: str, default: str) -> tuple[int, int]:
+    """Parse an HH:MM (24h, America/Chicago) schedule value from the environment.
+
+    Falls back to ``default`` if the value is missing or malformed.
+    """
+    raw = os.getenv(env_name, default)
+    try:
+        hh, mm = str(raw).strip().split(":")
+        hour, minute = int(hh), int(mm)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    except (ValueError, AttributeError):
+        pass
+    dh, dm = default.split(":")
+    print(f"[WARN] Invalid {env_name}={raw!r}; falling back to {default}.")
+    return int(dh), int(dm)
+
+
+def get_session_start_ct() -> datetime:
+    """Daily launch time (America/Chicago). Configurable via SESSION_START (HH:MM)."""
+    hour, minute = parse_session_time("SESSION_START", "09:00")
     now_ct = datetime.now(ZoneInfo("America/Chicago"))
-    return now_ct.hour < 9
+    return now_ct.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def get_session_close_ct() -> datetime:
+    """Daily close time (America/Chicago). Configurable via SESSION_END (HH:MM)."""
+    hour, minute = parse_session_time("SESSION_END", "15:00")
+    now_ct = datetime.now(ZoneInfo("America/Chicago"))
+    return now_ct.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def is_before_session_start() -> bool:
+    """Block new entries before the scheduled launch time (default 9:00 AM CT)."""
+    return datetime.now(ZoneInfo("America/Chicago")) < get_session_start_ct()
 
 def get_account_equity(executor):
     account = executor.client.get_account()
@@ -110,18 +141,19 @@ async def execute_candidates(governor, executor, portfolio_state, candidates):
 
 # --- EOD Liquidation ---
 
-def is_eod_liquidation_window() -> bool:
-    """True during the final stretch before the regular close (3:00 PM CT / 4:00 PM ET).
+def is_session_closing() -> bool:
+    """True once the scheduled close routine begins, and for the rest of the day.
 
-    Window length is configurable via EOD_LIQUIDATION_MINUTES (minutes before close
-    to start flattening; default 10). Note: assumes the regular 3:00 PM CT close and
-    does not adjust for half-day early closes.
+    Flattening starts EOD_LIQUIDATION_MINUTES (default 10) before the scheduled
+    close time (SESSION_END, default 3:00 PM CT / 4:00 PM ET) and stays active
+    through to the regular market close so nothing is re-opened afterward.
+    Note: assumes the configured close and does not adjust for half-day early closes.
     """
     lead_minutes = int(os.getenv("EOD_LIQUIDATION_MINUTES", 10))
     now_ct = datetime.now(ZoneInfo("America/Chicago"))
-    close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+    close_ct = get_session_close_ct()
     start_ct = close_ct - timedelta(minutes=lead_minutes)
-    return start_ct <= now_ct < close_ct
+    return now_ct >= start_ct
 
 
 async def liquidate_all_positions(executor):
@@ -239,9 +271,18 @@ async def main():
     portfolio_state = PortfolioState()
     governor = ExecutionGovernor(config=portfolio_config, portfolio_state=portfolio_state)
 
+    start_ct = get_session_start_ct()
+    close_ct = get_session_close_ct()
+    lead_minutes = int(os.getenv("EOD_LIQUIDATION_MINUTES", 10))
+
     print(f"--- REVERSION BOT STARTING ---")
     print(f"Timeframe: {timeframe} | Lookback: {lookback} | Mode: {'PAPER' if exec_config.paper else 'LIVE'}")
     print(f"Monitoring: {', '.join(symbols)}")
+    print(
+        f"Schedule (CT): launch {start_ct.strftime('%H:%M')} | "
+        f"flatten {(close_ct - timedelta(minutes=lead_minutes)).strftime('%H:%M')} | "
+        f"close {close_ct.strftime('%H:%M')}"
+    )
 
     try:
         while True:
@@ -252,14 +293,14 @@ async def main():
                 await asyncio.sleep(poll_interval)
                 continue
 
-            if is_eod_liquidation_window():
+            if is_session_closing():
                 await liquidate_all_positions(executor)
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] EOD liquidation done. Sleeping...")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Session closed (>= {os.getenv('SESSION_END', '15:00')} CT). Flattened. Sleeping...")
                 await asyncio.sleep(poll_interval)
                 continue
 
-            if is_morning_blackout():
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Morning blackout (9:30-10:00 ET). Sleeping...")
+            if is_before_session_start():
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Pre-launch (< {os.getenv('SESSION_START', '09:00')} CT). Sleeping...")
                 await asyncio.sleep(poll_interval)
                 continue
 

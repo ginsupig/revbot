@@ -3,10 +3,12 @@
     Supervisor wrapper for revbot — keeps a single live instance running.
 
 .DESCRIPTION
-    Launches `python main.py` and restarts it if it exits or crashes.
-    main.py manages market hours internally (it sleeps when the market is
-    closed and liquidates at EOD), so this wrapper's only job is to keep one
-    instance alive and restart it on failure with backoff.
+    Launches `python main.py` and restarts it only if it CRASHES (non-zero
+    exit). main.py runs the session itself: it sleeps until the open, trades,
+    liquidates at EOD, and exits cleanly (code 0) once the market has closed
+    for the day. A clean exit stops this supervisor too, so the task finishes
+    and tomorrow's open trigger starts a fresh run — i.e. fire-at-open,
+    stop-at-close, with crash-restart preserved.
 
     A global mutex guarantees only ONE supervisor runs at a time, so multiple
     Task Scheduler triggers (logon + daily) can never spawn duplicate bots
@@ -80,6 +82,15 @@ try {
 
         $ranSeconds = [int]((Get-Date) - $start).TotalSeconds
         Write-Log "main.py exited (code=$code) after ${ranSeconds}s"
+
+        # Clean exit (code 0) = the bot ended the session itself (market closed
+        # for the day, or a duplicate instance). Don't restart — let the task
+        # finish; tomorrow's open trigger starts a fresh run. Only a crash
+        # (non-zero) gets the restart-with-backoff treatment.
+        if ($code -eq 0) {
+            Write-Log "Clean exit — session over for the day. Supervisor stopping until next scheduled start."
+            break
+        }
 
         # Long run -> healthy, reset backoff. Instant death -> back off so we
         # don't hot-loop on a config/credential error.

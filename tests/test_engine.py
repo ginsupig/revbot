@@ -95,3 +95,18 @@ def test_falling_knife_blocks_long_entry():
     decision = engine.get_decision(df, symbol='SPY')
     assert decision.signal == 'WAIT'
     assert decision.reason == 'Downtrend_Too_Extended'
+
+
+def test_short_bias_relaxes_overbought_threshold():
+    # Normal thresholds are set so high that nothing ever counts as overbought;
+    # the risk-off thresholds are low. So a short only appears under short_bias.
+    cfg = ReversionConfig(
+        min_history=60, enable_shorts=True,
+        rsi_min=99.0, ri_short_threshold=9.0,           # normal: unreachable
+        risk_off_rsi_min=30.0, risk_off_ri_short_threshold=0.0,  # risk-off: easy
+    )
+    engine = ReversionEngine(cfg)
+    df = engine.calculate_indicators(make_overbought_df())
+
+    assert engine.get_decision(df, symbol='SPY', short_bias=False).signal != 'SHORT_REVERSION'
+    assert engine.get_decision(df, symbol='SPY', short_bias=True).signal == 'SHORT_REVERSION'

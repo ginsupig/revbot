@@ -30,6 +30,12 @@ class ReversionConfig:
     ri_short_threshold: float = 0.5
     rsi_min: float = 52.0
     rsi_hard_min: float = 30.0
+    # Relaxed short-entry thresholds used only when the market is risk-off AND
+    # favor-shorts mode is on: in a confirmed downtrend, fade rips more eagerly
+    # (a lower overbought bar) since bounces tend to fail. Applied via the
+    # short_bias flag threaded from main.py through the engine.
+    risk_off_rsi_min: float = 45.0
+    risk_off_ri_short_threshold: float = 0.25
 
     min_history: int = 160
 

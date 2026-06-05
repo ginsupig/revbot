@@ -194,6 +194,8 @@ class ReversionEngine:
         close = float(row["close"])
         lb1 = float(row["lb1"])
         lb2 = float(row["lb2"])
+        ub1 = float(row["ub1"]) if pd.notna(row["ub1"]) else None
+        ub2 = float(row["ub2"]) if pd.notna(row["ub2"]) else None
         sma = float(row["sma"])
         ri = float(row["ri"])
         atr = float(row["atr"])
@@ -273,6 +275,8 @@ class ReversionEngine:
                 close=close,
                 lb1=lb1,
                 lb2=lb2,
+                ub1=ub1,
+                ub2=ub2,
                 sma=sma,
                 ri=ri,
                 rsi=current_rsi,
@@ -283,6 +287,30 @@ class ReversionEngine:
                 dollar_volume=safety.dollar_volume,
             )
 
+        # Long setup did not validate. The long and short zones are mutually
+        # exclusive (price can't be at/below lb1 and at/above ub1 at once), so
+        # we only reach a short setup when there was no long to begin with.
+        if self.config.enable_shorts and ub1 is not None and ub2 is not None:
+            short_decision = self._evaluate_short(
+                row=row,
+                prev=prev,
+                safety=safety,
+                symbol=symbol,
+                close=close,
+                lb1=lb1,
+                lb2=lb2,
+                ub1=ub1,
+                ub2=ub2,
+                sma=sma,
+                ri=ri,
+                current_rsi=current_rsi,
+                atr=atr,
+                vwap=vwap,
+                trend_ema=trend_ema,
+            )
+            if short_decision is not None:
+                return short_decision
+
         return ReversionDecision(
             signal="WAIT",
             reason=reason,
@@ -290,10 +318,112 @@ class ReversionEngine:
             close=close,
             lb1=lb1,
             lb2=lb2,
+            ub1=ub1,
+            ub2=ub2,
             sma=sma,
             ri=ri,
             rsi=current_rsi,
             adx=float(row["adx"]),
+            atr=atr,
+            vwap=vwap,
+            spread_bps=safety.spread_bps,
+            dollar_volume=safety.dollar_volume,
+        )
+
+    def _evaluate_short(
+        self,
+        *,
+        row,
+        prev,
+        safety,
+        symbol,
+        close: float,
+        lb1: float,
+        lb2: float,
+        ub1: float,
+        ub2: float,
+        sma: float,
+        ri: float,
+        current_rsi: float,
+        atr: float,
+        vwap: float,
+        trend_ema: float,
+    ) -> ReversionDecision | None:
+        """Mirror of the long reversion setup: short overbought rips.
+
+        Returns a SHORT_REVERSION decision when every mirrored gate passes,
+        otherwise None (the caller falls through to the long-side WAIT reason).
+        All filter flags (reclaim/bullish-close/volume/vwap/trend) reuse the
+        same config switches as the long side, applied in the short direction.
+        """
+        adx = float(row["adx"])
+
+        # Reflected hard guard: don't short a capitulation that is also strongly
+        # trending down (mirror of the long blow-off-top block in is_market_safe).
+        if adx >= self.config.adx_hard_max and current_rsi <= self.config.rsi_hard_min:
+            return None
+
+        # Price must be at or above ub1 (or inside the ub1–ub2 band).
+        in_short_zone = close >= ub1
+        if not in_short_zone:
+            return None
+
+        overbought = (
+            ri >= self.config.ri_short_threshold
+            or current_rsi >= self.config.rsi_min
+        )
+        if not overbought:
+            return None
+
+        reject_ub1 = True
+        bearish_close = True
+        volume_ok = True
+        vwap_ok = True
+        trend_ok = True
+
+        if prev is not None:
+            prev_close = float(prev["close"])
+            prev_ub1 = float(prev["ub1"]) if pd.notna(prev["ub1"]) else ub1
+            # Mirror of reclaim_lb1: a rejection back below ub1, or any down-tick.
+            reject_ub1 = (prev_close > prev_ub1 and close < ub1) or close < prev_close
+            bearish_close = close <= float(row["open"])
+
+            avg_volume = float(row["avg_volume"]) if pd.notna(row["avg_volume"]) else 0.0
+            volume_ok = (
+                avg_volume <= 0
+                or float(row["volume"]) >= avg_volume * self.config.volume_multiplier_min
+            )
+
+        if self.config.use_vwap_filter and vwap > 0:
+            vwap_ok = abs((close - vwap) / vwap) <= self.config.max_vwap_extension_pct
+
+        if self.config.use_trend_filter:
+            # Mirror of the long trend filter: only short when not far *above* the
+            # higher-timeframe trend (i.e. price is not in a strong uptrend).
+            trend_ok = close <= trend_ema * 1.035
+
+        if self.config.require_reclaim_lb1 and not reject_ub1:
+            return None
+        if self.config.require_bullish_close and not bearish_close:
+            return None
+        if self.config.require_volume_expansion and not volume_ok:
+            return None
+        if not vwap_ok or not trend_ok:
+            return None
+
+        return ReversionDecision(
+            signal="SHORT_REVERSION",
+            reason="Validated_Short_Reversion",
+            symbol=symbol,
+            close=close,
+            lb1=lb1,
+            lb2=lb2,
+            ub1=ub1,
+            ub2=ub2,
+            sma=sma,
+            ri=ri,
+            rsi=current_rsi,
+            adx=adx,
             atr=atr,
             vwap=vwap,
             spread_bps=safety.spread_bps,

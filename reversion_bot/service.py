@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 import hashlib
 import logging
+import math
+import threading
 
 import pandas as pd
 
@@ -42,6 +44,11 @@ class ReversionService:
         }
         self.risk = RiskManager(risk_config)
         self.ml_learner = MLSignalLearner()
+        # evaluate_symbol runs concurrently (asyncio.gather -> threads) over this
+        # one shared model. fit() rebuilds estimators_ in place, so an overlapping
+        # predict_proba() can divide by zero estimators and return inf/nan. This
+        # lock serializes all ML access so train and predict never overlap.
+        self._ml_lock = threading.Lock()
         self.perf_cfg = performance_config or PerformanceConfig()
         self.perf = PerformanceTracker(self.perf_cfg.state_dir)
 
@@ -347,34 +354,43 @@ class ReversionService:
             return 0.5
 
         data_hash = self._hash_frame_tail(df, rows=200)
-        should_train = (
-            self.ml_last_train_data_hash != data_hash
-            and (self.ml_eval_count == 1 or self.ml_eval_count % self.ml_train_every == 0)
-        )
-        if should_train:
-            try:
-                X, y = self.ml_learner.prepare_features(df)
-                if len(X) >= 50 and y.nunique() >= 2:
-                    self.ml_learner.model.fit(X, y)
-                    self.ml_last_train_data_hash = data_hash
-                    self.logger.info("ML retrained rows=%s classes=%s", len(X), int(y.nunique()))
-            except Exception as exc:
-                self.logger.warning("ML retrain error: %s", exc)
+        # Hold the lock across train+predict so a concurrent fit() can never
+        # leave the forest with zero estimators mid-predict (the inf/nan source).
+        with self._ml_lock:
+            should_train = (
+                self.ml_last_train_data_hash != data_hash
+                and (self.ml_eval_count == 1 or self.ml_eval_count % self.ml_train_every == 0)
+            )
+            if should_train:
+                try:
+                    X, y = self.ml_learner.prepare_features(df)
+                    if len(X) >= 50 and y.nunique() >= 2:
+                        self.ml_learner.model.fit(X, y)
+                        self.ml_last_train_data_hash = data_hash
+                        self.logger.info("ML retrained rows=%s classes=%s", len(X), int(y.nunique()))
+                except Exception as exc:
+                    self.logger.warning("ML retrain error: %s", exc)
 
-        try:
-            X, _ = self.ml_learner.prepare_features(df)
-            if len(X) == 0:
+            try:
+                X, _ = self.ml_learner.prepare_features(df)
+                if len(X) == 0:
+                    return 0.5
+                proba = self.ml_learner.model.predict_proba(X)
+                if len(proba) == 0:
+                    return 0.5
+                row = proba[-1]
+                if len(row) < 2:
+                    return 0.5
+                p = float(row[1])
+            except Exception as exc:
+                self.logger.warning("ML probability error: %s", exc)
                 return 0.5
-            proba = self.ml_learner.model.predict_proba(X)
-            if len(proba) == 0:
-                return 0.5
-            row = proba[-1]
-            if len(row) < 2:
-                return 0.5
-            return float(row[1])
-        except Exception as exc:
-            self.logger.warning("ML probability error: %s", exc)
+
+        # Defense in depth: never let a non-finite or out-of-range probability
+        # leak into the weighted score (an inf would pass any threshold).
+        if not math.isfinite(p):
             return 0.5
+        return min(max(p, 0.0), 1.0)
 
     def _get_trendfail_score(self, df: pd.DataFrame, engine: ReversionEngine | None = None) -> float:
         engine = engine or self.engine
@@ -413,7 +429,16 @@ class ReversionService:
             return 0.30
 
     def _weighted_score(self, component_scores: Dict[str, float]) -> float:
-        return sum(self.weights.get(name, 0.0) * float(value) for name, value in component_scores.items())
+        # Treat any non-finite component as neutral-zero so a single bad signal
+        # (e.g. an inf ML probability) can never produce an inf/nan trade score
+        # that would silently pass the entry threshold.
+        total = 0.0
+        for name, value in component_scores.items():
+            v = float(value)
+            if not math.isfinite(v):
+                v = 0.0
+            total += self.weights.get(name, 0.0) * v
+        return total
 
     @staticmethod
     def _hash_frame_tail(df: pd.DataFrame, rows: int = 200) -> str:

@@ -83,6 +83,10 @@ class ExecutionConfig:
     tif: str = "day"
     paper: bool = True
     base_url: str = ""
+    # HTTP connection-pool size for the Alpaca REST session. The bot evaluates
+    # the whole universe concurrently, so the requests default of 10 overflows
+    # and logs "Connection pool is full, discarding connection" every cycle.
+    conn_pool_maxsize: int = 32
 
 
 @dataclass(frozen=True)

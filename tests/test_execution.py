@@ -111,3 +111,17 @@ def test_has_open_position_detects_both_sides():
     assert long_ex.has_open_position("SPY") and long_ex.has_open_long_position("SPY")
     assert short_ex.has_open_position("SPY") and short_ex.has_open_short_position("SPY")
     assert not flat_ex.has_open_position("SPY")
+
+
+def test_tune_connection_pool_mounts_larger_adapter():
+    import requests
+    ex = make_executor()
+    ex.client._session = requests.Session()
+    ex._tune_connection_pool(32)
+    adapter = ex.client._session.get_adapter("https://paper-api.alpaca.markets")
+    assert getattr(adapter, "_pool_maxsize", None) == 32
+
+
+def test_tune_connection_pool_noop_without_session():
+    ex = make_executor()  # FakeClient has no _session attribute
+    ex._tune_connection_pool(32)  # must not raise

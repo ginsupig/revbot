@@ -155,6 +155,19 @@ class ReversionEngine:
                 dollar_volume=dollar_volume,
             )
 
+        # Mirror of the blow-off-top block above: refuse to fade a strong
+        # *downtrend* that is also deeply oversold (a falling knife). Without
+        # this, a long-reversion would buy names like ADX~60 / RSI~22.
+        if adx is not None and adx >= self.config.adx_hard_max and rsi <= self.config.rsi_hard_min:
+            return SafetyDecision(
+                False,
+                "Downtrend_Too_Extended",
+                adx=adx,
+                rsi=rsi,
+                spread_bps=spread_bps,
+                dollar_volume=dollar_volume,
+            )
+
         return SafetyDecision(
             True,
             "Safe",

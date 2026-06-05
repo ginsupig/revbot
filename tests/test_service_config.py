@@ -54,3 +54,20 @@ def test_ml_probability_clamps_non_finite(tmp_path):
 
     svc.ml_learner.model = _InfModel()
     assert svc._get_ml_probability(pd.DataFrame({"close": [1.0, 2.0, 3.0]})) == 0.5
+
+
+def test_short_bias_threads_through_service(tmp_path):
+    # With unreachable normal short thresholds, a short only fires when the
+    # service passes short_bias=True down to the engine.
+    from reversion_bot.config import ReversionConfig, RiskConfig
+    from test_engine import make_overbought_df
+
+    cfg = ReversionConfig(
+        min_history=60, enable_shorts=True,
+        rsi_min=99.0, ri_short_threshold=9.0,
+        risk_off_rsi_min=30.0, risk_off_ri_short_threshold=0.0,
+    )
+    svc = ReversionService(cfg, RiskConfig(), PerformanceConfig(state_dir=str(tmp_path)))
+    df = make_overbought_df()
+    assert svc.evaluate_symbol("T", df, 100000, short_bias=False).get("go_short") is not True
+    assert svc.evaluate_symbol("T", df, 100000, short_bias=True).get("go_short") is True

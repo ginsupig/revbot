@@ -80,12 +80,12 @@ class ReversionService:
         """The symbol's own tuned engine, or the shared default."""
         return self._symbol_engines.get(str(symbol).upper(), self.engine)
 
-    def evaluate_symbol(self, symbol: str, df: pd.DataFrame, account_equity: float) -> Dict[str, Any]:
+    def evaluate_symbol(self, symbol: str, df: pd.DataFrame, account_equity: float, short_bias: bool = False) -> Dict[str, Any]:
         self.logger.info("Evaluating symbol=%s rows=%s", symbol, len(df))
 
         engine = self._engine_for(symbol)
         enriched = engine.calculate_indicators(df)
-        decision = engine.get_decision(enriched, symbol=symbol)
+        decision = engine.get_decision(enriched, symbol=symbol, short_bias=short_bias)
 
         mean_reversion_score = self._score_mean_reversion(decision, enriched, engine)
         ml_probability = self._get_ml_probability(df)
@@ -144,11 +144,14 @@ class ReversionService:
         go_long = passes_score and not is_short_signal
         # Shorts are mean-reversion only and require conviction in that component,
         # so an overbought rip routed to any other style never opens a short.
+        # In risk-off favor-shorts mode the conviction floor is relaxed slightly
+        # so the loosened engine trigger actually produces trades.
+        mr_floor = 0.40 if short_bias else 0.45
         go_short = (
             passes_score
             and is_short_signal
             and entry_style == "mean_reversion"
-            and component_scores["mean_reversion"] >= 0.45
+            and component_scores["mean_reversion"] >= mr_floor
         )
 
         if entry_style == "trend_following" and component_scores["trend_following"] < 0.55:

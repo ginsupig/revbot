@@ -193,8 +193,10 @@ class ExecutionGovernor:
             return False
 
         open_symbols = [str(p.symbol).upper() for p in positions]
-        open_styles: Dict[str, int] = {}
-        open_regimes: Dict[str, int] = {}
+        # Reconstruct style/regime counts from persisted metadata (broker
+        # positions don't carry these tags) so the per-style and per-regime
+        # caps actually bind instead of comparing against empty dicts.
+        open_styles, open_regimes = self.portfolio_state.open_style_regime_counts(open_symbols)
         current_total_exposure = sum(abs(float(p.market_value)) for p in positions)
         current_total_heat = self.total_drawdown_heat(positions)
 

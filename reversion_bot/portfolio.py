@@ -38,6 +38,10 @@ class PortfolioState:
             "last_equity": None,
             "daily_new_positions": [],
             "last_trade_ts_by_symbol": {},
+            # symbol -> {"entry_style","regime"} for each position we opened.
+            # Broker positions don't carry these tags, so we persist them here to
+            # reconstruct per-style / per-regime open counts for the governor.
+            "position_meta": {},
         }
 
     def _load(self) -> Dict[str, Any]:
@@ -100,7 +104,35 @@ class PortfolioState:
         daily.append(timestamp_iso)
         data["daily_new_positions"] = daily
         data.setdefault("last_trade_ts_by_symbol", {})[symbol.upper()] = timestamp_iso
+        data.setdefault("position_meta", {})[symbol.upper()] = {
+            "entry_style": entry_style,
+            "regime": regime,
+        }
         self._save(data)
+
+    def open_style_regime_counts(self, open_symbols) -> tuple[Dict[str, int], Dict[str, int]]:
+        """Reconstruct per-style and per-regime counts for currently-open symbols.
+
+        Intersecting stored metadata with the live open-symbol set means closed
+        positions never inflate the counts, so the governor's style/regime caps
+        reflect what is actually held right now.
+        """
+        data = self._load()
+        meta = data.get("position_meta", {})
+        open_set = {str(s).upper() for s in open_symbols}
+        styles: Dict[str, int] = {}
+        regimes: Dict[str, int] = {}
+        for sym in open_set:
+            entry = meta.get(sym)
+            if not entry:
+                continue
+            style = entry.get("entry_style")
+            regime = entry.get("regime")
+            if style:
+                styles[style] = styles.get(style, 0) + 1
+            if regime:
+                regimes[regime] = regimes.get(regime, 0) + 1
+        return styles, regimes
 
     def daily_new_positions_count(self, date_prefix: str) -> int:
         data = self._load()

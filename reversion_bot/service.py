@@ -30,6 +30,7 @@ class ReversionService:
         performance_config: PerformanceConfig | None = None,
         log_file: str = "reversion_service.log",
         symbol_configs: Dict[str, ReversionConfig] | None = None,
+        min_trade_score: float | None = None,
     ) -> None:
         self.engine = ReversionEngine(strategy_config)
         # Per-symbol engines (each with its own tuned config). Read-only after
@@ -55,7 +56,7 @@ class ReversionService:
             "trendfail": 0.15,
             "trend_following": 0.30,
         }
-        self.min_trade_score = 0.36
+        self.min_trade_score = 0.36 if min_trade_score is None else float(min_trade_score)
 
         self.logger = logging.getLogger("ReversionService")
         self.logger.setLevel(logging.INFO)

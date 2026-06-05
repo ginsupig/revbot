@@ -217,16 +217,54 @@ async def main():
         min_history=lookback,
         min_dollar_volume=float(os.getenv("MIN_DOLLAR_VOLUME", 750000.0)),
         min_price=float(os.getenv("MIN_PRICE", 5.0)),
+        max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", 40.0)),
+        # Bollinger band entry zone (lb1/lb2 = sma -/+ band_std * std).
+        band_length=int(os.getenv("BAND_LENGTH", 20)),
+        band_std_1=float(os.getenv("BAND_STD_1", 1.0)),
+        band_std_2=float(os.getenv("BAND_STD_2", 2.0)),
+        # Indicator lookbacks.
+        ri_length=int(os.getenv("RI_LENGTH", 20)),
+        rsi_length=int(os.getenv("RSI_LENGTH", 14)),
+        adx_length=int(os.getenv("ADX_LENGTH", 14)),
+        trend_ema_length=int(os.getenv("TREND_EMA_LENGTH", 50)),
+        # Long oversold gates.
+        ri_threshold=float(os.getenv("RI_THRESHOLD", -0.5)),
+        rsi_max=float(os.getenv("RSI_MAX", 48.0)),
+        adx_max=float(os.getenv("ADX_MAX", 40.0)),
+        adx_hard_max=float(os.getenv("ADX_HARD_MAX", 50.0)),
+        rsi_hard_max=float(os.getenv("RSI_HARD_MAX", 70.0)),
+        max_vwap_extension_pct=float(os.getenv("MAX_VWAP_EXTENSION_PCT", 0.012)),
         require_reclaim_lb1=parse_bool(os.getenv("REQUIRE_RECLAIM_LB1", "False")),
+        require_bullish_close=parse_bool(os.getenv("REQUIRE_BULLISH_CLOSE", "False")),
+        require_volume_expansion=parse_bool(os.getenv("REQUIRE_VOLUME_EXPANSION", "False")),
         use_vwap_filter=parse_bool(os.getenv("USE_VWAP_FILTER", "False")),
         use_trend_filter=parse_bool(os.getenv("USE_TREND_FILTER", "False")),
+        # Volume confirmation.
+        volume_lookback=int(os.getenv("VOLUME_LOOKBACK", 20)),
+        volume_multiplier_min=float(os.getenv("VOLUME_MULTIPLIER_MIN", 1.0)),
+        # Trend-fail strategy.
+        trendfail_window=int(os.getenv("TRENDFAIL_WINDOW", 20)),
+        trendfail_threshold=float(os.getenv("TRENDFAIL_THRESHOLD", 0.005)),
+        # Short side (mirror) gates.
         enable_shorts=parse_bool(os.getenv("ENABLE_SHORTS", "True"), default=True),
+        ri_short_threshold=float(os.getenv("RI_SHORT_THRESHOLD", 0.5)),
+        rsi_min=float(os.getenv("RSI_MIN", 52.0)),
+        rsi_hard_min=float(os.getenv("RSI_HARD_MIN", 30.0)),
     )
 
     risk_config = RiskConfig(
         risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", 0.005)),
         max_position_value_pct=float(os.getenv("MAX_POSITION_VALUE_PCT", 0.15)),
         min_rr=float(os.getenv("MIN_RR", 1.5)),
+        # Per-style ATR stop/target multiples.
+        stop_atr_multiple=float(os.getenv("STOP_ATR_MULTIPLE", 1.20)),
+        target_atr_multiple=float(os.getenv("TARGET_ATR_MULTIPLE", 2.00)),
+        trend_stop_atr_multiple=float(os.getenv("TREND_STOP_ATR_MULTIPLE", 1.20)),
+        trend_target_atr_multiple=float(os.getenv("TREND_TARGET_ATR_MULTIPLE", 3.00)),
+        trendfail_stop_atr_multiple=float(os.getenv("TRENDFAIL_STOP_ATR_MULTIPLE", 1.10)),
+        trendfail_target_atr_multiple=float(os.getenv("TRENDFAIL_TARGET_ATR_MULTIPLE", 2.20)),
+        atr_length=int(os.getenv("ATR_LENGTH", 14)),
+        atr_floor_pct=float(os.getenv("ATR_FLOOR_PCT", 0.0035)),
     )
 
     if not base_url:
@@ -285,7 +323,12 @@ async def main():
             print("[ALLOWLIST] No symbols passed the allowlist gate — nothing to trade this session.")
 
     # 4. Initialize Remaining Services
-    perf_config = PerformanceConfig(state_dir="state/performance")
+    perf_config = PerformanceConfig(
+        state_dir=os.getenv("PERF_STATE_DIR", "state/performance"),
+        enable_adaptive_threshold=parse_bool(os.getenv("PERF_ENABLE_ADAPTIVE_THRESHOLD", "True"), default=True),
+        min_samples=int(os.getenv("PERF_MIN_SAMPLES", 20)),
+        max_threshold_adj=float(os.getenv("PERF_MAX_THRESHOLD_ADJ", 0.05)),
+    )
     portfolio_config = PortfolioConfig(
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", 4)),
         max_trades_per_cycle=int(os.getenv("MAX_TRADES_PER_CYCLE", 2)),
@@ -316,7 +359,13 @@ async def main():
         print(f"[PARAMS] Per-symbol configs loaded: {len(symbol_configs)} "
               f"({len(covered)} of {len(symbols)} in today's universe use their own params).")
 
-    service = ReversionService(strategy_config, risk_config, perf_config, symbol_configs=symbol_configs)
+    service = ReversionService(
+        strategy_config,
+        risk_config,
+        perf_config,
+        symbol_configs=symbol_configs,
+        min_trade_score=float(os.getenv("MIN_TRADE_SCORE", 0.36)),
+    )
     portfolio_state = PortfolioState()
     governor = ExecutionGovernor(config=portfolio_config, portfolio_state=portfolio_state)
 

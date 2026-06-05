@@ -95,7 +95,7 @@ async def fetch_bars_for_symbol(symbol: str, timeframe: str, lookback: int):
 
 async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor):
     try:
-        if await asyncio.to_thread(executor.has_open_long_position, symbol):
+        if await asyncio.to_thread(executor.has_open_position, symbol):
             return None
 
         bars = await fetch_bars_for_symbol(symbol, timeframe, lookback)
@@ -169,18 +169,23 @@ async def liquidate_all_positions(executor):
 
     for pos in positions:
         symbol = str(pos.symbol).upper()
-        qty = int(float(pos.qty))
+        signed_qty = int(float(pos.qty))
+        qty = abs(signed_qty)
+        if qty == 0:
+            continue
+        # Flatten in the closing direction: sell to exit a long, buy to cover a short.
+        side = "sell" if signed_qty > 0 else "buy"
         try:
             executor.client.submit_order(
                 symbol=symbol,
                 qty=qty,
-                side="sell",
+                side=side,
                 type="market",
                 time_in_force="day",
             )
-            print(f"[EOD] Market sell submitted: {symbol} x{qty}")
+            print(f"[EOD] Market {side} submitted: {symbol} x{qty}")
         except Exception as e:
-            print(f"[EOD] Failed to submit sell for {symbol}: {e}")
+            print(f"[EOD] Failed to submit {side} for {symbol}: {e}")
 
 
 # --- Main Entry Point ---
@@ -215,6 +220,7 @@ async def main():
         require_reclaim_lb1=parse_bool(os.getenv("REQUIRE_RECLAIM_LB1", "False")),
         use_vwap_filter=parse_bool(os.getenv("USE_VWAP_FILTER", "False")),
         use_trend_filter=parse_bool(os.getenv("USE_TREND_FILTER", "False")),
+        enable_shorts=parse_bool(os.getenv("ENABLE_SHORTS", "True"), default=True),
     )
 
     risk_config = RiskConfig(
@@ -316,6 +322,7 @@ async def main():
 
     print(f"--- REVERSION BOT STARTING ---")
     print(f"Timeframe: {timeframe} | Lookback: {lookback} | Mode: {'PAPER' if exec_config.paper else 'LIVE'}")
+    print(f"Shorts: {'ENABLED' if strategy_config.enable_shorts else 'disabled'}")
     print(f"Monitoring: {', '.join(symbols)}")
 
     cycle = 0
@@ -366,7 +373,7 @@ async def main():
             ]
             raw_results = await asyncio.gather(*eval_tasks)
             all_results = [r for r in raw_results if r is not None]
-            candidates = [r for r in all_results if r.get("go_long")]
+            candidates = [r for r in all_results if r.get("go_long") or r.get("go_short")]
 
             # Keep equity tracking current for drawdown checks
             if all_results:

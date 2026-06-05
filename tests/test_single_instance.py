@@ -56,3 +56,33 @@ def test_dead_pid_detection():
     assert _pid_alive(0) is False
     assert _pid_alive(-1) is False
     assert _pid_alive(os.getpid()) is True
+
+
+def test_live_foreign_holder_is_refused(tmp_path, monkeypatch):
+    # A different, *alive* process holds the lock -> acquire must refuse and
+    # leave the existing lock untouched (the core of the single-instance safety).
+    import reversion_bot.single_instance as si
+
+    lock = tmp_path / "revbot.lock"
+    lock.write_text("424242")
+    monkeypatch.setattr(si, "_pid_alive", lambda pid: pid == 424242)
+
+    ok, holder = si.acquire_lock(lock)
+    assert ok is False
+    assert holder == 424242
+    assert lock.read_text().strip() == "424242"   # foreign lock preserved
+
+
+def test_atomic_acquire_is_exclusive(tmp_path):
+    # First caller wins; acquiring again returns held-by-us rather than silently
+    # granting a second independent lock or clearing the owner's file.
+    lock = tmp_path / "revbot.lock"
+    ok1, pid1 = acquire_lock(lock)
+    assert ok1 is True and pid1 == os.getpid()
+
+    ok2, pid2 = acquire_lock(lock)
+    assert ok2 is True and pid2 == os.getpid()
+    assert lock.read_text().strip() == str(os.getpid())
+
+    release_lock(lock)
+    assert not lock.exists()

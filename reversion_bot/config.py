@@ -20,6 +20,17 @@ class ReversionConfig:
     rsi_max: float = 48.0
     rsi_hard_max: float = 70.0
 
+    # --- Short side (mean-reversion mirror) ---------------------------------
+    # When enabled, the engine also emits SHORT_REVERSION on overbought rips:
+    # the exact mirror of the long oversold-dip entry. Thresholds are reflected
+    # around the neutral midpoints (RI 0, RSI 50). rsi_hard_min guards against
+    # shorting into a capitulation that is *also* strongly trending (the mirror
+    # of rsi_hard_max, which blocks longs into a blow-off top).
+    enable_shorts: bool = True
+    ri_short_threshold: float = 0.5
+    rsi_min: float = 52.0
+    rsi_hard_min: float = 30.0
+
     min_history: int = 160
 
     require_reclaim_lb1: bool = False

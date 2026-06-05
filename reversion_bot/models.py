@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Optional, Literal, Dict, Any
 
-Signal = Literal['LONG_REVERSION', 'WAIT']
+Signal = Literal['LONG_REVERSION', 'SHORT_REVERSION', 'WAIT']
 
 
 @dataclass
@@ -24,6 +24,8 @@ class ReversionDecision:
     close: Optional[float] = None
     lb1: Optional[float] = None
     lb2: Optional[float] = None
+    ub1: Optional[float] = None
+    ub2: Optional[float] = None
     sma: Optional[float] = None
     ri: Optional[float] = None
     rsi: Optional[float] = None
@@ -48,6 +50,10 @@ class PositionPlan:
     rr_ratio: float
     position_value: float
     max_account_risk: float
+    # Direction of the trade. "long" buys with a stop below / target above;
+    # "short" sells-to-open with a stop above / target below. Defaults to "long"
+    # so existing long-only call sites and persisted plans are unaffected.
+    side: str = "long"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

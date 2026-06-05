@@ -35,3 +35,36 @@ def test_wait_when_no_valid_setup():
     df = engine.calculate_indicators(make_df())
     decision = engine.get_decision(df, symbol='SPY')
     assert decision.signal == 'WAIT'
+
+
+def make_overbought_df(n=160):
+    """A ranging oscillation that ends on a swing high poking above the upper
+    band — the mirror of the oversold dip the long side looks for."""
+    idx = pd.date_range('2026-01-01', periods=n, freq='min')
+    t = np.arange(n)
+    # Several gentle cycles keep ADX low (range regime, passes the safety gate),
+    # and the phase is chosen so the final bar sits near a peak.
+    close = 100 + 3.0 * np.sin(2 * np.pi * t / 25.0)
+    close[-1] = close.max() + 0.5  # final push above ub1
+    open_ = close - 0.05           # green-ish bars; bearish_close not required by default
+    high = np.maximum(open_, close) + 0.10
+    low = np.minimum(open_, close) - 0.10
+    volume = np.full(n, 60000)
+    return pd.DataFrame({
+        'open': open_, 'high': high, 'low': low, 'close': close, 'volume': volume,
+    }, index=idx)
+
+
+def test_short_signal_on_overbought_when_enabled():
+    engine = ReversionEngine(ReversionConfig(min_history=60, enable_shorts=True))
+    df = engine.calculate_indicators(make_overbought_df())
+    decision = engine.get_decision(df, symbol='SPY')
+    assert decision.signal == 'SHORT_REVERSION'
+    assert decision.ub1 is not None and decision.close >= decision.ub1
+
+
+def test_no_short_when_disabled():
+    engine = ReversionEngine(ReversionConfig(min_history=60, enable_shorts=False))
+    df = engine.calculate_indicators(make_overbought_df())
+    decision = engine.get_decision(df, symbol='SPY')
+    assert decision.signal != 'SHORT_REVERSION'

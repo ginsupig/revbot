@@ -114,6 +114,37 @@ class AlpacaExecutor:
         self._order_ids.add(order_key)
         return response
 
+    def open_short_bracket(self, symbol: str, plan: PositionPlan):
+        symbol = symbol.strip().upper()
+        self._validate_short_plan(plan)
+
+        clock = self.client.get_clock()
+        if not clock.is_open:
+            raise RuntimeError("Market is closed. Cannot submit order.")
+
+        if self.has_open_short_position(symbol):
+            raise RuntimeError(f"Short position for {symbol} already exists.")
+
+        order_key = self._order_key(symbol, plan)
+        if order_key in self._order_ids:
+            raise RuntimeError(f"Duplicate order detected for {order_key}.")
+
+        order_data = {
+            "symbol": symbol,
+            "qty": plan.qty,
+            "side": "sell",
+            "type": "market",
+            "time_in_force": self._tif,
+            "order_class": "bracket",
+            # On a short, profit is taken *below* entry and the stop sits *above*.
+            "take_profit": {"limit_price": round(plan.target_price, 2)},
+            "stop_loss": {"stop_price": round(plan.stop_price, 2)}
+        }
+
+        response = self.client.submit_order(**order_data)
+        self._order_ids.add(order_key)
+        return response
+
     def submit_order(self, candidate: dict):
         symbol = candidate["symbol"]
         pd = candidate["position_plan"]
@@ -127,7 +158,11 @@ class AlpacaExecutor:
             rr_ratio=pd["rr_ratio"],
             position_value=pd["position_value"],
             max_account_risk=pd["max_account_risk"],
+            side=pd.get("side", "long"),
         )
+        # Prefer the candidate's explicit go_short flag; fall back to plan side.
+        if candidate.get("go_short") or plan.side == "short":
+            return self.open_short_bracket(symbol, plan)
         return self.open_long_bracket(symbol, plan)
 
     def replace_limit_order(self, order_id: str, new_limit_price: float):
@@ -147,6 +182,19 @@ class AlpacaExecutor:
         positions = self.get_positions()
         return any(str(p.symbol).upper() == symbol and float(p.qty) > 0 for p in positions)
 
+    def has_open_short_position(self, symbol: str) -> bool:
+        positions = self.get_positions()
+        return any(str(p.symbol).upper() == symbol and float(p.qty) < 0 for p in positions)
+
+    def has_open_position(self, symbol: str) -> bool:
+        """True if any position (long or short) is open for the symbol.
+
+        Used as the pre-entry guard so the bot never stacks a new trade on top
+        of an existing one in either direction.
+        """
+        positions = self.get_positions()
+        return any(str(p.symbol).upper() == symbol and float(p.qty) != 0 for p in positions)
+
     @staticmethod
     def _validate_plan(plan: PositionPlan) -> None:
         if plan.qty <= 0:
@@ -159,6 +207,19 @@ class AlpacaExecutor:
             raise ValueError("Stop price must be below entry for long bracket.")
         if plan.target_price <= plan.entry_price:
             raise ValueError("Target price must be above entry for long bracket.")
+
+    @staticmethod
+    def _validate_short_plan(plan: PositionPlan) -> None:
+        if plan.qty <= 0:
+            raise ValueError("Quantity must be positive.")
+        if plan.entry_price <= 0:
+            raise ValueError("Entry price must be positive.")
+        if plan.stop_price <= 0 or plan.target_price <= 0:
+            raise ValueError("Stop and target prices must be positive.")
+        if plan.stop_price <= plan.entry_price:
+            raise ValueError("Stop price must be above entry for short bracket.")
+        if plan.target_price >= plan.entry_price:
+            raise ValueError("Target price must be below entry for short bracket.")
 
     @staticmethod
     def _order_key(symbol: str, plan: PositionPlan) -> str:

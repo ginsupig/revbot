@@ -121,6 +121,7 @@ class ReversionService:
                 "trade_score": round(weighted_score, 4),
                 "threshold": round(threshold, 4),
                 "go_long": False,
+                "go_short": False,
                 "regime": regime,
                 "entry_style": entry_style,
                 "router_reason": f"hard_gate:{decision.reason}",
@@ -129,7 +130,18 @@ class ReversionService:
             self._persist_eval(symbol, regime, entry_style, decision, payload["router_reason"], weighted_score, threshold, row, go_long=False)
             return payload
 
-        go_long = weighted_score >= threshold and router_reason != "score_below_threshold"
+        is_short_signal = decision.signal == "SHORT_REVERSION"
+        passes_score = weighted_score >= threshold and router_reason != "score_below_threshold"
+
+        go_long = passes_score and not is_short_signal
+        # Shorts are mean-reversion only and require conviction in that component,
+        # so an overbought rip routed to any other style never opens a short.
+        go_short = (
+            passes_score
+            and is_short_signal
+            and entry_style == "mean_reversion"
+            and component_scores["mean_reversion"] >= 0.45
+        )
 
         if entry_style == "trend_following" and component_scores["trend_following"] < 0.55:
             go_long = False
@@ -146,6 +158,7 @@ class ReversionService:
             "trade_score": round(weighted_score, 4),
             "threshold": round(threshold, 4),
             "go_long": False,
+            "go_short": False,
             "regime": regime,
             "entry_style": entry_style,
             "router_reason": router_reason,
@@ -154,19 +167,25 @@ class ReversionService:
         self._log_eval(symbol, regime, decision, router_reason, component_scores, weighted_score, threshold, row)
         self._persist_eval(symbol, regime, entry_style, decision, router_reason, weighted_score, threshold, row, go_long=go_long)
 
-        if go_long:
+        if go_long or go_short:
+            side = "short" if go_short else "long"
             plan = self.risk.build_plan_for_style(
                 entry_style=entry_style,
                 account_equity=account_equity,
                 decision=decision,
                 conviction_score=weighted_score,
+                side=side,
             )
             if plan is None:
                 payload["router_reason"] = f"plan_rejected:{entry_style}"
                 return payload
 
             payload["position_plan"] = asdict(plan)
-            payload["go_long"] = True
+            payload["side"] = side
+            if go_short:
+                payload["go_short"] = True
+            else:
+                payload["go_long"] = True
             payload["portfolio_heat"] = float(plan.qty) * float(plan.risk_per_share)
 
             hour = datetime.utcnow().hour
@@ -259,6 +278,10 @@ class ReversionService:
         tf = float(component_scores["trend_following"])
         tff = float(component_scores["trendfail"])
 
+        # A validated short is mean-reversion only and takes precedence over the
+        # trend-regime branch (we never route an overbought short to trend-follow).
+        if engine_signal == "SHORT_REVERSION" and mr >= 0.45:
+            return "mean_reversion", "engine_validated_short_reversion"
         if regime == "trend" and tf >= 0.55:
             return "trend_following", "trend_regime_alignment"
         if engine_signal == "LONG_REVERSION" and mr >= 0.45:
@@ -282,19 +305,35 @@ class ReversionService:
 
     def _score_mean_reversion(self, decision, enriched: pd.DataFrame, engine: ReversionEngine | None = None) -> float:
         engine = engine or self.engine
+        is_short = decision.signal == "SHORT_REVERSION"
         score = 0.20
-        if decision.signal == "LONG_REVERSION":
+        if decision.signal in ("LONG_REVERSION", "SHORT_REVERSION"):
             score += 0.25
-        if decision.close is not None and decision.lb1 is not None and decision.lb2 is not None:
+        # Band depth: how far past the entry band the price has stretched.
+        # Long measures depth below lb1 (toward lb2); short mirrors it above ub1.
+        if is_short:
+            if decision.close is not None and decision.ub1 is not None and decision.ub2 is not None:
+                zone_width = max(decision.ub2 - decision.ub1, 1e-9)
+                depth = (decision.close - decision.ub1) / zone_width
+                score += min(max(depth, 0.0), 1.0) * 0.20
+        elif decision.close is not None and decision.lb1 is not None and decision.lb2 is not None:
             zone_width = max(decision.lb1 - decision.lb2, 1e-9)
             depth = (decision.lb1 - decision.close) / zone_width
             score += min(max(depth, 0.0), 1.0) * 0.20
         if decision.ri is not None:
-            threshold = getattr(engine.config, "ri_threshold", -0.5)
-            oversold_distance = max(threshold - decision.ri, 0.0)
-            score += min(oversold_distance / 0.75, 1.0) * 0.15
+            if is_short:
+                threshold = getattr(engine.config, "ri_short_threshold", 0.5)
+                stretch = max(decision.ri - threshold, 0.0)
+            else:
+                threshold = getattr(engine.config, "ri_threshold", -0.5)
+                stretch = max(threshold - decision.ri, 0.0)
+            score += min(stretch / 0.75, 1.0) * 0.15
         if decision.rsi is not None:
-            softness = max((engine.config.rsi_max + 10) - decision.rsi, 0.0)
+            if is_short:
+                rsi_min = getattr(engine.config, "rsi_min", 52.0)
+                softness = max(decision.rsi - (rsi_min - 10), 0.0)
+            else:
+                softness = max((engine.config.rsi_max + 10) - decision.rsi, 0.0)
             score += min(softness / 25.0, 1.0) * 0.10
         if decision.adx is not None:
             adx_buffer = max((engine.config.adx_max + 5) - decision.adx, 0.0)

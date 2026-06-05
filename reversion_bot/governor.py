@@ -144,7 +144,7 @@ class ExecutionGovernor:
         Extracts all required state from the candidate payload + live broker,
         then delegates to can_open().
         """
-        if not candidate.get("go_long"):
+        if not (candidate.get("go_long") or candidate.get("go_short")):
             return False
 
         symbol = candidate.get("symbol", "")

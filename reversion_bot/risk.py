@@ -14,7 +14,7 @@ class RiskManager:
         self,
         account_equity: float,
         decision: ReversionDecision,
-        conviction_score: float,
+        conviction_score: float = 0.5,
         entry_style: str = "mean_reversion",
     ) -> PositionPlan:
         entry = float(decision.close or 0.0)
@@ -38,6 +38,72 @@ class RiskManager:
 
         risk_per_share = round(entry - stop, 4)
         reward_per_share = round(target - entry, 4)
+        return self._size_plan(
+            account_equity=account_equity,
+            entry=entry,
+            stop=stop,
+            target=target,
+            risk_per_share=risk_per_share,
+            reward_per_share=reward_per_share,
+            conviction_score=conviction_score,
+            side="long",
+        )
+
+    def build_short_plan(
+        self,
+        account_equity: float,
+        decision: ReversionDecision,
+        conviction_score: float = 0.5,
+        entry_style: str = "mean_reversion",
+    ) -> PositionPlan:
+        """Mirror of build_long_plan for a sell-to-open: stop *above* entry,
+        target *below*. Sizing (risk budget, value cap) is identical."""
+        entry = float(decision.close or 0.0)
+        atr = float(decision.atr or 0.0)
+
+        if entry <= 0:
+            raise ValueError("Entry price must be positive.")
+
+        atr_floor = entry * self.config.atr_floor_pct
+        atr = max(atr, atr_floor)
+
+        stop_mult, target_mult = self._style_multiples(entry_style)
+
+        stop = round(entry + atr * stop_mult, 2)
+        target = round(entry - atr * target_mult, 2)
+
+        if stop <= entry or target >= entry:
+            raise ValueError(
+                f"Invalid short stop/entry/target: stop={stop}, entry={entry}, target={target}"
+            )
+
+        risk_per_share = round(stop - entry, 4)
+        reward_per_share = round(entry - target, 4)
+        return self._size_plan(
+            account_equity=account_equity,
+            entry=entry,
+            stop=stop,
+            target=target,
+            risk_per_share=risk_per_share,
+            reward_per_share=reward_per_share,
+            conviction_score=conviction_score,
+            side="short",
+        )
+
+    def _size_plan(
+        self,
+        *,
+        account_equity: float,
+        entry: float,
+        stop: float,
+        target: float,
+        risk_per_share: float,
+        reward_per_share: float,
+        conviction_score: float,
+        side: str,
+    ) -> PositionPlan:
+        """Shared position sizing for both directions. Risk/reward are already
+        signed positive by the caller, so the math is direction-agnostic."""
         rr_ratio = reward_per_share / max(risk_per_share, 1e-9)
 
         if rr_ratio < self.config.min_rr:
@@ -72,6 +138,7 @@ class RiskManager:
             rr_ratio=round(rr_ratio, 4),
             position_value=position_value,
             max_account_risk=round(risk_budget, 2),
+            side=side,
         )
 
     def _style_multiples(self, entry_style: str) -> tuple[float, float]:
@@ -100,9 +167,11 @@ class RiskManager:
         decision: ReversionDecision,
         conviction_score: float,
         entry_style: str,
+        side: str = "long",
     ) -> PositionPlan | None:
+        builder = self.build_short_plan if side == "short" else self.build_long_plan
         try:
-            return self.build_long_plan(
+            return builder(
                 account_equity=account_equity,
                 decision=decision,
                 conviction_score=conviction_score,

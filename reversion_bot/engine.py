@@ -177,7 +177,7 @@ class ReversionEngine:
             dollar_volume=dollar_volume,
         )
 
-    def get_decision(self, df: pd.DataFrame, symbol: str | None = None) -> ReversionDecision:
+    def get_decision(self, df: pd.DataFrame, symbol: str | None = None, short_bias: bool = False) -> ReversionDecision:
         row = df.iloc[-1]
         prev = df.iloc[-2] if len(df) >= 2 else None
 
@@ -320,6 +320,7 @@ class ReversionEngine:
                 atr=atr,
                 vwap=vwap,
                 trend_ema=trend_ema,
+                short_bias=short_bias,
             )
             if short_decision is not None:
                 return short_decision
@@ -361,6 +362,7 @@ class ReversionEngine:
         atr: float,
         vwap: float,
         trend_ema: float,
+        short_bias: bool = False,
     ) -> ReversionDecision | None:
         """Mirror of the long reversion setup: short overbought rips.
 
@@ -368,6 +370,10 @@ class ReversionEngine:
         otherwise None (the caller falls through to the long-side WAIT reason).
         All filter flags (reclaim/bullish-close/volume/vwap/trend) reuse the
         same config switches as the long side, applied in the short direction.
+
+        short_bias relaxes the overbought thresholds (used when the market is
+        risk-off and favor-shorts mode is on) so the bot fades rips more eagerly
+        in a downtrend.
         """
         adx = float(row["adx"])
 
@@ -381,9 +387,13 @@ class ReversionEngine:
         if not in_short_zone:
             return None
 
+        rsi_min = self.config.risk_off_rsi_min if short_bias else self.config.rsi_min
+        ri_short_threshold = (
+            self.config.risk_off_ri_short_threshold if short_bias else self.config.ri_short_threshold
+        )
         overbought = (
-            ri >= self.config.ri_short_threshold
-            or current_rsi >= self.config.rsi_min
+            ri >= ri_short_threshold
+            or current_rsi >= rsi_min
         )
         if not overbought:
             return None

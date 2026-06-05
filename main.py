@@ -114,7 +114,7 @@ async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int) -
         print(f"[REGIME] benchmark fetch failed ({e}); treating as risk-on.")
         return False
 
-async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor):
+async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor, short_bias=False):
     try:
         if await asyncio.to_thread(executor.has_open_position, symbol):
             return None
@@ -125,7 +125,7 @@ async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor):
 
         bars = bars.tail(lookback)
         account_equity = await asyncio.to_thread(get_account_equity, executor)
-        result = await asyncio.to_thread(service.evaluate_symbol, symbol, bars, account_equity)
+        result = await asyncio.to_thread(service.evaluate_symbol, symbol, bars, account_equity, short_bias)
         result["_account_equity"] = account_equity
         return result
     except Exception as e:
@@ -240,6 +240,9 @@ async def main():
     regime_symbol = os.getenv("MARKET_REGIME_SYMBOL", "SPY")
     regime_timeframe = os.getenv("MARKET_REGIME_TIMEFRAME", "1Day")
     regime_ema = int(os.getenv("MARKET_REGIME_EMA", 50))
+    # Favor-shorts mode (opt-in): when risk-off, also relax the short trigger so
+    # the bot leans short into the downtrend instead of only sitting in cash.
+    favor_shorts_risk_off = parse_bool(os.getenv("FAVOR_SHORTS_IN_RISK_OFF", "False"))
 
     # 2. INITIALIZE CONFIGURATIONS FIRST
     strategy_config = ReversionConfig(
@@ -279,6 +282,8 @@ async def main():
         ri_short_threshold=float(os.getenv("RI_SHORT_THRESHOLD", 0.5)),
         rsi_min=float(os.getenv("RSI_MIN", 52.0)),
         rsi_hard_min=float(os.getenv("RSI_HARD_MIN", 30.0)),
+        risk_off_rsi_min=float(os.getenv("RISK_OFF_RSI_MIN", 45.0)),
+        risk_off_ri_short_threshold=float(os.getenv("RISK_OFF_RI_SHORT_THRESHOLD", 0.25)),
     )
 
     risk_config = RiskConfig(
@@ -403,7 +408,10 @@ async def main():
     print(f"Timeframe: {timeframe} | Lookback: {lookback} | Mode: {'PAPER' if exec_config.paper else 'LIVE'}")
     print(f"Shorts: {'ENABLED' if strategy_config.enable_shorts else 'disabled'}")
     if use_market_filter:
-        print(f"Market regime filter: ON ({regime_symbol} {regime_timeframe} EMA{regime_ema} — block longs when risk-off)")
+        extra = " + favor shorts" if favor_shorts_risk_off else ""
+        print(f"Market regime filter: ON ({regime_symbol} {regime_timeframe} EMA{regime_ema} — block longs when risk-off{extra})")
+    elif favor_shorts_risk_off:
+        print(f"Market regime: favor-shorts only ({regime_symbol} {regime_timeframe} EMA{regime_ema})")
     else:
         print("Market regime filter: off")
     print(f"Monitoring: {', '.join(symbols)}")
@@ -450,8 +458,19 @@ async def main():
                 await asyncio.sleep(poll_interval)
                 continue
 
+            # Resolve the market regime once per cycle, up front, so the
+            # short-bias relaxation can be applied during evaluation (not just
+            # the long suppression afterwards).
+            risk_off = False
+            if use_market_filter or favor_shorts_risk_off:
+                risk_off = await evaluate_market_regime(regime_symbol, regime_timeframe, regime_ema)
+            short_bias = risk_off and favor_shorts_risk_off
+            if risk_off:
+                tag = "risk-off (favoring shorts)" if short_bias else "risk-off"
+                print(f"[REGIME] {regime_symbol} {regime_timeframe} below EMA{regime_ema} — {tag}.")
+
             eval_tasks = [
-                evaluate_symbol_only(s, lookback, timeframe, service, executor) 
+                evaluate_symbol_only(s, lookback, timeframe, service, executor, short_bias)
                 for s in symbols
             ]
             raw_results = await asyncio.gather(*eval_tasks)
@@ -459,14 +478,11 @@ async def main():
             candidates = [r for r in all_results if r.get("go_long") or r.get("go_short")]
 
             # Market-regime gate: in a risk-off tape, drop new longs (keep shorts).
-            # Only pay for the benchmark fetch when there's actually a long to gate.
-            if use_market_filter and any(c.get("go_long") for c in candidates):
-                risk_off = await evaluate_market_regime(regime_symbol, regime_timeframe, regime_ema)
-                if risk_off:
-                    candidates, dropped = suppress_longs_if_risk_off(candidates, True)
-                    if dropped:
-                        names = ', '.join(c['symbol'] for c in dropped)
-                        print(f"[REGIME] {regime_symbol} risk-off — suppressed {len(dropped)} long(s): {names}")
+            if use_market_filter and risk_off:
+                candidates, dropped = suppress_longs_if_risk_off(candidates, True)
+                if dropped:
+                    names = ', '.join(c['symbol'] for c in dropped)
+                    print(f"[REGIME] suppressed {len(dropped)} long(s): {names}")
 
             # Keep equity tracking current for drawdown checks
             if all_results:

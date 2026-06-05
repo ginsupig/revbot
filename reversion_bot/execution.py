@@ -3,6 +3,7 @@ from __future__ import annotations
 from alpaca_trade_api.rest import REST
 from time import sleep
 import logging
+from requests.adapters import HTTPAdapter
 from requests.exceptions import HTTPError
 
 from .models import PositionPlan
@@ -17,6 +18,29 @@ class AlpacaExecutor:
         self.client = REST(api_key, secret_key, exec_config.base_url)
         self._order_ids = set()
         self._tif = "day"
+        self._tune_connection_pool(int(getattr(exec_config, "conn_pool_maxsize", 32)))
+
+    def _tune_connection_pool(self, maxsize: int) -> None:
+        """Widen the REST session's HTTP connection pool.
+
+        The bot fans out one request per symbol (plus account/position calls)
+        concurrently each cycle, which exceeds the requests default pool of 10
+        and spams "Connection pool is full, discarding connection" warnings —
+        and silently reopens sockets, adding latency. Mounting a larger adapter
+        sizes the pool to the universe. Best-effort: never fatal if the SDK's
+        session internals differ.
+        """
+        if maxsize <= 0:
+            return
+        session = getattr(self.client, "_session", None)
+        if session is None:
+            return
+        try:
+            adapter = HTTPAdapter(pool_connections=maxsize, pool_maxsize=maxsize)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.warning("Could not tune connection pool: %s", exc)
 
     def scan_symbols(self, min_price=5.0, min_dollar_volume=750000.0, max_count=30):
         """

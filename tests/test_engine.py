@@ -68,3 +68,30 @@ def test_no_short_when_disabled():
     df = engine.calculate_indicators(make_overbought_df())
     decision = engine.get_decision(df, symbol='SPY')
     assert decision.signal != 'SHORT_REVERSION'
+
+
+def make_falling_knife_df(n=160):
+    """A strong, steady decline: high ADX + very low RSI — a falling knife the
+    long-reversion must NOT try to catch."""
+    idx = pd.date_range('2026-01-01', periods=n, freq='min')
+    base = np.linspace(130, 100, n)              # relentless downtrend
+    noise = np.random.default_rng(3).normal(0, 0.05, n)
+    close = base + noise
+    open_ = close + 0.10                          # each bar closes below its open
+    high = np.maximum(open_, close) + 0.05
+    low = np.minimum(open_, close) - 0.05
+    volume = np.full(n, 60000)
+    return pd.DataFrame({
+        'open': open_, 'high': high, 'low': low, 'close': close, 'volume': volume,
+    }, index=idx)
+
+
+def test_falling_knife_blocks_long_entry():
+    engine = ReversionEngine(ReversionConfig(min_history=60))
+    df = engine.calculate_indicators(make_falling_knife_df())
+    row = df.iloc[-1]
+    # Precondition: this fixture really is an extended oversold downtrend.
+    assert row['adx'] >= 50 and row['rsi'] <= 30
+    decision = engine.get_decision(df, symbol='SPY')
+    assert decision.signal == 'WAIT'
+    assert decision.reason == 'Downtrend_Too_Extended'

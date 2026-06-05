@@ -55,22 +55,46 @@ def _read_pid(path: Path) -> int:
 
 
 def acquire_lock(lock_path: "str | os.PathLike") -> Tuple[bool, int]:
-    """Try to claim the single-instance lock.
+    """Try to claim the single-instance lock, atomically.
 
-    Returns ``(acquired, holder_pid)``. On success, writes our PID and registers
-    an atexit hook to release it; a stale lock (holder no longer alive) is
-    reclaimed. On failure, ``holder_pid`` is the live process already holding it.
+    Returns ``(acquired, holder_pid)``. Uses an *exclusive create*
+    (``O_CREAT | O_EXCL``) so that when two launches race, exactly one wins and
+    the loser is refused — closing the read-then-write gap that let manual and
+    scheduled starts stack up. A lock left by a dead process is detected as
+    stale and reclaimed. On refusal, ``holder_pid`` is the live process that
+    already holds it.
     """
     path = Path(lock_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    mypid = os.getpid()
 
-    existing = _read_pid(path)
-    if existing and existing != os.getpid() and _pid_alive(existing):
-        return False, existing
+    # At most one stale-reclaim, then one retry of the exclusive create.
+    for _ in range(2):
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            holder = _read_pid(path)
+            if holder == mypid:
+                # Already ours (e.g. re-entrant call) — treat as held.
+                atexit.register(release_lock, str(path))
+                return True, mypid
+            if holder and _pid_alive(holder):
+                return False, holder          # someone else is live — refuse
+            # Stale (dead/unreadable holder): drop it and retry the create.
+            try:
+                os.unlink(str(path))
+            except FileNotFoundError:
+                pass
+            continue
+        else:
+            with os.fdopen(fd, "w") as f:
+                f.write(str(mypid))
+            atexit.register(release_lock, str(path))
+            return True, mypid
 
-    path.write_text(str(os.getpid()))
-    atexit.register(release_lock, str(path))
-    return True, os.getpid()
+    # Couldn't claim even after a reclaim attempt (another racer won) — refuse.
+    holder = _read_pid(path)
+    return False, holder or mypid
 
 
 def release_lock(lock_path: "str | os.PathLike") -> None:

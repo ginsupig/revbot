@@ -28,6 +28,7 @@ from reversion_bot.symbol_params import load_symbol_params, build_symbol_configs
 from reversion_bot.single_instance import acquire_lock, release_lock
 from reversion_bot.schedule import session_done
 from reversion_bot.heartbeat import write_heartbeat
+from reversion_bot.market_regime import is_risk_off, suppress_longs_if_risk_off
 from run_real_backtest import fetch_alpaca_bars
 
 # Lock scoped to this checkout (not cwd), so a separate deployment can still
@@ -92,6 +93,26 @@ def build_fetch_window(timeframe: str, lookback: int) -> tuple[str, str]:
 async def fetch_bars_for_symbol(symbol: str, timeframe: str, lookback: int):
     start, end = build_fetch_window(timeframe, lookback)
     return await asyncio.to_thread(fetch_alpaca_bars, symbol, start, end, timeframe)
+
+
+async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int) -> bool:
+    """Fetch the benchmark and decide if the market is risk-off (below trend).
+
+    Fail-open: any fetch error or thin data returns False (risk-on) so a
+    benchmark hiccup never blocks trading.
+    """
+    try:
+        now_utc = datetime.now(timezone.utc)
+        # Enough calendar days to cover ema_length daily bars (with slack for
+        # weekends/holidays); harmless over-fetch for intraday timeframes.
+        days = max(ema_length * 3, 90)
+        start = (now_utc - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        bars = await asyncio.to_thread(fetch_alpaca_bars, symbol, start, end, timeframe)
+        return is_risk_off(bars, ema_length)
+    except Exception as e:
+        print(f"[REGIME] benchmark fetch failed ({e}); treating as risk-on.")
+        return False
 
 async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor):
     try:
@@ -211,6 +232,14 @@ async def main():
     timeframe = os.getenv("TRADE_TIMEFRAME", "5Min")
     lookback = int(os.getenv("TRADE_LOOKBACK", 160))
     poll_interval = int(os.getenv("TRADE_POLL_INTERVAL", 30))
+
+    # Market-regime filter: when the benchmark is below its trend EMA (risk-off),
+    # suppress NEW long entries. Dip-buying every oversold name in a market-wide
+    # selloff is the losing trade; shorts and existing positions are unaffected.
+    use_market_filter = parse_bool(os.getenv("USE_MARKET_REGIME_FILTER", "True"), default=True)
+    regime_symbol = os.getenv("MARKET_REGIME_SYMBOL", "SPY")
+    regime_timeframe = os.getenv("MARKET_REGIME_TIMEFRAME", "1Day")
+    regime_ema = int(os.getenv("MARKET_REGIME_EMA", 50))
 
     # 2. INITIALIZE CONFIGURATIONS FIRST
     strategy_config = ReversionConfig(
@@ -373,6 +402,10 @@ async def main():
     print(f"--- REVERSION BOT STARTING ---")
     print(f"Timeframe: {timeframe} | Lookback: {lookback} | Mode: {'PAPER' if exec_config.paper else 'LIVE'}")
     print(f"Shorts: {'ENABLED' if strategy_config.enable_shorts else 'disabled'}")
+    if use_market_filter:
+        print(f"Market regime filter: ON ({regime_symbol} {regime_timeframe} EMA{regime_ema} — block longs when risk-off)")
+    else:
+        print("Market regime filter: off")
     print(f"Monitoring: {', '.join(symbols)}")
 
     cycle = 0
@@ -424,6 +457,16 @@ async def main():
             raw_results = await asyncio.gather(*eval_tasks)
             all_results = [r for r in raw_results if r is not None]
             candidates = [r for r in all_results if r.get("go_long") or r.get("go_short")]
+
+            # Market-regime gate: in a risk-off tape, drop new longs (keep shorts).
+            # Only pay for the benchmark fetch when there's actually a long to gate.
+            if use_market_filter and any(c.get("go_long") for c in candidates):
+                risk_off = await evaluate_market_regime(regime_symbol, regime_timeframe, regime_ema)
+                if risk_off:
+                    candidates, dropped = suppress_longs_if_risk_off(candidates, True)
+                    if dropped:
+                        names = ', '.join(c['symbol'] for c in dropped)
+                        print(f"[REGIME] {regime_symbol} risk-off — suppressed {len(dropped)} long(s): {names}")
 
             # Keep equity tracking current for drawdown checks
             if all_results:

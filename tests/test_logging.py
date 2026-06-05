@@ -7,7 +7,7 @@ import numpy as np
 from reversion_bot.service import ReversionService
 
 def test_logging_runs():
-    n = 80
+    n = 200
     np.random.seed(42)
     close = np.cumsum(np.random.randn(n)) + 100
     volume = np.random.randint(1000, 2000, n)

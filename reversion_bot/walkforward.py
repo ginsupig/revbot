@@ -180,6 +180,11 @@ def short_exhaustion_strategy(df, **kwargs):
     target_mult = float(kwargs.pop("target_atr_multiple", TARGET_ATR_MULTIPLE))
     atr_length = int(kwargs.pop("atr_length", 14))
     cost_pct = float(kwargs.pop("cost_pct", SLIPPAGE_PCT))
+    # Extra per-trade friction specific to shorting (locate/borrow fee + worse
+    # short fills). Added on top of cost_pct so backtests can haircut shorts
+    # realistically; default 0 leaves prior results unchanged.
+    borrow_cost_pct = float(kwargs.pop("borrow_cost_pct", 0.0))
+    cost_pct += borrow_cost_pct
     reentry_cooldown_bars = int(kwargs.pop("reentry_cooldown_bars", 0))
     min_reward_cost_ratio = float(kwargs.pop("min_reward_cost_ratio", 0.0))
 
@@ -333,12 +338,16 @@ def run_walkforward_backtest(df, param_grid=None, n_splits=5):
     return results, oos_metrics, best_params
 
 
-def run_exhaustion_walkforward(df, param_grid=None, n_splits=5, verbose=True):
+def run_exhaustion_walkforward(df, param_grid=None, n_splits=5, verbose=True, fixed_kwargs=None):
     """Walk-forward the short-exhaustion strategy: tune in-sample, score OOS.
 
     Same protocol as run_walkforward_backtest but drives short_exhaustion_strategy
     so the higher-high-on-fading-RVOL edge can be validated per symbol across the
     universe before it's ever wired live.
+
+    fixed_kwargs: strategy params held CONSTANT across the whole sweep (e.g. a
+    borrow-cost haircut). Folded into the grid as single-value lists so they flow
+    through both the tuner and the OOS scoring without expanding the search.
     """
     from sklearn.model_selection import TimeSeriesSplit
 
@@ -349,6 +358,8 @@ def run_exhaustion_walkforward(df, param_grid=None, n_splits=5, verbose=True):
             "require_divergence": [True, False],
             "target_atr_multiple": [2.0, 3.0],
         }
+    if fixed_kwargs:
+        param_grid = {**param_grid, **{k: [v] for k, v in fixed_kwargs.items()}}
     tuner = AutoTuner(short_exhaustion_strategy, df, param_grid)
     best_params, best_score = tuner.tune(profit_factor, n_splits=n_splits)
     if verbose:

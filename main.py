@@ -219,6 +219,16 @@ async def main():
         require_reclaim_lb1=parse_bool(os.getenv("REQUIRE_RECLAIM_LB1", "False")),
         use_vwap_filter=parse_bool(os.getenv("USE_VWAP_FILTER", "False")),
         use_trend_filter=parse_bool(os.getenv("USE_TREND_FILTER", "False")),
+        # Entry-signal thresholds. These share the same env var names as
+        # autotune_run.py / walk-forward so a tuned .env applies live too.
+        # Defaults match the ReversionConfig dataclass (unset == unchanged behavior).
+        band_length=int(os.getenv("BAND_LENGTH", 20)),
+        band_std_1=float(os.getenv("BAND_STD_1", 1.0)),
+        band_std_2=float(os.getenv("BAND_STD_2", 2.0)),
+        ri_threshold=float(os.getenv("RI_THRESHOLD", -0.5)),
+        rsi_max=float(os.getenv("RSI_MAX", 48.0)),
+        adx_max=float(os.getenv("ADX_MAX", 40.0)),
+        max_vwap_extension_pct=float(os.getenv("MAX_VWAP_EXTENSION_PCT", 0.012)),
     )
 
     risk_config = RiskConfig(

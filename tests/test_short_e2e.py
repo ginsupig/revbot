@@ -61,6 +61,8 @@ def make_executor():
     ex.client = FakeClient()
     ex._order_ids = set()
     ex._tif = "day"
+    ex._use_limit_entry = False
+    ex._limit_offset_bps = 8.0
     return ex
 
 

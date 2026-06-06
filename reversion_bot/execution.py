@@ -17,8 +17,29 @@ class AlpacaExecutor:
 
         self.client = REST(api_key, secret_key, exec_config.base_url)
         self._order_ids = set()
-        self._tif = "day"
+        self._tif = getattr(exec_config, "tif", "day") or "day"
+        # Marketable-limit entries cap entry slippage: the entry leg is priced a
+        # few bps through the planned entry so it still crosses and fills, rather
+        # than a plain market order that pays whatever the book offers.
+        self._use_limit_entry = bool(getattr(exec_config, "use_limit_entry", False))
+        self._limit_offset_bps = float(getattr(exec_config, "limit_entry_offset_bps", 8.0))
         self._tune_connection_pool(int(getattr(exec_config, "conn_pool_maxsize", 32)))
+
+    def _entry_order_type(self, entry_price: float, side: str) -> dict:
+        """Entry-leg order fields: a marketable limit when enabled, else market.
+
+        For a buy the limit is placed ABOVE the planned entry, for a short sell
+        BELOW it, by limit_entry_offset_bps — so the order crosses the spread and
+        fills while capping worst-case slippage to roughly that offset.
+        """
+        if not self._use_limit_entry:
+            return {"type": "market"}
+        offset = self._limit_offset_bps / 10_000.0
+        if side == "buy":
+            limit_price = entry_price * (1.0 + offset)
+        else:
+            limit_price = entry_price * (1.0 - offset)
+        return {"type": "limit", "limit_price": round(limit_price, 2)}
 
     def _tune_connection_pool(self, maxsize: int) -> None:
         """Widen the REST session's HTTP connection pool.
@@ -127,11 +148,11 @@ class AlpacaExecutor:
             "symbol": symbol,
             "qty": plan.qty,
             "side": "buy",
-            "type": "market",
             "time_in_force": self._tif,
             "order_class": "bracket",
             "take_profit": {"limit_price": round(plan.target_price, 2)},
-            "stop_loss": {"stop_price": round(plan.stop_price, 2)}
+            "stop_loss": {"stop_price": round(plan.stop_price, 2)},
+            **self._entry_order_type(plan.entry_price, "buy"),
         }
 
         response = self.client.submit_order(**order_data)
@@ -157,12 +178,12 @@ class AlpacaExecutor:
             "symbol": symbol,
             "qty": plan.qty,
             "side": "sell",
-            "type": "market",
             "time_in_force": self._tif,
             "order_class": "bracket",
             # On a short, profit is taken *below* entry and the stop sits *above*.
             "take_profit": {"limit_price": round(plan.target_price, 2)},
-            "stop_loss": {"stop_price": round(plan.stop_price, 2)}
+            "stop_loss": {"stop_price": round(plan.stop_price, 2)},
+            **self._entry_order_type(plan.entry_price, "sell"),
         }
 
         response = self.client.submit_order(**order_data)

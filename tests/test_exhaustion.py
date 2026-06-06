@@ -80,3 +80,32 @@ def test_run_exhaustion_walkforward_smoke():
     assert len(oos) == 2
     assert "profit_factor" in oos[0]
     assert isinstance(best, dict)
+
+
+def test_borrow_cost_reduces_short_pnl():
+    # Same winning setup, but a borrow haircut must lower the realized pnl.
+    highs = np.concatenate([np.linspace(100, 109, 40), [111.0], np.linspace(110, 95, 15)])
+    vols = np.concatenate([np.full(40, 200_000.0), [40_000.0], np.full(15, 150_000.0)])
+    kw = dict(hh_lookback=5, rvol_lookback=5, rvol_max=1.0, require_divergence=False, cost_pct=0.0)
+    base = short_exhaustion_strategy(_df(highs, vols), **kw)["pnl"].sum()
+    haircut = short_exhaustion_strategy(_df(highs, vols), borrow_cost_pct=0.0020, **kw)["pnl"].sum()
+    assert base > 0                # sanity: the trade won pre-haircut
+    assert haircut < base          # borrow cost eats into the edge
+
+
+def test_fixed_kwargs_flow_through_walkforward():
+    # A constant borrow haircut across the sweep must not error and cannot
+    # improve PF versus no haircut.
+    rng = np.random.default_rng(1)
+    n = 240
+    highs = 100 + np.cumsum(rng.normal(0, 0.3, n))
+    vols = rng.uniform(80_000, 200_000, n)
+    grid = {"rvol_max": [1.0], "hh_lookback": [10], "require_divergence": [False], "target_atr_multiple": [2.0]}
+    df = _df(highs, vols)
+    _r1, oos_plain, _b1 = run_exhaustion_walkforward(df, param_grid=grid, n_splits=2, verbose=False)
+    _r2, oos_hair, _b2 = run_exhaustion_walkforward(
+        df, param_grid=grid, n_splits=2, verbose=False, fixed_kwargs={"borrow_cost_pct": 0.01}
+    )
+    plain_pf = np.mean([m["profit_factor"] for m in oos_plain])
+    hair_pf = np.mean([m["profit_factor"] for m in oos_hair])
+    assert hair_pf <= plain_pf + 1e-9

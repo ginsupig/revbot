@@ -2,6 +2,7 @@ numpy
 pandas
 pytest
 alpaca-py
+alpaca-trade-api
 pytz
 scikit-learn
 dotenv

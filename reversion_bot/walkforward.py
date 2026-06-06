@@ -5,6 +5,8 @@ from reversion_bot.config import ReversionConfig
 from reversion_bot.autotune import AutoTuner
 from reversion_bot.analytics import profit_factor, sharpe_ratio, max_drawdown
 from reversion_bot.cost_model import passes_cost_gate, in_cooldown
+from reversion_bot.exhaustion import exhaustion_short_signal
+from reversion_bot.indicators import calculate_atr
 
 # --- Live-execution constants (mirror risk.py / main.py) ---
 STOP_ATR_MULTIPLE = 1.20        # risk.py RiskConfig.stop_atr_multiple
@@ -155,6 +157,124 @@ def mean_reversion_strategy(df, **kwargs):
     return enriched
 
 
+def short_exhaustion_strategy(df, **kwargs):
+    """SHORT entries on the bearish-exhaustion signal + realistic exit sim.
+
+    Mirror of mean_reversion_strategy for the short side: entries fire when
+    exhaustion_short_signal prints (higher high on fading RVOL); exits use an
+    inverted ATR bracket (stop ABOVE entry, target BELOW) plus EOD liquidation,
+    with per-trade friction. Returns the frame with a ``pnl`` column so the same
+    profit_factor / sharpe / max_drawdown scorers and AutoTuner apply.
+
+    Signal params (all tunable in a walkforward grid):
+        hh_lookback, rvol_lookback, rvol_max, require_divergence
+    Exit / cost params:
+        stop_atr_multiple, target_atr_multiple, atr_length, cost_pct,
+        reentry_cooldown_bars, min_reward_cost_ratio
+    """
+    hh_lookback = int(kwargs.pop("hh_lookback", 20))
+    rvol_lookback = int(kwargs.pop("rvol_lookback", 20))
+    rvol_max = float(kwargs.pop("rvol_max", 1.0))
+    require_divergence = bool(kwargs.pop("require_divergence", True))
+    stop_mult = float(kwargs.pop("stop_atr_multiple", STOP_ATR_MULTIPLE))
+    target_mult = float(kwargs.pop("target_atr_multiple", TARGET_ATR_MULTIPLE))
+    atr_length = int(kwargs.pop("atr_length", 14))
+    cost_pct = float(kwargs.pop("cost_pct", SLIPPAGE_PCT))
+    reentry_cooldown_bars = int(kwargs.pop("reentry_cooldown_bars", 0))
+    min_reward_cost_ratio = float(kwargs.pop("min_reward_cost_ratio", 0.0))
+
+    enriched = df.copy()
+    atr_series = calculate_atr(enriched, atr_length)
+    signal_series = exhaustion_short_signal(
+        enriched,
+        hh_lookback=hh_lookback,
+        rvol_lookback=rvol_lookback,
+        rvol_max=rvol_max,
+        require_divergence=require_divergence,
+    )
+
+    if "date" in enriched.columns:
+        hour_ct, minute_ct = _ct_hour_minute(enriched["date"])
+        hour_ct = pd.Series(np.asarray(hour_ct), index=enriched.index)
+        minute_ct = pd.Series(np.asarray(minute_ct), index=enriched.index)
+    elif isinstance(enriched.index, pd.DatetimeIndex):
+        h, m = _ct_hour_minute(enriched.index)
+        hour_ct = pd.Series(np.asarray(h), index=enriched.index)
+        minute_ct = pd.Series(np.asarray(m), index=enriched.index)
+    else:
+        hour_ct = pd.Series(np.full(len(enriched), 10), index=enriched.index)
+        minute_ct = pd.Series(np.zeros(len(enriched), dtype=int), index=enriched.index)
+
+    enriched["signal"] = 0
+    enriched["position"] = 0
+    enriched["strategy_return"] = 0.0
+
+    in_trade = False
+    entry_price = stop_price = target_price = 0.0
+    prev_close = None
+    last_exit_idx = None
+
+    for i in range(len(enriched)):
+        row = enriched.iloc[i]
+        close = float(row["close"])
+        high = float(row["high"])
+        low = float(row["low"])
+        h = int(hour_ct.iloc[i])
+        m = int(minute_ct.iloc[i])
+
+        bar_return = 0.0
+
+        if in_trade:
+            eod = (h > EOD_LIQUIDATION_HOUR_CT) or (
+                h == EOD_LIQUIDATION_HOUR_CT and m >= EOD_LIQUIDATION_MINUTE_CT
+            )
+            # On a short the adverse move is UP: check the stop (above) first.
+            exit_price = None
+            if high >= stop_price:
+                exit_price = stop_price
+            elif low <= target_price:
+                exit_price = target_price
+            elif eod:
+                exit_price = close
+
+            if exit_price is not None:
+                # Short P&L: profit when exit is below entry. Friction per trip.
+                bar_return = (entry_price / exit_price - 1.0) - cost_pct
+                in_trade = False
+                last_exit_idx = i
+                enriched.at[enriched.index[i], "position"] = 0
+            else:
+                # Held: short gains when price falls bar-over-bar.
+                bar_return = (prev_close / close - 1.0) if prev_close else 0.0
+                enriched.at[enriched.index[i], "position"] = -1
+        else:
+            morning_blackout = h < MORNING_BLACKOUT_HOUR_CT
+            eod = (h > EOD_LIQUIDATION_HOUR_CT) or (
+                h == EOD_LIQUIDATION_HOUR_CT and m >= EOD_LIQUIDATION_MINUTE_CT
+            )
+            cooldown = in_cooldown(i, last_exit_idx, reentry_cooldown_bars)
+            if not morning_blackout and not eod and not cooldown and bool(signal_series.iloc[i]):
+                atr = float(atr_series.iloc[i]) if pd.notna(atr_series.iloc[i]) else 0.0
+                atr = max(atr, close * ATR_FLOOR_PCT)
+                entry_price = close
+                stop_price = round(entry_price + atr * stop_mult, 4)     # above
+                target_price = round(entry_price - atr * target_mult, 4)  # below
+                # Short reward clears cost? reward = (entry - target) / entry.
+                reward_pct = (entry_price - target_price) / entry_price if entry_price else 0.0
+                cost_ok = min_reward_cost_ratio <= 0 or reward_pct >= cost_pct * min_reward_cost_ratio
+                if target_price < entry_price < stop_price and target_price > 0 and cost_ok:
+                    in_trade = True
+                    enriched.at[enriched.index[i], "signal"] = -1
+                    enriched.at[enriched.index[i], "position"] = -1
+
+        enriched.at[enriched.index[i], "strategy_return"] = bar_return
+        prev_close = close
+
+    enriched["market_return"] = enriched["close"].pct_change()
+    enriched["pnl"] = enriched["strategy_return"]
+    return enriched
+
+
 def evaluate_fixed_params(df, params, n_splits=3):
     """Out-of-sample metrics for ONE fixed param set (no per-symbol tuning).
 
@@ -206,6 +326,46 @@ def run_walkforward_backtest(df, param_grid=None, n_splits=5):
         oos_metrics.append({"fold": fold + 1, "profit_factor": pf, "sharpe": sr, "max_drawdown": dd})
         print(f"Fold {fold + 1}: PF={pf:.2f}, Sharpe={sr:.2f}, MaxDD={dd:.4f}")
     if oos_metrics:
+        avg_pf = np.mean([m["profit_factor"] for m in oos_metrics])
+        avg_sr = np.mean([m["sharpe"] for m in oos_metrics])
+        avg_dd = np.mean([m["max_drawdown"] for m in oos_metrics])
+        print(f"\nOut-of-sample summary: Avg PF={avg_pf:.2f}, Avg Sharpe={avg_sr:.2f}, Avg MaxDD={avg_dd:.4f}")
+    return results, oos_metrics, best_params
+
+
+def run_exhaustion_walkforward(df, param_grid=None, n_splits=5, verbose=True):
+    """Walk-forward the short-exhaustion strategy: tune in-sample, score OOS.
+
+    Same protocol as run_walkforward_backtest but drives short_exhaustion_strategy
+    so the higher-high-on-fading-RVOL edge can be validated per symbol across the
+    universe before it's ever wired live.
+    """
+    from sklearn.model_selection import TimeSeriesSplit
+
+    if param_grid is None:
+        param_grid = {
+            "rvol_max": [0.8, 1.0, 1.2],
+            "hh_lookback": [10, 20],
+            "require_divergence": [True, False],
+            "target_atr_multiple": [2.0, 3.0],
+        }
+    tuner = AutoTuner(short_exhaustion_strategy, df, param_grid)
+    best_params, best_score = tuner.tune(profit_factor, n_splits=n_splits)
+    if verbose:
+        print(f"Best Params: {best_params}, Best Profit Factor: {best_score:.2f}")
+
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    results, oos_metrics = [], []
+    for fold, (_train_idx, test_idx) in enumerate(tscv.split(df)):
+        res = short_exhaustion_strategy(df.iloc[test_idx], **best_params)
+        results.append(res)
+        pf = profit_factor(res)
+        sr = sharpe_ratio(res)
+        dd = max_drawdown(res)
+        oos_metrics.append({"fold": fold + 1, "profit_factor": pf, "sharpe": sr, "max_drawdown": dd})
+        if verbose:
+            print(f"Fold {fold + 1}: PF={pf:.2f}, Sharpe={sr:.2f}, MaxDD={dd:.4f}")
+    if verbose and oos_metrics:
         avg_pf = np.mean([m["profit_factor"] for m in oos_metrics])
         avg_sr = np.mean([m["sharpe"] for m in oos_metrics])
         avg_dd = np.mean([m["max_drawdown"] for m in oos_metrics])

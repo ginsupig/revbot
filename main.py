@@ -307,6 +307,9 @@ async def main():
         paper=True if "paper" in base_url.lower() else False,
         base_url=base_url,
         conn_pool_maxsize=int(os.getenv("CONN_POOL_MAXSIZE", 32)),
+        use_limit_entry=parse_bool(os.getenv("USE_LIMIT_ENTRY", "True"), default=True),
+        limit_entry_offset_bps=float(os.getenv("LIMIT_ENTRY_OFFSET_BPS", 8.0)),
+        tif=os.getenv("TRADE_TIF", "day"),
     )
 
     # 3. Initialize Executor and Symbol List

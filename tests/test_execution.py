@@ -46,12 +46,14 @@ class FakeClient:
         return {"id": "fake", **kwargs}
 
 
-def make_executor(positions=None):
+def make_executor(positions=None, use_limit_entry=False, limit_offset_bps=8.0):
     # Bypass __init__ so we never construct a real Alpaca REST client / hit network.
     ex = AlpacaExecutor.__new__(AlpacaExecutor)
     ex.client = FakeClient(positions)
     ex._order_ids = set()
     ex._tif = "day"
+    ex._use_limit_entry = use_limit_entry
+    ex._limit_offset_bps = limit_offset_bps
     return ex
 
 
@@ -73,6 +75,54 @@ def short_candidate():
             "side": "short",
         },
     }
+
+
+def long_candidate():
+    return {
+        "symbol": "SPY",
+        "go_long": True,
+        "side": "long",
+        "position_plan": {
+            "qty": 10,
+            "entry_price": 100.0,
+            "stop_price": 98.0,     # below entry
+            "target_price": 104.0,  # above entry
+            "risk_per_share": 2.0,
+            "reward_per_share": 4.0,
+            "rr_ratio": 2.0,
+            "position_value": 1000.0,
+            "max_account_risk": 500.0,
+            "side": "long",
+        },
+    }
+
+
+def test_market_entry_by_default():
+    ex = make_executor()  # use_limit_entry defaults False
+    ex.submit_order(long_candidate())
+    order = ex.client.orders[-1]
+    assert order["type"] == "market"
+    assert "limit_price" not in order
+
+
+def test_limit_entry_buy_is_priced_above_entry():
+    ex = make_executor(use_limit_entry=True, limit_offset_bps=8.0)
+    ex.submit_order(long_candidate())
+    order = ex.client.orders[-1]
+    assert order["type"] == "limit"
+    # Marketable buy: 8 bps above the 100.00 entry -> 100.08, so it crosses up.
+    assert order["limit_price"] == 100.08
+    assert order["limit_price"] > 100.0
+
+
+def test_limit_entry_short_is_priced_below_entry():
+    ex = make_executor(use_limit_entry=True, limit_offset_bps=8.0)
+    ex.submit_order(short_candidate())
+    order = ex.client.orders[-1]
+    assert order["type"] == "limit"
+    # Marketable short sell: 8 bps below the 100.00 entry -> 99.92, crosses down.
+    assert order["limit_price"] == 99.92
+    assert order["limit_price"] < 100.0
 
 
 def test_submit_order_routes_short_to_sell_bracket():

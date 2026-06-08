@@ -82,6 +82,7 @@ class ExecutionGovernor:
         new_position_value: float,
         new_position_heat: float,
         trades_executed_this_cycle: int,
+        side: str = "long",
     ) -> Tuple[bool, str]:
         symbol = symbol.upper()
         open_symbols = {s.upper() for s in open_symbols}
@@ -103,6 +104,11 @@ class ExecutionGovernor:
 
         if self.portfolio_state.in_symbol_cooldown(symbol, now, self.config.symbol_cooldown_minutes):
             return False, "symbol_cooldown"
+
+        if self.portfolio_state.in_direction_flip_cooldown(
+            symbol, side, now, self.config.direction_flip_cooldown_minutes
+        ):
+            return False, "direction_flip_cooldown"
 
         max_exposure = account_equity * self.config.max_total_exposure_pct
         if current_total_exposure + new_position_value > max_exposure:
@@ -150,6 +156,7 @@ class ExecutionGovernor:
         symbol = candidate.get("symbol", "")
         entry_style = candidate.get("entry_style", "mean_reversion")
         regime = candidate.get("regime", "reversion")
+        side = "short" if candidate.get("go_short") else "long"
         position_plan = candidate.get("position_plan", {})
         new_position_value = float(position_plan.get("position_value", 0.0))
         new_position_heat = float(candidate.get("portfolio_heat", 0.0))
@@ -215,6 +222,7 @@ class ExecutionGovernor:
             new_position_value=new_position_value,
             new_position_heat=new_position_heat,
             trades_executed_this_cycle=trades_executed_this_cycle,
+            side=side,
         )
         if not ok:
             print(f"[GOVERNOR] {symbol} rejected: {reason}")

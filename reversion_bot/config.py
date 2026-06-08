@@ -122,3 +122,7 @@ class PortfolioConfig:
     reduced_risk_multiplier: float = 0.60
 
     symbol_cooldown_minutes: int = 30
+    # After an entry, block re-entry in the OPPOSITE direction on the same
+    # symbol for this many minutes (whipsaw guard: short->stop->long churn).
+    # 0 = off. The plain symbol cooldown still blocks all re-entry separately.
+    direction_flip_cooldown_minutes: int = 0

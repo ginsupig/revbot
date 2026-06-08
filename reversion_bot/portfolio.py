@@ -97,7 +97,7 @@ class PortfolioState:
             return 0.0
         return max(0.0, (peak - account_equity) / peak)
 
-    def note_new_position(self, symbol: str, entry_style: str, regime: str, timestamp_iso: str) -> None:
+    def note_new_position(self, symbol: str, entry_style: str, regime: str, timestamp_iso: str, side: str = "long") -> None:
         data = self._load()
         today = timestamp_iso[:10]
         daily = [x for x in data.get("daily_new_positions", []) if str(x).startswith(today)]
@@ -107,6 +107,7 @@ class PortfolioState:
         data.setdefault("position_meta", {})[symbol.upper()] = {
             "entry_style": entry_style,
             "regime": regime,
+            "side": side,
         }
         self._save(data)
 
@@ -145,14 +146,40 @@ class PortfolioState:
         symbol = str(candidate.get("symbol", "")).upper()
         entry_style = str(candidate.get("entry_style", "unknown"))
         regime = str(candidate.get("regime", "unknown"))
+        side = "short" if candidate.get("go_short") else "long"
         ts = datetime.now(timezone.utc).isoformat()
-        self.note_new_position(symbol, entry_style, regime, ts)
+        self.note_new_position(symbol, entry_style, regime, ts, side=side)
 
     def in_symbol_cooldown(self, symbol: str, now: datetime, cooldown_minutes: int) -> bool:
         data = self._load()
         last_ts = data.get("last_trade_ts_by_symbol", {}).get(symbol.upper())
         if not last_ts:
             return False
+        try:
+            last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+        except Exception:
+            return False
+        return now <= last_dt + timedelta(minutes=cooldown_minutes)
+
+    def in_direction_flip_cooldown(self, symbol: str, side: str, now: datetime, cooldown_minutes: int) -> bool:
+        """True if `side` is OPPOSITE the symbol's last entry and we're still
+        within the flip-cooldown window since that entry.
+
+        This blocks the whipsaw seen live (short -> stopped -> immediately long,
+        or vice versa). Measured from the last entry, so it targets *rapid*
+        flips; a genuine reversal hours later is unaffected. Same-direction
+        re-entry is never blocked here (the plain symbol cooldown covers that).
+        """
+        if cooldown_minutes <= 0:
+            return False
+        data = self._load()
+        last_ts = data.get("last_trade_ts_by_symbol", {}).get(symbol.upper())
+        meta = data.get("position_meta", {}).get(symbol.upper())
+        if not last_ts or not meta:
+            return False
+        last_side = meta.get("side")
+        if not last_side or last_side == side:
+            return False  # same direction (or unknown) -> not a flip
         try:
             last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
         except Exception:

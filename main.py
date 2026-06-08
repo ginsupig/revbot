@@ -70,6 +70,54 @@ def get_account_equity(executor):
     account = executor.client.get_account()
     return float(account.equity)
 
+
+def preflight_check(executor, paper: bool) -> bool:
+    """Validate credentials + connectivity before the trading loop starts.
+
+    One get_account() call confirms the API keys are authorized for THIS
+    endpoint. On an auth failure we fail fast with a clear paper/live hint
+    instead of letting every scan/order call fail cryptically all session.
+    Returns True to proceed, False to abort.
+    """
+    mode = "PAPER" if paper else "LIVE"
+    bar = "=" * 68
+    try:
+        account = executor.client.get_account()
+    except Exception as e:
+        msg = str(e).lower()
+        print(f"\n{bar}")
+        if any(t in msg for t in ("not authorized", "unauthorized", "forbidden", "401", "403")):
+            print(f"[PREFLIGHT] Alpaca REJECTED your credentials for the {mode} endpoint.")
+            print("[PREFLIGHT] Most likely the API key/secret don't match the base URL —")
+            print("[PREFLIGHT] paper and live use SEPARATE keys. If APCA_API_BASE_URL points")
+            print("[PREFLIGHT] at live, set your LIVE key/secret (and vice versa).")
+        else:
+            print(f"[PREFLIGHT] Could not reach Alpaca ({mode} endpoint): {e}")
+        print(f"{bar}\n")
+        return False
+
+    status = getattr(account, "status", "?")
+    equity = getattr(account, "equity", "?")
+    bp = getattr(account, "buying_power", "?")
+    blocked = bool(getattr(account, "trading_blocked", False)) or bool(
+        getattr(account, "account_blocked", False)
+    )
+    shorting_enabled = getattr(account, "shorting_enabled", None)
+
+    if not paper:
+        print("*" * 68)
+        print("*** LIVE TRADING — REAL MONEY. Orders will hit your funded account. ***")
+        print("*" * 68)
+    print(f"[PREFLIGHT] Connected to Alpaca {mode}: status={status} "
+          f"equity={equity} buying_power={bp}")
+    if blocked:
+        print("[PREFLIGHT] ABORT: broker reports this account trading_blocked/account_blocked.")
+        return False
+    if shorting_enabled is False:
+        print("[PREFLIGHT] WARNING: shorting is NOT enabled on this account — "
+              "short signals will be rejected by the broker.")
+    return True
+
 def parse_bool(value: str, default: bool = False) -> bool:
     if value is None:
         return default
@@ -314,7 +362,16 @@ async def main():
 
     # 3. Initialize Executor and Symbol List
     executor = AlpacaExecutor(api_key, api_secret, exec_config)
-    
+
+    # Preflight: confirm the keys are authorized for this endpoint before doing
+    # anything else. Bad creds (e.g. paper keys against the live URL) used to
+    # surface as cryptic, repeated scan failures; now we abort cleanly with a
+    # clear hint and release the lock so the supervisor doesn't hot-loop.
+    if not preflight_check(executor, exec_config.paper):
+        print("[PREFLIGHT] Aborting before any orders — fix the above and restart.")
+        release_lock(LOCK_PATH)
+        return 0
+
     # Attempt dynamic scan
     symbols = executor.scan_symbols(
         min_price=strategy_config.min_price,

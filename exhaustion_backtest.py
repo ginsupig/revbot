@@ -46,11 +46,18 @@ CORE_UNIVERSE = [
 # Defaults to the churn-adds previously dropped from the watchlist.
 EDGE_NAMES = ["MSTR", "RKLB", "RDW", "QBTS"]
 
+# Ablation grid: trimmed on the original dimensions so the new quality filters
+# (confirm_mode, cmf_max, min_extension_atr) can vary without exploding the
+# search. Each new dimension carries an "off" value so the tuner can choose to
+# ignore it — that's the ablation: if a filter never wins, it isn't helping.
 PARAM_GRID = {
-    "rvol_max": [0.8, 1.0, 1.2],
-    "hh_lookback": [10, 20],
-    "require_divergence": [True, False],
+    "rvol_max": [0.8, 1.0],
+    "hh_lookback": [20],
+    "require_divergence": [True],
     "target_atr_multiple": [2.0, 3.0],
+    "confirm_mode": ["none", "medium", "strong"],
+    "cmf_max": [None, 0.0],
+    "min_extension_atr": [0.0, 1.5],
 }
 
 

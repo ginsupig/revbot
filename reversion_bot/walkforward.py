@@ -5,7 +5,7 @@ from reversion_bot.config import ReversionConfig
 from reversion_bot.autotune import AutoTuner
 from reversion_bot.analytics import profit_factor, sharpe_ratio, max_drawdown
 from reversion_bot.cost_model import passes_cost_gate, in_cooldown
-from reversion_bot.exhaustion import exhaustion_short_signal
+from reversion_bot.exhaustion import exhaustion_short_signal, relative_volume
 from reversion_bot.indicators import calculate_atr
 
 # --- Live-execution constants (mirror risk.py / main.py) ---
@@ -167,15 +167,29 @@ def short_exhaustion_strategy(df, **kwargs):
     profit_factor / sharpe / max_drawdown scorers and AutoTuner apply.
 
     Signal params (all tunable in a walkforward grid):
-        hh_lookback, rvol_lookback, rvol_max, require_divergence
+        hh_lookback, rvol_lookback, rvol_max, require_divergence, cmf_max,
+        cmf_period
+    Quality filters (default off → prior behavior):
+        min_extension_atr : only fire when close is at least this many ATR above
+            its ext_ema_span EMA (a real blow-off, not a marginal high).
+        confirm_mode : require the NEXT bar to confirm the rollover before
+            entering. "none" (default) = enter on the signal bar; "weak" =
+            next close < signal close; "medium" = next close < signal low;
+            "strong" = medium AND next-bar RVOL > 1 (sellers stepped in).
     Exit / cost params:
         stop_atr_multiple, target_atr_multiple, atr_length, cost_pct,
-        reentry_cooldown_bars, min_reward_cost_ratio
+        borrow_cost_pct, reentry_cooldown_bars, min_reward_cost_ratio
     """
     hh_lookback = int(kwargs.pop("hh_lookback", 20))
     rvol_lookback = int(kwargs.pop("rvol_lookback", 20))
     rvol_max = float(kwargs.pop("rvol_max", 1.0))
     require_divergence = bool(kwargs.pop("require_divergence", True))
+    cmf_max = kwargs.pop("cmf_max", None)
+    cmf_max = None if cmf_max is None else float(cmf_max)
+    cmf_period = int(kwargs.pop("cmf_period", 21))
+    min_extension_atr = float(kwargs.pop("min_extension_atr", 0.0))
+    ext_ema_span = int(kwargs.pop("ext_ema_span", 50))
+    confirm_mode = str(kwargs.pop("confirm_mode", "none")).lower()
     stop_mult = float(kwargs.pop("stop_atr_multiple", STOP_ATR_MULTIPLE))
     target_mult = float(kwargs.pop("target_atr_multiple", TARGET_ATR_MULTIPLE))
     atr_length = int(kwargs.pop("atr_length", 14))
@@ -190,13 +204,23 @@ def short_exhaustion_strategy(df, **kwargs):
 
     enriched = df.copy()
     atr_series = calculate_atr(enriched, atr_length)
+    rvol_series = relative_volume(enriched["volume"], rvol_lookback)
     signal_series = exhaustion_short_signal(
         enriched,
         hh_lookback=hh_lookback,
         rvol_lookback=rvol_lookback,
         rvol_max=rvol_max,
         require_divergence=require_divergence,
+        cmf_max=cmf_max,
+        cmf_period=cmf_period,
     )
+
+    # Extension gate: only fade a push that is genuinely stretched above trend.
+    if min_extension_atr > 0:
+        close_s = enriched["close"].astype(float)
+        ema = close_s.ewm(span=ext_ema_span, adjust=False).mean()
+        extended = (close_s - ema) >= (min_extension_atr * atr_series)
+        signal_series = signal_series & extended.fillna(False)
 
     if "date" in enriched.columns:
         hour_ct, minute_ct = _ct_hour_minute(enriched["date"])
@@ -218,6 +242,20 @@ def short_exhaustion_strategy(df, **kwargs):
     entry_price = stop_price = target_price = 0.0
     prev_close = None
     last_exit_idx = None
+    # Confirmation: a candidate at bar i waits for bar i+1 to confirm the
+    # rollover. pending_idx holds the unconfirmed candidate bar.
+    pending_idx = None
+
+    def _confirmed(sig_idx: int, cur_close: float, cur_rvol: float) -> bool:
+        sig_low = float(enriched["low"].iloc[sig_idx])
+        sig_close = float(enriched["close"].iloc[sig_idx])
+        if confirm_mode == "weak":
+            return cur_close < sig_close
+        if confirm_mode == "medium":
+            return cur_close < sig_low
+        if confirm_mode == "strong":
+            return cur_close < sig_low and (pd.notna(cur_rvol) and cur_rvol > 1.0)
+        return True
 
     for i in range(len(enriched)):
         row = enriched.iloc[i]
@@ -258,7 +296,24 @@ def short_exhaustion_strategy(df, **kwargs):
                 h == EOD_LIQUIDATION_HOUR_CT and m >= EOD_LIQUIDATION_MINUTE_CT
             )
             cooldown = in_cooldown(i, last_exit_idx, reentry_cooldown_bars)
-            if not morning_blackout and not eod and not cooldown and bool(signal_series.iloc[i]):
+            tradeable = not morning_blackout and not eod and not cooldown
+
+            # Decide whether THIS bar opens a short: either a candidate that needs
+            # no confirmation, or a prior candidate confirmed by this bar.
+            enter = False
+            if tradeable:
+                if confirm_mode == "none":
+                    enter = bool(signal_series.iloc[i])
+                elif pending_idx is not None and i == pending_idx + 1:
+                    enter = _confirmed(pending_idx, close, float(rvol_series.iloc[i]))
+
+            # A candidate fired on this bar but is awaiting next-bar confirmation.
+            if confirm_mode != "none" and bool(signal_series.iloc[i]):
+                pending_idx = i
+            elif confirm_mode != "none" and pending_idx is not None and i > pending_idx:
+                pending_idx = None   # candidate expires if not confirmed next bar
+
+            if enter:
                 atr = float(atr_series.iloc[i]) if pd.notna(atr_series.iloc[i]) else 0.0
                 atr = max(atr, close * ATR_FLOOR_PCT)
                 entry_price = close
@@ -269,6 +324,7 @@ def short_exhaustion_strategy(df, **kwargs):
                 cost_ok = min_reward_cost_ratio <= 0 or reward_pct >= cost_pct * min_reward_cost_ratio
                 if target_price < entry_price < stop_price and target_price > 0 and cost_ok:
                     in_trade = True
+                    pending_idx = None
                     enriched.at[enriched.index[i], "signal"] = -1
                     enriched.at[enriched.index[i], "position"] = -1
 

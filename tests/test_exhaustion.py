@@ -5,7 +5,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import pandas as pd
 
-from reversion_bot.exhaustion import relative_volume, exhaustion_short_signal
+from reversion_bot.exhaustion import (
+    relative_volume,
+    exhaustion_short_signal,
+    chaikin_money_flow,
+)
 from reversion_bot.walkforward import short_exhaustion_strategy, run_exhaustion_walkforward
 from reversion_bot.analytics import profit_factor
 
@@ -109,3 +113,66 @@ def test_fixed_kwargs_flow_through_walkforward():
     plain_pf = np.mean([m["profit_factor"] for m in oos_plain])
     hair_pf = np.mean([m["profit_factor"] for m in oos_hair])
     assert hair_pf <= plain_pf + 1e-9
+
+
+# --- Chaikin Money Flow + new quality filters --------------------------------
+
+def _ohlc(highs, lows, closes, vols):
+    a = lambda x: np.asarray(x, dtype=float)
+    return pd.DataFrame({"open": a(closes), "high": a(highs), "low": a(lows),
+                         "close": a(closes), "volume": a(vols)})
+
+
+def test_cmf_sign_matches_close_position():
+    n = 30
+    high = np.full(n, 101.0); low = np.full(n, 100.0); vol = np.full(n, 1e5)
+    at_low = chaikin_money_flow(_ohlc(high, low, low, vol), period=21).iloc[-1]
+    at_high = chaikin_money_flow(_ohlc(high, low, high, vol), period=21).iloc[-1]
+    assert at_low < -0.9      # closing at the low => distribution
+    assert at_high > 0.9      # closing at the high => accumulation
+
+
+def test_cmf_filter_gates_the_signal():
+    # A fixture that fires the base signal; the CMF filter should keep it when
+    # the threshold is permissive and drop it when impossible.
+    df = _df(np.linspace(100, 110, 40), np.linspace(200_000, 100_000, 40))
+    base = exhaustion_short_signal(df, hh_lookback=5, rvol_lookback=5, rvol_max=1.0)
+    permissive = exhaustion_short_signal(df, hh_lookback=5, rvol_lookback=5, rvol_max=1.0, cmf_max=1.0)
+    impossible = exhaustion_short_signal(df, hh_lookback=5, rvol_lookback=5, rvol_max=1.0, cmf_max=-2.0)
+    assert bool(base.iloc[-1]) is True
+    assert bool(permissive.iloc[-1]) is True       # CMF <= 1 always true
+    assert bool(impossible.iloc[-1]) is False        # CMF <= -2 never true
+
+
+def test_extension_gate_blocks_unstretched_signals():
+    highs = np.concatenate([np.linspace(100, 109, 40), [111.0], np.linspace(110, 95, 15)])
+    vols = np.concatenate([np.full(40, 200_000.0), [40_000.0], np.full(15, 150_000.0)])
+    kw = dict(hh_lookback=5, rvol_lookback=5, rvol_max=1.0, require_divergence=False, cost_pct=0.0)
+    traded = short_exhaustion_strategy(_df(highs, vols), **kw)
+    gated = short_exhaustion_strategy(_df(highs, vols), min_extension_atr=100.0, **kw)
+    assert int((traded["signal"] == -1).sum()) >= 1   # fires without the gate
+    assert int((gated["signal"] == -1).sum()) == 0     # impossible extension blocks all
+
+
+def test_confirmation_skips_a_high_that_keeps_rising():
+    # New high on thin volume, but price KEEPS rising afterwards (no rollover).
+    # confirm_mode="none" shorts the high (and would get stopped); "medium" waits
+    # for a lower close that never comes, so it correctly takes no trade.
+    highs = np.concatenate([np.linspace(100, 109, 40), [111.0], np.linspace(112, 120, 15)])
+    vols = np.concatenate([np.full(40, 200_000.0), [40_000.0], np.full(15, 200_000.0)])
+    kw = dict(hh_lookback=5, rvol_lookback=5, rvol_max=1.0, require_divergence=False, cost_pct=0.0)
+    no_confirm = short_exhaustion_strategy(_df(highs, vols), confirm_mode="none", **kw)
+    confirmed = short_exhaustion_strategy(_df(highs, vols), confirm_mode="medium", **kw)
+    assert int((no_confirm["signal"] == -1).sum()) >= 1   # naively shorts the high
+    assert int((confirmed["signal"] == -1).sum()) == 0      # confirmation saves it
+
+
+def test_confirmation_still_trades_a_real_rollover():
+    # New high on thin volume, then a sharp drop -> confirmation passes and the
+    # delayed short still gets taken and wins.
+    highs = np.concatenate([np.linspace(100, 109, 40), [111.0], np.linspace(110, 92, 15)])
+    vols = np.concatenate([np.full(40, 200_000.0), [40_000.0], np.full(15, 150_000.0)])
+    kw = dict(hh_lookback=5, rvol_lookback=5, rvol_max=1.0, require_divergence=False, cost_pct=0.0)
+    res = short_exhaustion_strategy(_df(highs, vols), confirm_mode="medium", **kw)
+    assert int((res["signal"] == -1).sum()) >= 1
+    assert res["pnl"].sum() > 0

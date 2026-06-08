@@ -439,6 +439,7 @@ async def main():
         reduce_size_after_drawdown_pct=float(os.getenv("REDUCE_SIZE_AFTER_DRAWDOWN_PCT", 0.01)),
         reduced_risk_multiplier=float(os.getenv("REDUCED_RISK_MULTIPLIER", 0.60)),
         symbol_cooldown_minutes=int(os.getenv("SYMBOL_COOLDOWN_MINUTES", 30)),
+        direction_flip_cooldown_minutes=int(os.getenv("DIRECTION_FLIP_COOLDOWN_MINUTES", 60)),
     )
     
     # Per-symbol params: each allowlisted name trades with its OWN tuned config

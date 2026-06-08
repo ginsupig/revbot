@@ -375,7 +375,9 @@ class ReversionService:
                     self.logger.warning("ML retrain error: %s", exc)
 
             try:
-                X, _ = self.ml_learner.prepare_features(df)
+                # Predict on a feature frame that KEEPS the current bar; training
+                # drops it because its forward-looking label is unknowable.
+                X = self.ml_learner.prepare_features_for_predict(df)
                 if len(X) == 0:
                     return 0.5
                 proba = self.ml_learner.model.predict_proba(X)

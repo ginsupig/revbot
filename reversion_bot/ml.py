@@ -3,11 +3,31 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 
 
+FEATURE_COLS = [
+    "fast_sma_ratio",
+    "slow_sma_ratio",
+    "sma_diff_ratio",
+    "volatility_pct",
+    "rsi",
+    "macd_line_ratio",
+    "macd_signal_ratio",
+    "macd_hist_ratio",
+    "momentum_pct",
+    "trend_following",
+    "trend_ema_ratio",
+    "volume_ratio",
+    "high_low_pct",
+    "close_open_pct",
+    "price_position",
+]
+
+
 class MLSignalLearner:
     def __init__(self):
         self.model = RandomForestClassifier(n_estimators=100, random_state=42)
 
-    def prepare_features(self, bars):
+    def _build_features(self, bars):
+        """Compute the feature columns (no label). Shared by train and predict."""
         bars = bars.copy()
         close = bars["close"].astype(float)
 
@@ -50,34 +70,34 @@ class MLSignalLearner:
         rolling_max = close.rolling(window=20).max()
         rolling_min = close.rolling(window=20).min()
         bars["price_position"] = (close - rolling_min) / (rolling_max - rolling_min + 1e-9)
+        return bars
 
+    def prepare_features(self, bars):
+        """Training features + label. The label is next-bar direction
+        (pct_change().shift(-1)), so the final row — whose label is unknowable —
+        is dropped. Use prepare_features_for_predict() for live scoring so the
+        current bar isn't thrown away."""
+        bars = self._build_features(bars)
+        close = bars["close"].astype(float)
         bars["return"] = close.pct_change().shift(-1)
         bars["target"] = np.where(bars["return"] > 0, 1, 0)
 
-        bars = bars.dropna()
+        bars = bars.dropna(subset=FEATURE_COLS + ["return"])
 
-        X = bars[
-            [
-                "fast_sma_ratio",
-                "slow_sma_ratio",
-                "sma_diff_ratio",
-                "volatility_pct",
-                "rsi",
-                "macd_line_ratio",
-                "macd_signal_ratio",
-                "macd_hist_ratio",
-                "momentum_pct",
-                "trend_following",
-                "trend_ema_ratio",
-                "volume_ratio",
-                "high_low_pct",
-                "close_open_pct",
-                "price_position",
-            ]
-        ]
+        X = bars[FEATURE_COLS]
         y = bars["target"]
 
         return X, y
+
+    def prepare_features_for_predict(self, bars):
+        """Feature rows for live scoring — keeps the CURRENT bar.
+
+        Unlike prepare_features(), this never builds the forward-looking label,
+        so it doesn't drop the most recent bar (the one we're deciding on). It
+        drops only rows whose features aren't warm yet."""
+        bars = self._build_features(bars)
+        bars = bars.dropna(subset=FEATURE_COLS)
+        return bars[FEATURE_COLS]
 
     @staticmethod
     def compute_rsi(series, window=14):

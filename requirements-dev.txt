@@ -1,0 +1,6 @@
+# Everything in requirements.txt, plus test and research-backtest tooling.
+#   Install:  pip install -r requirements-dev.txt
+-r requirements.txt
+
+pytest>=7.4
+yfinance>=0.2.40             # used by the standalone *_backtest.py research scripts

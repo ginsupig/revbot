@@ -74,3 +74,29 @@ def test_build_maps_each_symbol_to_its_config():
 
 def test_build_empty_map_is_empty():
     assert build_symbol_configs({}, ReversionConfig()) == {}
+
+
+# --- per-symbol confirmation / quality gates (previously dropped) -----------
+
+def test_per_symbol_confirmation_flags_now_apply():
+    # require_bullish_close / require_volume_expansion were missing from the
+    # allowed set, so a per-symbol confirmation bar was silently ignored. They
+    # must now flow into the symbol's config (the AMD/NVDA/META/CLF overlay).
+    base = ReversionConfig(require_bullish_close=False, require_volume_expansion=False)
+    cfg = config_for_symbol(base, {
+        "require_bullish_close": True,
+        "require_volume_expansion": "true",
+        "volume_multiplier_min": 1.5,
+        "trend_ema_length": 100,
+    })
+    assert cfg.require_bullish_close is True
+    assert cfg.require_volume_expansion is True
+    assert cfg.volume_multiplier_min == 1.5
+    assert cfg.trend_ema_length == 100 and isinstance(cfg.trend_ema_length, int)
+
+
+def test_per_symbol_confirmation_is_opt_in():
+    # Default-inert: a symbol with no confirmation override keeps base behavior.
+    base = ReversionConfig(require_bullish_close=False)
+    cfg = config_for_symbol(base, {"ri_threshold": -1.0})
+    assert cfg.require_bullish_close is False

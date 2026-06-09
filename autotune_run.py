@@ -26,6 +26,34 @@ INTEGER_PARAMS = {'band_length', 'min_history'}
 BOOL_PARAMS = {'use_vwap_filter'}
 
 
+def aggregate_best_params(all_best_params, params=None, bool_params=None):
+    """Collapse per-symbol best params into one global fallback set.
+
+    Numerics -> median, bools -> majority vote. Special-cased: the VWAP
+    extension is medianed over ONLY the symbols whose best params leave
+    use_vwap_filter ON — for the others the paired extension is a meaningless
+    grid placeholder, and including it drags the global value to the tight,
+    harmful low end (the 0.012 that the A/B showed loses money). When the
+    majority turns VWAP on, the extension should reflect the names that use it.
+    """
+    params = list(PARAM_TO_ENV if params is None else params)
+    bool_params = BOOL_PARAMS if bool_params is None else bool_params
+    aggregated = {}
+    for param in params:
+        if param == "max_vwap_extension_pct":
+            values = [p[param] for p in all_best_params
+                      if param in p and p.get("use_vwap_filter")]
+        else:
+            values = [p[param] for p in all_best_params if param in p]
+        if not values:
+            continue
+        if param in bool_params:
+            aggregated[param] = sum(bool(v) for v in values) >= (len(values) / 2)
+        else:
+            aggregated[param] = float(np.median([float(v) for v in values]))
+    return aggregated
+
+
 def update_env_file(env_path, updates):
     """Update key=value lines in a .env file in-place."""
     with open(env_path, 'r') as f:
@@ -143,16 +171,9 @@ def main():
         print("\nNo valid results — .env not updated.")
         return
 
-    # Aggregate across symbols: median for numerics, majority vote for bools.
-    aggregated = {}
-    for param in PARAM_TO_ENV:
-        values = [p[param] for p in all_best_params if param in p]
-        if not values:
-            continue
-        if param in BOOL_PARAMS:
-            aggregated[param] = sum(bool(v) for v in values) >= (len(values) / 2)
-        else:
-            aggregated[param] = float(np.median([float(v) for v in values]))
+    # Aggregate across symbols: median for numerics, majority vote for bools
+    # (VWAP extension medianed over vwap-ON symbols only — see the function).
+    aggregated = aggregate_best_params(all_best_params)
 
     # Format for .env
     env_updates = {}

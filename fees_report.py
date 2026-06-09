@@ -28,22 +28,10 @@ def _attr(obj, name, default=None):
 
 
 def make_client():
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except Exception:
-        pass
-    from alpaca_trade_api.rest import REST
-
-    key = os.getenv("APCA_API_KEY_ID")
-    secret = os.getenv("APCA_API_SECRET_KEY")
-    base_url = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-    if not key or not secret:
-        raise SystemExit(
-            "Missing Alpaca creds. Set APCA_API_KEY_ID and APCA_API_SECRET_KEY "
-            "(see .env.example)."
-        )
-    return REST(key, secret, base_url)
+    # Shared preflight: validates creds, prints the endpoint, and on an auth
+    # failure prints a clear paper/live hint instead of a raw traceback.
+    from reversion_bot.report_client import make_client as _make
+    return _make()
 
 
 def fetch_non_trade_activities(client, days: int) -> List[dict]:

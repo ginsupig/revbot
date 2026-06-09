@@ -358,6 +358,9 @@ async def main():
         use_limit_entry=parse_bool(os.getenv("USE_LIMIT_ENTRY", "True"), default=True),
         limit_entry_offset_bps=float(os.getenv("LIMIT_ENTRY_OFFSET_BPS", 8.0)),
         tif=os.getenv("TRADE_TIF", "day"),
+        # Opt-in: run the order path on the maintained alpaca-py SDK. Default off
+        # = legacy alpaca_trade_api (unchanged). Paper-test before flipping on.
+        use_alpaca_py=parse_bool(os.getenv("USE_ALPACA_PY", "False")),
     )
 
     # 3. Initialize Executor and Symbol List

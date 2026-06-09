@@ -15,7 +15,13 @@ class AlpacaExecutor:
         if not hasattr(exec_config, 'base_url'):
             raise ValueError("ExecutionConfig must have a 'base_url' attribute.")
 
-        self.client = REST(api_key, secret_key, exec_config.base_url)
+        # Order path SDK: opt-in `alpaca-py` adapter (maintained) vs the legacy
+        # `alpaca_trade_api` REST client (EOL). Default off = legacy = unchanged.
+        if bool(getattr(exec_config, "use_alpaca_py", False)):
+            from .alpaca_py_client import AlpacaPyClient
+            self.client = AlpacaPyClient(api_key, secret_key, exec_config.base_url)
+        else:
+            self.client = REST(api_key, secret_key, exec_config.base_url)
         self._order_ids = set()
         self._tif = getattr(exec_config, "tif", "day") or "day"
         # Marketable-limit entries cap entry slippage: the entry leg is priced a

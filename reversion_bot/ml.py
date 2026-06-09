@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 
 
@@ -23,8 +24,18 @@ FEATURE_COLS = [
 
 
 class MLSignalLearner:
-    def __init__(self):
-        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+    def __init__(self, calibration: str | None = "sigmoid", calibration_cv: int = 3):
+        # A bare RandomForest's predict_proba is notoriously miscalibrated —
+        # tree-vote fractions, not true probabilities — yet that number is 25%
+        # of every entry score. Wrap it in CalibratedClassifierCV so the value
+        # fed to the blend is an actual calibrated probability. "sigmoid" (Platt)
+        # is robust on the few-hundred-row windows the bot retrains on; pass
+        # calibration=None for the raw forest (e.g. an A/B comparison).
+        base = RandomForestClassifier(n_estimators=100, random_state=42)
+        if calibration:
+            self.model = CalibratedClassifierCV(base, method=calibration, cv=calibration_cv)
+        else:
+            self.model = base
 
     def _build_features(self, bars):
         """Compute the feature columns (no label). Shared by train and predict."""

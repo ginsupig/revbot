@@ -47,3 +47,25 @@ def test_predict_features_keep_the_current_bar():
     assert X_pred.index[-1] == df.index[-1]      # current bar scored
     assert X_train.index[-1] == df.index[-2]      # training still drops the unlabeled bar
     assert len(X_pred) == len(X_train) + 1
+
+
+# --- Probability calibration -------------------------------------------------
+
+def test_default_model_is_calibrated_and_optional():
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.ensemble import RandomForestClassifier
+    assert isinstance(MLSignalLearner().model, CalibratedClassifierCV)
+    assert isinstance(MLSignalLearner(calibration=None).model, RandomForestClassifier)
+
+
+def test_calibrated_probabilities_are_valid():
+    # Fit on a 2-class set and confirm predict_proba returns real probabilities
+    # in [0, 1] (the value that feeds the 25%-weight blend).
+    df = _ramp(200)
+    learner = MLSignalLearner()           # calibrated (sigmoid, cv=3)
+    learner.fit(df)
+    proba = learner.predict_proba(df)
+    assert proba.shape[1] == 2
+    assert float(proba.min()) >= 0.0 and float(proba.max()) <= 1.0
+    # Rows sum to 1 (proper probability distribution).
+    assert np.allclose(proba.sum(axis=1), 1.0, atol=1e-6)

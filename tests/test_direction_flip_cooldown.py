@@ -83,6 +83,9 @@ class _Client:
 class _Executor:
     client = _Client()
 
+    def open_order_symbols(self):
+        return set()
+
 
 def _short_candidate(symbol="ARM"):
     return {"go_short": True, "symbol": symbol, "entry_style": "mean_reversion",

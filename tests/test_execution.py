@@ -30,9 +30,15 @@ class FakePosition:
         self.qty = qty
 
 
+class FakeOrder:
+    def __init__(self, symbol):
+        self.symbol = symbol
+
+
 class FakeClient:
-    def __init__(self, positions=None):
+    def __init__(self, positions=None, open_orders=None):
         self._positions = positions or []
+        self._open_orders = [FakeOrder(s) for s in (open_orders or [])]
         self.orders = []
 
     def get_clock(self):
@@ -41,15 +47,18 @@ class FakeClient:
     def list_positions(self):
         return self._positions
 
+    def list_orders(self, status=None, limit=None):
+        return self._open_orders
+
     def submit_order(self, **kwargs):
         self.orders.append(kwargs)
         return {"id": "fake", **kwargs}
 
 
-def make_executor(positions=None, use_limit_entry=False, limit_offset_bps=8.0):
+def make_executor(positions=None, use_limit_entry=False, limit_offset_bps=8.0, open_orders=None):
     # Bypass __init__ so we never construct a real Alpaca REST client / hit network.
     ex = AlpacaExecutor.__new__(AlpacaExecutor)
-    ex.client = FakeClient(positions)
+    ex.client = FakeClient(positions, open_orders=open_orders)
     ex._order_ids = set()
     ex._tif = "day"
     ex._use_limit_entry = use_limit_entry
@@ -175,3 +184,34 @@ def test_tune_connection_pool_mounts_larger_adapter():
 def test_tune_connection_pool_noop_without_session():
     ex = make_executor()  # FakeClient has no _session attribute
     ex._tune_connection_pool(32)  # must not raise
+
+
+# --- Open-order reconciliation (double-submit guard) -------------------------
+
+def test_open_order_symbols_and_has_open_order():
+    ex = make_executor(open_orders=["AAPL", "spy"])
+    assert ex.open_order_symbols() == {"AAPL", "SPY"}
+    assert ex.has_open_order("aapl") is True
+    assert ex.has_open_order("MSFT") is False
+
+
+def test_long_bracket_blocked_by_working_order():
+    # A working (unfilled) order on the symbol must block a new bracket even
+    # though there's no filled position yet.
+    ex = make_executor(open_orders=["SPY"])
+    with pytest.raises(RuntimeError, match="Working order already exists"):
+        ex.submit_order(long_candidate())
+    assert ex.client.orders == []   # nothing submitted
+
+
+def test_short_bracket_blocked_by_working_order():
+    ex = make_executor(open_orders=["SPY"])
+    with pytest.raises(RuntimeError, match="Working order already exists"):
+        ex.submit_order(short_candidate())
+    assert ex.client.orders == []
+
+
+def test_no_working_order_allows_submit():
+    ex = make_executor(open_orders=[])
+    ex.submit_order(long_candidate())
+    assert len(ex.client.orders) == 1

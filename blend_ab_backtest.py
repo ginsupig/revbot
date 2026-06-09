@@ -153,6 +153,12 @@ def main() -> None:
     end_s = end.strftime("%Y-%m-%d")
     print(f"Blend-gate A/B | symbols={len(symbols)} | {start}->{end_s} | {args.timeframe}")
 
+    # One shared log path OUTSIDE any per-symbol tempdir: the ReversionService
+    # logger keeps a FileHandler open, which would block TemporaryDirectory
+    # cleanup on Windows (WinError 32). Perf state stays isolated per symbol.
+    log_fd, log_path = tempfile.mkstemp(prefix="blend_ab_", suffix=".log")
+    os.close(log_fd)
+
     tot = {"blended": [], "routed": []}
     print(f"\n  {'SYMBOL':<8}{'blended PF':>12}{'routed PF':>11}{'b net':>10}{'r net':>10}{'b/r trades':>12}")
     for sym in symbols:
@@ -164,7 +170,7 @@ def main() -> None:
             with tempfile.TemporaryDirectory() as tmp:
                 svc = ReversionService(ReversionConfig(min_history=60, enable_shorts=True),
                                        RiskConfig(), PerformanceConfig(state_dir=tmp),
-                                       log_file=os.path.join(tmp, "svc.log"))
+                                       log_file=log_path)
                 pnls = _simulate(bars, svc)
             tot["blended"] += pnls["blended"]
             tot["routed"] += pnls["routed"]
@@ -173,6 +179,11 @@ def main() -> None:
                   f"{f'{bn[0]}/{br[0]}':>12}")
         except Exception as e:
             print(f"  {sym:<8}  error: {e}")
+
+    try:
+        os.unlink(log_path)
+    except OSError:
+        pass
 
     print("\n=== Universe totals ===")
     for mode in ("blended", "routed"):

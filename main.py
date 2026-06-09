@@ -28,7 +28,12 @@ from reversion_bot.symbol_params import load_symbol_params, build_symbol_configs
 from reversion_bot.single_instance import acquire_lock, release_lock
 from reversion_bot.schedule import session_done
 from reversion_bot.heartbeat import write_heartbeat
-from reversion_bot.market_regime import is_risk_off, suppress_longs_if_risk_off
+from reversion_bot.market_regime import (
+    is_risk_off,
+    suppress_longs_if_risk_off,
+    suppress_longs_by_sector,
+)
+from reversion_bot.sectors import sector_for, etf_for_sector
 from run_real_backtest import fetch_alpaca_bars
 
 # Lock scoped to this checkout (not cwd), so a separate deployment can still
@@ -162,6 +167,50 @@ async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int) -
         print(f"[REGIME] benchmark fetch failed ({e}); treating as risk-on.")
         return False
 
+
+# Sector-regime cache: the gate is a DAILY EMA, so a sector ETF's risk-off state
+# can't change within the session faster than its daily bar. Refresh each proxy
+# ETF at most hourly instead of every poll cycle (keeps the data load to a few
+# ETF fetches/day rather than per-cycle). etf -> (epoch_fetched, risk_off).
+_SECTOR_REGIME_CACHE: dict = {}
+_SECTOR_REGIME_TTL_S = 3600
+
+
+async def evaluate_sector_regime(active_sectors, timeframe: str, ema_length: int) -> dict:
+    """Resolve {sector: risk_off} for the active sectors via their proxy ETFs.
+
+    Each ETF is fetched at most once per _SECTOR_REGIME_TTL_S (reusing the
+    fail-open evaluate_market_regime path); stale ETFs are refreshed concurrently.
+    """
+    import time as _time
+    now = _time.time()
+    etfs = {etf_for_sector(s) for s in active_sectors}
+    etfs.discard(None)
+
+    fresh: dict = {}
+    stale = []
+    for etf in etfs:
+        cached = _SECTOR_REGIME_CACHE.get(etf)
+        if cached and now - cached[0] < _SECTOR_REGIME_TTL_S:
+            fresh[etf] = cached[1]
+        else:
+            stale.append(etf)
+
+    if stale:
+        results = await asyncio.gather(*[
+            evaluate_market_regime(etf, timeframe, ema_length) for etf in stale
+        ])
+        for etf, ro in zip(stale, results):
+            _SECTOR_REGIME_CACHE[etf] = (now, ro)
+            fresh[etf] = ro
+
+    regime = {}
+    for sector in active_sectors:
+        etf = etf_for_sector(sector)
+        if etf in fresh:
+            regime[sector] = fresh[etf]
+    return regime
+
 async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor, short_bias=False):
     try:
         if await asyncio.to_thread(executor.has_open_position, symbol):
@@ -291,6 +340,12 @@ async def main():
     # Favor-shorts mode (opt-in): when risk-off, also relax the short trigger so
     # the bot leans short into the downtrend instead of only sitting in cash.
     favor_shorts_risk_off = parse_bool(os.getenv("FAVOR_SHORTS_IN_RISK_OFF", "False"))
+    # Sector-aware regime gate (opt-in): judge each long against ITS sector ETF's
+    # trend (SMH/XLK/XLE/...), not just SPY — so a semis selloff suppresses semis
+    # longs even while SPY holds. Default off = today's SPY-only behavior.
+    # SECTOR_REGIME_COMBINE: "or" (sector OR SPY) | "sector" (sector signal only).
+    use_sector_filter = parse_bool(os.getenv("USE_SECTOR_REGIME_FILTER", "False"))
+    sector_combine = (os.getenv("SECTOR_REGIME_COMBINE", "or") or "or").strip().lower()
 
     # 2. INITIALIZE CONFIGURATIONS FIRST
     strategy_config = ReversionConfig(
@@ -478,6 +533,11 @@ async def main():
         print(f"Market regime: favor-shorts only ({regime_symbol} {regime_timeframe} EMA{regime_ema})")
     else:
         print("Market regime filter: off")
+    if use_sector_filter:
+        covered = sorted({sector_for(s) for s in symbols} - {None})
+        mode = "sector OR SPY" if sector_combine != "sector" else "sector-only"
+        print(f"Sector regime gate: ON ({mode}, {regime_timeframe} EMA{regime_ema}) — "
+              f"sectors in play: {', '.join(covered) or '(none mapped)'}")
     print(f"Monitoring: {', '.join(symbols)}")
 
     cycle = 0
@@ -533,6 +593,20 @@ async def main():
                 tag = "risk-off (favoring shorts)" if short_bias else "risk-off"
                 print(f"[REGIME] {regime_symbol} {regime_timeframe} below EMA{regime_ema} — {tag}.")
 
+            # Sector regime (cached, hourly): which of today's sectors are below
+            # their proxy ETF's trend. Resolved up front so the long-suppression
+            # step can judge each name against its own sector.
+            sector_regime = {}
+            if use_sector_filter:
+                active_sectors = {sector_for(s) for s in symbols}
+                active_sectors.discard(None)
+                sector_regime = await evaluate_sector_regime(
+                    active_sectors, regime_timeframe, regime_ema
+                )
+                off = sorted(s for s, ro in sector_regime.items() if ro)
+                if off:
+                    print(f"[REGIME] sector risk-off (EMA{regime_ema}): {', '.join(off)}")
+
             eval_tasks = [
                 evaluate_symbol_only(s, lookback, timeframe, service, executor, short_bias)
                 for s in symbols
@@ -541,12 +615,22 @@ async def main():
             all_results = [r for r in raw_results if r is not None]
             candidates = [r for r in all_results if r.get("go_long") or r.get("go_short")]
 
-            # Market-regime gate: in a risk-off tape, drop new longs (keep shorts).
-            if use_market_filter and risk_off:
+            # Regime gate: drop new longs in a risk-off tape (keep shorts). The
+            # sector-aware gate supersedes the SPY-only one and, under "or",
+            # still folds SPY in as the broad overlay (and the fallback for any
+            # unclassified name).
+            dropped = []
+            if use_sector_filter:
+                candidates, dropped = suppress_longs_by_sector(
+                    candidates, sector_regime,
+                    fallback_risk_off=(risk_off if use_market_filter else False),
+                    combine=sector_combine,
+                )
+            elif use_market_filter and risk_off:
                 candidates, dropped = suppress_longs_if_risk_off(candidates, True)
-                if dropped:
-                    names = ', '.join(c['symbol'] for c in dropped)
-                    print(f"[REGIME] suppressed {len(dropped)} long(s): {names}")
+            if dropped:
+                names = ', '.join(c['symbol'] for c in dropped)
+                print(f"[REGIME] suppressed {len(dropped)} long(s): {names}")
 
             # Keep equity tracking current for drawdown checks
             if all_results:

@@ -40,18 +40,10 @@ def _load_env() -> None:
 
 
 def _make_client():
-    # Matches the SDK used elsewhere in the repo (execution.py / main.py).
-    from alpaca_trade_api.rest import REST
-
-    key = os.getenv("APCA_API_KEY_ID")
-    secret = os.getenv("APCA_API_SECRET_KEY")
-    base_url = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-    if not key or not secret:
-        raise SystemExit(
-            "Missing Alpaca creds. Set APCA_API_KEY_ID and APCA_API_SECRET_KEY "
-            "(see .env.example)."
-        )
-    return REST(key, secret, base_url)
+    # Shared preflight: validates creds, prints the endpoint, and on an auth
+    # failure prints a clear paper/live hint instead of a raw traceback.
+    from reversion_bot.report_client import make_client
+    return make_client()
 
 
 def _attr(obj, name, default=None):

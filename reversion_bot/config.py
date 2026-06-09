@@ -93,6 +93,11 @@ class ExecutionConfig:
     # the whole universe concurrently, so the requests default of 10 overflows
     # and logs "Connection pool is full, discarding connection" every cycle.
     conn_pool_maxsize: int = 32
+    # Opt-in: route the order path through the maintained `alpaca-py` SDK
+    # (TradingClient) instead of the EOL `alpaca_trade_api` REST client. Default
+    # OFF = legacy path, zero behavior change. Flip on (env USE_ALPACA_PY) to
+    # paper-test the new SDK before it becomes the default.
+    use_alpaca_py: bool = False
 
 
 @dataclass(frozen=True)

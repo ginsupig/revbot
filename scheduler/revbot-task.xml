@@ -42,7 +42,10 @@
     <Enabled>true</Enabled>
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
+    <!-- Wake a sleeping machine for the 08:25 pre-open start. (Note: with the
+         InteractiveToken principal it still only runs while you're logged on;
+         use a Password/S4U principal to trade fully logged off.) -->
+    <WakeToRun>true</WakeToRun>
     <!-- Backstop: force-stop ~7h after the 08:25 CT start (i.e. ~15:25 CT, just
          past the 15:00 close) in case the bot's own clean end-of-day exit ever
          fails. Normal days end well before this when main.py exits at the close. -->

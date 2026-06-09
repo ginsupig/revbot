@@ -38,6 +38,17 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
+# --- Interpreter resolution ----------------------------------------------
+# The scheduled task runs us with -NoProfile and WITHOUT an activated venv, so
+# a bare "python" resolves to whatever (if anything) is on the task's PATH —
+# typically a system Python missing numpy/alpaca/etc., which makes main.py fail
+# on import (exit 1). Prefer the repo's own .venv unless an explicit -Python was
+# passed, so a hand-run (venv active) and the scheduled run use the SAME deps.
+if ($Python -eq "python") {
+    $venvPy = Join-Path $scriptDir ".venv\Scripts\python.exe"
+    if (Test-Path $venvPy) { $Python = $venvPy }
+}
+
 # --- Single-instance guard ------------------------------------------------
 # If another supervisor already holds the mutex, exit quietly. This is what
 # makes it safe to wire up multiple scheduled triggers.

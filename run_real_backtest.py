@@ -2,9 +2,31 @@ import os
 import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from dotenv import load_dotenv
 from reversion_bot.walkforward import run_walkforward_backtest
+
+
+def _parse_timeframe(timeframe) -> TimeFrame:
+    """Normalize a timeframe string to an alpaca-py TimeFrame.
+
+    Accepts both the bare forms ('Day', 'Minute', 'Hour', '5Min') and Alpaca's
+    own '<n><unit>' strings ('1Day', '1Min', '1Hour'). The latter was the live
+    trap: MARKET_REGIME_TIMEFRAME defaulted to '1Day', which the old exact-match
+    chain rejected — so the regime fetch raised every cycle and the filter
+    silently failed open (never suppressed a long).
+    """
+    key = str(timeframe).strip().lower()
+    mapping = {
+        "minute": TimeFrame.Minute, "1min": TimeFrame.Minute, "1minute": TimeFrame.Minute,
+        "5min": TimeFrame(5, TimeFrameUnit.Minute), "15min": TimeFrame(15, TimeFrameUnit.Minute),
+        "hour": TimeFrame.Hour, "1hour": TimeFrame.Hour,
+        "day": TimeFrame.Day, "1day": TimeFrame.Day, "daily": TimeFrame.Day,
+    }
+    tf = mapping.get(key)
+    if tf is None:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
+    return tf
 
 
 def fetch_alpaca_bars(symbol, start, end, timeframe='1Day'):
@@ -21,18 +43,7 @@ def fetch_alpaca_bars(symbol, start, end, timeframe='1Day'):
     else:
         client = StockHistoricalDataClient(api_key, api_secret)
 
-    from alpaca.data.timeframe import TimeFrameUnit
-
-    if timeframe == 'Minute':
-        tf = TimeFrame.Minute
-    elif timeframe == '5Min':
-        tf = TimeFrame(5, TimeFrameUnit.Minute)
-    elif timeframe == 'Hour':
-        tf = TimeFrame.Hour
-    elif timeframe == 'Day':
-        tf = TimeFrame.Day
-    else:
-        raise ValueError(f"Unsupported timeframe: {timeframe}")
+    tf = _parse_timeframe(timeframe)
 
     req_kwargs = {
         'symbol_or_symbols': symbol,

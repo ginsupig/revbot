@@ -20,11 +20,17 @@ from typing import Dict
 from .config import ReversionConfig
 
 # Fields a per-symbol file may override on ReversionConfig, with type coercion.
-_INT_FIELDS = {"band_length", "min_history"}
-_BOOL_FIELDS = {"use_vwap_filter", "use_trend_filter", "require_reclaim_lb1"}
+_INT_FIELDS = {"band_length", "min_history", "trend_ema_length"}
+_BOOL_FIELDS = {
+    "use_vwap_filter", "use_trend_filter",
+    # Entry-quality confirmation gates. These were absent, so a per-symbol
+    # `require_bullish_close` (the highest-edge confirmation in the A/B for the
+    # high-beta names) was silently dropped — only the global .env flag applied.
+    "require_reclaim_lb1", "require_bullish_close", "require_volume_expansion",
+}
 _FLOAT_FIELDS = {
     "ri_threshold", "rsi_max", "max_vwap_extension_pct",
-    "band_std_1", "band_std_2", "adx_max",
+    "band_std_1", "band_std_2", "adx_max", "volume_multiplier_min",
 }
 _ALLOWED = _INT_FIELDS | _BOOL_FIELDS | _FLOAT_FIELDS
 

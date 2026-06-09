@@ -390,8 +390,8 @@ async def main():
     if not symbols:
         print("[WARN] Scanner returned no symbols. Using fallback watchlist.")
         symbols = [
-            "ARM", "ASTS", "NVDA", "TSM", "LRCX",
-            "AMD", "AMAT", "MU", "AVGO", "SMCI",
+            "AMD", "NVDA", "SMCI", "META", "ARM",
+            "CRWD", "FCX", "OXY", "CLF", "HIMS",
         ]
 
     # 3a-bis. Force-include watchlist / force-exclude blocklist. These wrap the

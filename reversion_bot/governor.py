@@ -83,6 +83,7 @@ class ExecutionGovernor:
         new_position_heat: float,
         trades_executed_this_cycle: int,
         side: str = "long",
+        open_order_symbols: Iterable[str] = (),
     ) -> Tuple[bool, str]:
         symbol = symbol.upper()
         open_symbols = {s.upper() for s in open_symbols}
@@ -92,6 +93,11 @@ class ExecutionGovernor:
 
         if symbol in open_symbols:
             return False, "open_position_exists"
+
+        # A working (unfilled) order on this symbol — invisible to list_positions
+        # — would otherwise let a second bracket stack on the same name.
+        if symbol in {s.upper() for s in open_order_symbols}:
+            return False, "open_order_exists"
 
         if len(open_symbols) >= self.config.max_open_positions:
             return False, "max_open_positions_reached"
@@ -167,8 +173,11 @@ class ExecutionGovernor:
             eq = getattr(account, "equity", None)
             account_equity = float(pv if pv else eq)
             positions = executor.client.list_positions()
+            # Working (unfilled) orders — fetched in the same guarded block so an
+            # error fails CLOSED (skip the entry) rather than risk a double-submit.
+            open_order_syms = executor.open_order_symbols()
         except Exception as e:
-            print(f"[GOVERNOR] account fetch failed: {e}")
+            print(f"[GOVERNOR] account/order fetch failed: {e}")
             return False
 
         # Real-time intraday margin gate (FINRA Notice 26-10, eff. 2026-06-04).
@@ -223,6 +232,7 @@ class ExecutionGovernor:
             new_position_heat=new_position_heat,
             trades_executed_this_cycle=trades_executed_this_cycle,
             side=side,
+            open_order_symbols=open_order_syms,
         )
         if not ok:
             print(f"[GOVERNOR] {symbol} rejected: {reason}")

@@ -140,6 +140,9 @@ class AlpacaExecutor:
         if self.has_open_long_position(symbol):
             raise RuntimeError(f"Position for {symbol} already exists.")
 
+        if self.has_open_order(symbol):
+            raise RuntimeError(f"Working order already exists for {symbol}.")
+
         order_key = self._order_key(symbol, plan)
         if order_key in self._order_ids:
             raise RuntimeError(f"Duplicate order detected for {order_key}.")
@@ -169,6 +172,9 @@ class AlpacaExecutor:
 
         if self.has_open_short_position(symbol):
             raise RuntimeError(f"Short position for {symbol} already exists.")
+
+        if self.has_open_order(symbol):
+            raise RuntimeError(f"Working order already exists for {symbol}.")
 
         order_key = self._order_key(symbol, plan)
         if order_key in self._order_ids:
@@ -222,6 +228,21 @@ class AlpacaExecutor:
 
     def get_positions(self):
         return self.client.list_positions()
+
+    def open_order_symbols(self) -> set:
+        """Symbols with a WORKING (unfilled/active) order right now.
+
+        Closes the double-submit gap: a bracket whose entry leg hasn't filled is
+        invisible to list_positions, so without this a second order could stack
+        on the same name across cycles (worse with marketable-limit entries that
+        sit unfilled). Raises on API error so callers fail CLOSED (skip the
+        entry) rather than risk a duplicate.
+        """
+        orders = self.client.list_orders(status="open", limit=500)
+        return {str(o.symbol).upper() for o in orders if getattr(o, "symbol", None)}
+
+    def has_open_order(self, symbol: str) -> bool:
+        return symbol.strip().upper() in self.open_order_symbols()
 
     def has_open_long_position(self, symbol: str) -> bool:
         positions = self.get_positions()

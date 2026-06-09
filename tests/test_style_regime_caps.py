@@ -77,6 +77,9 @@ class _Executor:
     def __init__(self, positions):
         self.client = _Client(positions)
 
+    def open_order_symbols(self):
+        return set()
+
 
 def test_reversion_style_cap_now_binds(tmp_path):
     # Two mean-reversion positions already open; cap is 2 -> a third is rejected.
@@ -98,3 +101,22 @@ def test_reversion_style_cap_now_binds(tmp_path):
         "portfolio_heat": 1.0,
     }
     assert gov.approve(candidate, executor=executor, trades_executed_this_cycle=0) is False
+
+
+def test_governor_rejects_when_a_working_order_exists(tmp_path):
+    # A working (unfilled) order on the symbol must block a new entry at the
+    # governor, closing the cross-cycle double-submit gap.
+    ps = PortfolioState(state_dir=str(tmp_path))
+    gov = ExecutionGovernor(config=PortfolioConfig(), portfolio_state=ps)
+
+    class _ExecutorWithWorkingOrder(_Executor):
+        def open_order_symbols(self):
+            return {"CCC"}
+
+    candidate = {
+        "go_long": True, "symbol": "CCC", "entry_style": "mean_reversion",
+        "regime": "reversion", "position_plan": {"position_value": 1000.0},
+        "portfolio_heat": 1.0,
+    }
+    ex = _ExecutorWithWorkingOrder([])
+    assert gov.approve(candidate, executor=ex, trades_executed_this_cycle=0) is False

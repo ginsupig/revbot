@@ -51,6 +51,9 @@ class FakeClient:
     def list_positions(self):
         return self._positions
 
+    def list_orders(self, status=None, limit=None):
+        return []
+
     def submit_order(self, **kwargs):
         self.orders.append(kwargs)
         return {"id": "fake", **kwargs}

@@ -164,6 +164,10 @@ class AlpacaPyClient:
     def cancel_all_orders(self):
         return self._trading.cancel_orders()
 
+    def close_position(self, symbol: str):
+        # Market-closes the position and cancels its related open orders.
+        return self._trading.close_position(symbol)
+
     def replace_order(self, order_id: str, limit_price: float):
         return self._trading.replace_order_by_id(
             order_id, ReplaceOrderRequest(limit_price=limit_price)

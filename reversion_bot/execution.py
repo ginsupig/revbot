@@ -235,6 +235,17 @@ class AlpacaExecutor:
     def get_positions(self):
         return self.client.list_positions()
 
+    def close_long(self, symbol: str):
+        """Market-close a LONG position and cancel ITS working orders (the
+        bracket legs), atomically and per-symbol.
+
+        Used by the breakout exit to take profit on a run before the fixed
+        bracket target. Uses close_position so it never touches other symbols'
+        orders (unlike the global cancel_all_orders the EOD path uses).
+        """
+        symbol = symbol.strip().upper()
+        return self.client.close_position(symbol)
+
     def open_order_symbols(self) -> set:
         """Symbols with a WORKING (unfilled/active) order right now.
 

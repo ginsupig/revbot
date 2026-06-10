@@ -31,15 +31,21 @@ class FakePosition:
 
 
 class FakeOrder:
-    def __init__(self, symbol):
+    def __init__(self, symbol, order_id=None):
         self.symbol = symbol
+        self.id = order_id if order_id is not None else f"oid-{symbol}"
 
 
 class FakeClient:
-    def __init__(self, positions=None, open_orders=None):
+    def __init__(self, positions=None, open_orders=None, close_fail_times=0):
         self._positions = positions or []
         self._open_orders = [FakeOrder(s) for s in (open_orders or [])]
         self.orders = []
+        self.cancelled = []        # order ids passed to cancel_order
+        self.closed = []           # symbols passed to close_position
+        # How many initial close_position calls should raise before succeeding
+        # (simulates held-for-orders qty freeing a beat after the cancel).
+        self._close_fail_times = close_fail_times
 
     def get_clock(self):
         return FakeClock()
@@ -54,11 +60,22 @@ class FakeClient:
         self.orders.append(kwargs)
         return {"id": "fake", **kwargs}
 
+    def cancel_order(self, order_id):
+        self.cancelled.append(order_id)
 
-def make_executor(positions=None, use_limit_entry=False, limit_offset_bps=8.0, open_orders=None):
+    def close_position(self, symbol):
+        if len(self.closed) < self._close_fail_times:
+            self.closed.append(symbol)
+            raise RuntimeError("insufficient qty available for order")
+        self.closed.append(symbol)
+        return {"id": "closed", "symbol": symbol}
+
+
+def make_executor(positions=None, use_limit_entry=False, limit_offset_bps=8.0,
+                  open_orders=None, close_fail_times=0):
     # Bypass __init__ so we never construct a real Alpaca REST client / hit network.
     ex = AlpacaExecutor.__new__(AlpacaExecutor)
-    ex.client = FakeClient(positions, open_orders=open_orders)
+    ex.client = FakeClient(positions, open_orders=open_orders, close_fail_times=close_fail_times)
     ex._order_ids = set()
     ex._tif = "day"
     ex._use_limit_entry = use_limit_entry
@@ -215,3 +232,34 @@ def test_no_working_order_allows_submit():
     ex = make_executor(open_orders=[])
     ex.submit_order(long_candidate())
     assert len(ex.client.orders) == 1
+
+
+# --- Breakout-exit close: cancel the bracket legs before liquidating ---------
+
+def test_close_long_cancels_symbol_orders_before_closing():
+    # The held bracket legs reserve the shares; without cancelling them first
+    # close_position is rejected with "insufficient qty available". Only the
+    # target symbol's orders are cancelled — other names are left alone.
+    ex = make_executor(open_orders=["OXY", "OXY", "AAPL"])
+    ex.close_long("oxy")
+    assert ex.client.cancelled == ["oid-OXY", "oid-OXY"]   # AAPL untouched
+    assert ex.client.closed == ["OXY"]
+
+
+def test_close_long_retries_close_until_qty_frees(monkeypatch):
+    # The cancelled qty can take a beat to free, so the first close may still
+    # raise; close_long retries rather than erroring out for the whole cycle.
+    monkeypatch.setattr("reversion_bot.execution.sleep", lambda *_: None)
+    ex = make_executor(open_orders=["OXY"], close_fail_times=2)
+    ex.close_long("OXY")
+    assert ex.client.cancelled == ["oid-OXY"]
+    assert ex.client.closed == ["OXY", "OXY", "OXY"]   # 2 failures + 1 success
+
+
+def test_close_long_survives_order_list_failure():
+    # A list_orders hiccup must not block the close — it still attempts to close.
+    ex = make_executor(open_orders=["OXY"])
+    ex.client.list_orders = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    ex.close_long("OXY")
+    assert ex.client.cancelled == []
+    assert ex.client.closed == ["OXY"]

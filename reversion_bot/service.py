@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 import hashlib
 import logging
 import math
+import os
+import time
 import threading
 
 import pandas as pd
@@ -62,6 +64,13 @@ class ReversionService:
         # start in a one-directional tape (one-class labels skip the fit) leaves
         # the model unfit for ages, spamming "not fitted" and pinning ml -> 0.5.
         self.ml_is_fitted = False
+        # Cross-restart persistence: a previously fitted model is loaded just
+        # below (after the logger exists) so ML works from bar 1 rather than
+        # cold-starting every session.
+        self._ml_from_disk = False
+        self._ml_model_path = os.path.join(
+            self.perf_cfg.state_dir, self.perf_cfg.ml_model_filename
+        )
 
         self.weights = {
             "mean_reversion": 0.30,
@@ -81,6 +90,10 @@ class ReversionService:
             ch.setFormatter(formatter)
             self.logger.addHandler(fh)
             self.logger.addHandler(ch)
+
+        # Load any persisted ML model now that the logger exists.
+        if self.perf_cfg.persist_ml_model:
+            self._load_ml_model()
 
     def _engine_for(self, symbol: str) -> ReversionEngine:
         """The symbol's own tuned engine, or the shared default."""
@@ -357,6 +370,41 @@ class ReversionService:
             score += min(adx_buffer / 20.0, 1.0) * 0.10
         return max(0.0, min(score, 1.0))
 
+    def _load_ml_model(self) -> None:
+        """Load a persisted ML model at startup. Best-effort and fully guarded:
+        any missing/stale/corrupt/incompatible file leaves the cold-start path
+        intact (ml_is_fitted stays False -> retrain-until-fit takes over).
+        """
+        path = self._ml_model_path
+        try:
+            if not os.path.exists(path):
+                return
+            age_h = (time.time() - os.path.getmtime(path)) / 3600.0
+            if age_h > float(self.perf_cfg.ml_model_max_age_hours):
+                self.logger.info("ML model on disk is stale (%.1fh) — cold-starting.", age_h)
+                return
+            import joblib
+            model = joblib.load(path)
+            if not hasattr(model, "predict_proba"):
+                return
+            self.ml_learner.model = model
+            self.ml_is_fitted = True
+            self._ml_from_disk = True
+            self.logger.info("ML model loaded from %s (age %.1fh).", path, age_h)
+        except Exception as exc:
+            self.logger.warning("ML model load failed (%s) — cold-starting.", exc)
+
+    def _save_ml_model(self) -> None:
+        """Persist the fitted model after a retrain. Best-effort; never fatal."""
+        if not self.perf_cfg.persist_ml_model:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._ml_model_path) or ".", exist_ok=True)
+            import joblib
+            joblib.dump(self.ml_learner.model, self._ml_model_path)
+        except Exception as exc:
+            self.logger.warning("ML model save failed: %s", exc)
+
     def _get_ml_probability(self, df: pd.DataFrame) -> float:
         self.ml_eval_count += 1
         if len(df) < self.min_rows_for_ml:
@@ -381,6 +429,8 @@ class ReversionService:
                         self.ml_learner.model.fit(X, y)
                         self.ml_last_train_data_hash = data_hash
                         self.ml_is_fitted = True
+                        self._ml_from_disk = False  # freshly fit on live data
+                        self._save_ml_model()
                         self.logger.info("ML retrained rows=%s classes=%s", len(X), int(y.nunique()))
                 except Exception as exc:
                     self.logger.warning("ML retrain error: %s", exc)
@@ -406,6 +456,13 @@ class ReversionService:
                 p = float(row[1])
             except Exception as exc:
                 self.logger.warning("ML probability error: %s", exc)
+                # If a model loaded from disk can't predict (stale schema after a
+                # code change, corrupt, etc.), invalidate it so the retrain-until-
+                # fit logic rebuilds it on live data instead of erroring forever.
+                if self._ml_from_disk:
+                    self.ml_is_fitted = False
+                    self._ml_from_disk = False
+                    self.logger.warning("Loaded ML model invalid — will retrain on live data.")
                 return 0.5
 
         # Defense in depth: never let a non-finite or out-of-range probability

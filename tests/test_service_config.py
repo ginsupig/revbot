@@ -46,7 +46,9 @@ def test_ml_probability_clamps_non_finite(tmp_path):
     # If the model returns a non-finite probability, fall back to neutral 0.5.
     svc = _svc(tmp_path)
     svc.min_rows_for_ml = 0
+    svc.ml_is_fitted = True   # reach the predict path (skip the unfit short-circuit)
     svc.ml_learner.prepare_features = lambda df: (pd.DataFrame({"a": [1.0]}), None)
+    svc.ml_learner.prepare_features_for_predict = lambda df: pd.DataFrame({"a": [1.0]})
 
     class _InfModel:
         def predict_proba(self, X):
@@ -54,6 +56,56 @@ def test_ml_probability_clamps_non_finite(tmp_path):
 
     svc.ml_learner.model = _InfModel()
     assert svc._get_ml_probability(pd.DataFrame({"close": [1.0, 2.0, 3.0]})) == 0.5
+
+
+# --- cold-start ML: never-fitted model must not raise/spam (regression) ------
+
+def _two_class(n=60):
+    X = pd.DataFrame({"a": list(range(n))})
+    y = pd.Series([0, 1] * (n // 2))
+    return X, y
+
+
+def test_unfit_model_returns_neutral_without_predicting(tmp_path):
+    # One-class labels skip the fit, so the model stays unfit. _get_ml_probability
+    # must return neutral 0.5 WITHOUT calling predict_proba (which would raise
+    # "not fitted" and spam the log for every symbol).
+    svc = _svc(tmp_path)
+    svc.min_rows_for_ml = 0
+    svc.ml_learner.prepare_features = lambda df: (pd.DataFrame({"a": [1.0] * 60}), pd.Series([1] * 60))
+
+    class _Boom:
+        def fit(self, X, y):
+            raise AssertionError("one-class data must not reach fit")  # nunique<2 guards it
+        def predict_proba(self, X):
+            raise AssertionError("predict_proba must not run on an unfit model")
+
+    svc.ml_learner.model = _Boom()
+    assert svc._get_ml_probability(pd.DataFrame({"close": [1.0, 2.0, 3.0]})) == 0.5
+    assert svc.ml_is_fitted is False
+
+
+def test_unfit_model_retries_fit_off_the_25_tick(tmp_path):
+    # The bug: training was only attempted on eval #1 / every 25th. A cold start
+    # in a one-directional tape could go many evals unfit. While unfit, a fit must
+    # be attempted on EVERY eval — here on eval #8 (neither 1 nor a multiple of 25).
+    svc = _svc(tmp_path)
+    svc.min_rows_for_ml = 0
+    svc.ml_eval_count = 7
+    X, y = _two_class()
+    svc.ml_learner.prepare_features = lambda df: (X, y)
+    svc.ml_learner.prepare_features_for_predict = lambda df: X
+
+    class _Model:
+        def fit(self, X, y):
+            pass
+        def predict_proba(self, X):
+            return np.array([[0.3, 0.7]])
+
+    svc.ml_learner.model = _Model()
+    p = svc._get_ml_probability(pd.DataFrame({"close": [1.0, 2.0, 3.0]}))
+    assert svc.ml_is_fitted is True   # fit happened off-tick because the model was unfit
+    assert p == 0.7
 
 
 def test_short_bias_threads_through_service(tmp_path):

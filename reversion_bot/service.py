@@ -56,6 +56,12 @@ class ReversionService:
         self.ml_eval_count = 0
         self.ml_train_every = 25
         self.min_rows_for_ml = 120
+        # The model fits lazily and lives in memory, so a restart (every session
+        # starts fresh) cold-starts it. Until the FIRST successful fit lands, keep
+        # retrying every eval rather than only on the 25-tick — otherwise a cold
+        # start in a one-directional tape (one-class labels skip the fit) leaves
+        # the model unfit for ages, spamming "not fitted" and pinning ml -> 0.5.
+        self.ml_is_fitted = False
 
         self.weights = {
             "mean_reversion": 0.30,
@@ -362,7 +368,11 @@ class ReversionService:
         with self._ml_lock:
             should_train = (
                 self.ml_last_train_data_hash != data_hash
-                and (self.ml_eval_count == 1 or self.ml_eval_count % self.ml_train_every == 0)
+                and (
+                    not self.ml_is_fitted          # keep trying until the first fit
+                    or self.ml_eval_count == 1
+                    or self.ml_eval_count % self.ml_train_every == 0
+                )
             )
             if should_train:
                 try:
@@ -370,9 +380,16 @@ class ReversionService:
                     if len(X) >= 50 and y.nunique() >= 2:
                         self.ml_learner.model.fit(X, y)
                         self.ml_last_train_data_hash = data_hash
+                        self.ml_is_fitted = True
                         self.logger.info("ML retrained rows=%s classes=%s", len(X), int(y.nunique()))
                 except Exception as exc:
                     self.logger.warning("ML retrain error: %s", exc)
+
+            # Until the model has been fit at least once, there is nothing to
+            # predict — return neutral cleanly instead of letting predict_proba
+            # raise "not fitted" for every symbol every cycle.
+            if not self.ml_is_fitted:
+                return 0.5
 
             try:
                 # Predict on a feature frame that KEEPS the current bar; training

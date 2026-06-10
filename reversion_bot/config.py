@@ -98,6 +98,16 @@ class ExecutionConfig:
     # OFF = legacy path, zero behavior change. Flip on (env USE_ALPACA_PY) to
     # paper-test the new SDK before it becomes the default.
     use_alpaca_py: bool = False
+    # Opt-in breakout exit: actively market-close a LONG when price reaches the
+    # upper linear-regression channel ("sell the breakout"), instead of waiting
+    # for the fixed bracket target — which the A/B showed clips winners. The
+    # broker-side stop + (wide) target stay as the safety net underneath. Default
+    # OFF = today's static-bracket behavior. Pair with a WIDE TARGET_ATR_MULTIPLE
+    # so the bracket target acts as a backstop the active exit beats.
+    use_channel_exit: bool = False
+    channel_exit_threshold: float = 0.80
+    channel_lookback: int = 80
+    channel_k: float = 2.0
 
 
 @dataclass(frozen=True)

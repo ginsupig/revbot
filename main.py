@@ -34,6 +34,7 @@ from reversion_bot.market_regime import (
     suppress_longs_by_sector,
 )
 from reversion_bot.sectors import sector_for, etf_for_sector
+from reversion_bot.channel import select_breakout_exits
 from run_real_backtest import fetch_alpaca_bars
 
 # Lock scoped to this checkout (not cwd), so a separate deployment can still
@@ -306,6 +307,53 @@ async def liquidate_all_positions(executor):
             print(f"[EOD] Failed to submit {side} for {symbol}: {e}")
 
 
+async def manage_channel_exits(executor, exec_config, lookback, timeframe):
+    """Breakout exit: market-close any LONG that has reached the upper regression
+    channel, capturing the run before the (wide) bracket target. Longs only; the
+    broker-side stop + bracket target remain the safety net. Best-effort — any
+    fetch/close error is logged and skipped so a hiccup never disrupts the loop.
+    """
+    try:
+        positions = await asyncio.to_thread(executor.get_positions)
+    except Exception as e:
+        print(f"[CHANNEL-EXIT] position fetch failed ({e}); skipping.")
+        return
+
+    longs = [p for p in positions if _safe_qty(p) > 0]
+    if not longs:
+        return
+
+    look = int(getattr(exec_config, "channel_lookback", 80))
+    k = float(getattr(exec_config, "channel_k", 2.0))
+    threshold = float(getattr(exec_config, "channel_exit_threshold", 0.80))
+
+    # Fetch each held long's recent closes (held names are skipped by the entry
+    # scan, so they aren't fetched there).
+    closes_by_symbol = {}
+    for p in longs:
+        symbol = str(p.symbol).upper()
+        try:
+            bars = await fetch_bars_for_symbol(symbol, timeframe, max(lookback, look))
+            if bars is not None and len(bars) >= look:
+                closes_by_symbol[symbol] = bars["close"].to_numpy()
+        except Exception as e:
+            print(f"[CHANNEL-EXIT] {symbol} bar fetch failed ({e}); skipping.")
+
+    for symbol in select_breakout_exits(longs, closes_by_symbol, threshold, look, k):
+        try:
+            await asyncio.to_thread(executor.close_long, symbol)
+            print(f"[CHANNEL-EXIT] {symbol} reached the upper channel — taking the breakout, exiting.")
+        except Exception as e:
+            print(f"[CHANNEL-EXIT] {symbol} close failed: {e}")
+
+
+def _safe_qty(position) -> float:
+    try:
+        return float(getattr(position, "qty", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # --- Main Entry Point ---
 
 async def main():
@@ -416,6 +464,12 @@ async def main():
         # Opt-in: run the order path on the maintained alpaca-py SDK. Default off
         # = legacy alpaca_trade_api (unchanged). Paper-test before flipping on.
         use_alpaca_py=parse_bool(os.getenv("USE_ALPACA_PY", "False")),
+        # Opt-in breakout exit (default off). Pair with a WIDE TARGET_ATR_MULTIPLE
+        # so the bracket target is just a backstop the active channel exit beats.
+        use_channel_exit=parse_bool(os.getenv("USE_CHANNEL_EXIT", "False")),
+        channel_exit_threshold=float(os.getenv("CHANNEL_EXIT_THRESHOLD", 0.80)),
+        channel_lookback=int(os.getenv("CHANNEL_LOOKBACK", 80)),
+        channel_k=float(os.getenv("CHANNEL_K", 2.0)),
     )
 
     # 3. Initialize Executor and Symbol List
@@ -538,6 +592,10 @@ async def main():
         mode = "sector OR SPY" if sector_combine != "sector" else "sector-only"
         print(f"Sector regime gate: ON ({mode}, {regime_timeframe} EMA{regime_ema}) — "
               f"sectors in play: {', '.join(covered) or '(none mapped)'}")
+    if exec_config.use_channel_exit:
+        print(f"Breakout exit: ON (exit longs at channel pos >= "
+              f"{exec_config.channel_exit_threshold:g}, lookback {exec_config.channel_lookback} bars) "
+              f"— set a WIDE TARGET_ATR_MULTIPLE as the backstop.")
     print(f"Monitoring: {', '.join(symbols)}")
 
     cycle = 0
@@ -641,7 +699,12 @@ async def main():
                     pass
 
             await execute_candidates(governor, executor, portfolio_state, candidates)
-            
+
+            # Breakout exit: take profit on any long that has run to the upper
+            # channel, before its (wide backstop) bracket target. Opt-in.
+            if exec_config.use_channel_exit:
+                await manage_channel_exits(executor, exec_config, lookback, timeframe)
+
             await asyncio.sleep(poll_interval)
 
         # Clean end-of-day exit (loop broke after the session closed).

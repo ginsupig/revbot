@@ -535,6 +535,9 @@ async def main():
         enable_adaptive_threshold=parse_bool(os.getenv("PERF_ENABLE_ADAPTIVE_THRESHOLD", "True"), default=True),
         min_samples=int(os.getenv("PERF_MIN_SAMPLES", 20)),
         max_threshold_adj=float(os.getenv("PERF_MAX_THRESHOLD_ADJ", 0.05)),
+        # Persist the fitted ML model across restarts (no daily cold-start).
+        persist_ml_model=parse_bool(os.getenv("PERSIST_ML_MODEL", "True"), default=True),
+        ml_model_max_age_hours=float(os.getenv("ML_MODEL_MAX_AGE_HOURS", 168.0)),
     )
     portfolio_config = PortfolioConfig(
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", 4)),

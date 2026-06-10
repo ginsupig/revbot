@@ -116,6 +116,15 @@ class PerformanceConfig:
     enable_adaptive_threshold: bool = True
     min_samples: int = 20
     max_threshold_adj: float = 0.05
+    # Persist the fitted ML model so a daily restart doesn't cold-start it (the
+    # model is in-memory only otherwise, so ML contributes nothing until it
+    # re-fits on live data — and in a one-directional tape it may never fit).
+    # Loaded at startup if present and fresh; re-saved after each retrain. A
+    # stale/incompatible load is self-healing: a failed predict invalidates it
+    # and the retrain-until-fit logic rebuilds it.
+    persist_ml_model: bool = True
+    ml_model_filename: str = "ml_model.pkl"
+    ml_model_max_age_hours: float = 168.0  # 7 days; older -> ignore, cold-start
 
 
 @dataclass(frozen=True)

@@ -123,3 +123,81 @@ def test_short_bias_threads_through_service(tmp_path):
     df = make_overbought_df()
     assert svc.evaluate_symbol("T", df, 100000, short_bias=False).get("go_short") is not True
     assert svc.evaluate_symbol("T", df, 100000, short_bias=True).get("go_short") is True
+
+
+# --- ML model persistence across restarts -----------------------------------
+
+import os
+import time
+from reversion_bot.config import PerformanceConfig as _PC
+
+
+def _fit_twoclass(svc):
+    """Drive one successful fit on a tiny picklable model."""
+    from sklearn.dummy import DummyClassifier
+    X = pd.DataFrame({"a": list(range(60))})
+    y = pd.Series([0, 1] * 30)
+    svc.min_rows_for_ml = 0
+    svc.ml_learner.prepare_features = lambda df: (X, y)
+    svc.ml_learner.prepare_features_for_predict = lambda df: X
+    svc.ml_learner.model = DummyClassifier(strategy="prior")
+    return svc._get_ml_probability(pd.DataFrame({"close": [1.0, 2.0, 3.0]}))
+
+
+def test_fitted_model_is_saved_then_reloaded(tmp_path):
+    svc = _svc(tmp_path)
+    _fit_twoclass(svc)
+    assert svc.ml_is_fitted is True
+    assert os.path.exists(svc._ml_model_path)
+
+    # A fresh service (same state dir) loads it -> fitted from startup.
+    svc2 = _svc(tmp_path)
+    assert svc2.ml_is_fitted is True
+    assert svc2._ml_from_disk is True
+
+
+def test_missing_model_file_cold_starts(tmp_path):
+    svc = _svc(tmp_path)
+    assert svc.ml_is_fitted is False
+    assert svc._ml_from_disk is False
+
+
+def test_stale_model_is_ignored(tmp_path):
+    import joblib
+    from sklearn.dummy import DummyClassifier
+    path = tmp_path / "ml_model.pkl"
+    joblib.dump(DummyClassifier(strategy="prior").fit([[0], [1]], [0, 1]), path)
+    old = time.time() - 10 * 3600
+    os.utime(path, (old, old))
+    cfg = _PC(state_dir=str(tmp_path), ml_model_max_age_hours=1.0)
+    svc = ReversionService(performance_config=cfg)
+    assert svc.ml_is_fitted is False   # too old -> cold-start
+
+
+def test_persist_disabled_neither_loads_nor_saves(tmp_path):
+    cfg = _PC(state_dir=str(tmp_path), persist_ml_model=False)
+    svc = ReversionService(performance_config=cfg)
+    _fit_twoclass(svc)
+    assert svc.ml_is_fitted is True
+    assert not os.path.exists(svc._ml_model_path)   # save skipped
+
+
+class _BrokenModel:
+    """Picklable model that errors on predict — simulates a stale schema."""
+    def predict_proba(self, X):
+        raise RuntimeError("feature schema mismatch")
+
+
+def test_loaded_model_invalidated_when_predict_fails(tmp_path):
+    import joblib
+    path = tmp_path / "ml_model.pkl"
+    joblib.dump(_BrokenModel(), path)
+    svc = _svc(tmp_path)
+    assert svc.ml_is_fitted is True and svc._ml_from_disk is True  # loaded
+    # A predict that raises must invalidate the loaded model so retrain kicks in.
+    svc.min_rows_for_ml = 0
+    svc.ml_learner.prepare_features = lambda df: (pd.DataFrame({"a": [1.0]}), pd.Series([0]))
+    svc.ml_learner.prepare_features_for_predict = lambda df: pd.DataFrame({"a": [1.0]})
+    assert svc._get_ml_probability(pd.DataFrame({"close": [1.0, 2.0, 3.0]})) == 0.5
+    assert svc.ml_is_fitted is False
+    assert svc._ml_from_disk is False

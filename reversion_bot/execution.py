@@ -236,15 +236,56 @@ class AlpacaExecutor:
         return self.client.list_positions()
 
     def close_long(self, symbol: str):
-        """Market-close a LONG position and cancel ITS working orders (the
-        bracket legs), atomically and per-symbol.
+        """Market-close a LONG position, cancelling ITS working orders (the
+        bracket legs) first, per-symbol.
 
         Used by the breakout exit to take profit on a run before the fixed
-        bracket target. Uses close_position so it never touches other symbols'
-        orders (unlike the global cancel_all_orders the EOD path uses).
+        bracket target. The open bracket legs (stop + take-profit) reserve the
+        shares as ``held_for_orders``; close_position alone is then rejected with
+        "insufficient qty available for order (requested: N, available: 0)" and
+        the position never closes — the breakout exit just re-fires the same
+        error every cycle. Cancel the symbol's working orders to free the held
+        qty, then liquidate. Per-symbol throughout, so other names' brackets are
+        untouched (unlike the global cancel_all_orders the EOD path uses).
         """
         symbol = symbol.strip().upper()
-        return self.client.close_position(symbol)
+        self._cancel_orders_for_symbol(symbol)
+        # Cancelled qty can take a beat to free server-side, so the first close
+        # may still see held shares; retry a few times before giving up.
+        last_exc: Exception | None = None
+        for _ in range(3):
+            try:
+                return self.client.close_position(symbol)
+            except Exception as e:  # noqa: BLE001 - retried/propagated below
+                last_exc = e
+                sleep(0.5)
+        raise last_exc
+
+    def _cancel_orders_for_symbol(self, symbol: str) -> None:
+        """Best-effort cancel of every working order for one symbol.
+
+        Frees shares the open bracket legs hold so close_position can liquidate.
+        Never raises: a cancel hiccup must not block the close path — the close
+        retry (and the next cycle) will recover.
+        """
+        symbol = symbol.strip().upper()
+        try:
+            orders = self.client.list_orders(status="open", limit=500)
+        except Exception as e:  # noqa: BLE001 - logged, close still attempted
+            logging.warning("close_long: order list failed for %s: %s", symbol, e)
+            return
+        for o in orders:
+            if str(getattr(o, "symbol", "")).upper() != symbol:
+                continue
+            order_id = getattr(o, "id", None)
+            if order_id is None:
+                continue
+            try:
+                self.client.cancel_order(order_id)
+            except Exception as e:  # noqa: BLE001 - one leg failing must not block
+                logging.warning(
+                    "close_long: cancel order %s for %s failed: %s", order_id, symbol, e
+                )
 
     def open_order_symbols(self) -> set:
         """Symbols with a WORKING (unfilled/active) order right now.

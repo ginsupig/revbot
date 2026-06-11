@@ -20,7 +20,8 @@ self-exit (force-stop ~15:25 CT) in case the clock check ever fails.
 |------|------|
 | `../run_bot.ps1` | Supervisor. Launches `python main.py`, **restarts it on crash** with backoff, and **stops on a clean (code 0) exit** so it shuts down at the close. A global mutex ensures only **one** instance runs, so duplicate triggers can't place duplicate orders. Logs to `../logs/`. |
 | `revbot-task.xml` | Scheduled-task definition: starts the supervisor **weekdays at 08:25 CT** (before US open) and **at logon** (a reboot mid-session brings it back; after hours it self-exits at once). `PT7H` time-limit backstop. |
-| `install_task.ps1` | Registers/updates the task named `revbot`. |
+| `install_task.ps1` | Registers/updates the task named `revbot` **for a logged-on session** (`InteractiveToken` — only fires while you're signed in). |
+| `install_task_headless.ps1` | Same task, but **runs whether you're logged on or not** (stored credential, like the autotune task). Use this if the bot must start unattended. Run elevated. |
 | `run_autotune.ps1` | Weekly tuner wrapper. Runs `autotune_run.py 90 --symbols …`, which rewrites `.env` (`TRADE_ALLOWLIST` + fallback params) and `symbol_params.json`. Single-instance guarded; logs to `../logs/autotune_*.log`. |
 | `install_autotune_task.ps1` | Registers the **weekly** task `revbot-autotune` (Sundays), so Monday's bot starts on fresh candidates. |
 
@@ -51,10 +52,17 @@ Get-Content .\logs\bot_$(Get-Date -Format yyyyMMdd).log -Wait
   If the task can't find Python, edit the `Action` in `revbot-task.xml` (or the
   `-Python` default in `run_bot.ps1`) to the full path, e.g.
   `C:\Users\<you>\AppData\Local\Programs\Python\Python311\python.exe`.
-- **Machine must be on.** A per-user task only runs while your PC is on (and,
-  as written, while you're logged on — `InteractiveToken`). For a true
-  always-on box that survives logoff/reboot unattended, run it on an
-  always-on server or switch to a service manager like NSSM.
+- **Machine must be on, and — by default — logged on.** `install_task.ps1`
+  imports `revbot-task.xml`, whose principal is `InteractiveToken`: the 08:25
+  trigger only fires while you're actually signed in. If the box was at the
+  lock screen, signed out, or asleep without a session, the bot never starts
+  ("it didn't fire this morning"). To run unattended, register with
+  **`install_task_headless.ps1`** instead — it stores your Windows credential
+  and runs the task "whether the user is logged on or not" (same lifecycle,
+  same `run_bot.ps1` wrapper), exactly like the weekly autotune task. The
+  machine still has to be powered on (Task Scheduler can wake it from sleep via
+  `WakeToRun`, but not from a full shutdown). For a truly always-on deployment,
+  prefer an always-on server or a service manager like NSSM.
 - **`.env` is read from the working directory** (`C:\revbot`), which the task
   and `run_bot.ps1` set explicitly — so your allowlist/params are picked up.
 - **Time zone.** The 08:25 trigger uses the machine's local time. Adjust the

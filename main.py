@@ -26,7 +26,7 @@ from reversion_bot.allowlist import (
 )
 from reversion_bot.symbol_params import load_symbol_params, build_symbol_configs
 from reversion_bot.single_instance import acquire_lock, release_lock
-from reversion_bot.schedule import session_done
+from reversion_bot.schedule import session_done, within_minutes_before_close
 from reversion_bot.heartbeat import write_heartbeat
 from reversion_bot.market_regime import (
     is_risk_off,
@@ -262,6 +262,74 @@ def is_eod_liquidation_window() -> bool:
     close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
     start_ct = close_ct - timedelta(minutes=lead_minutes)
     return start_ct <= now_ct < close_ct
+
+
+def is_eod_entry_cutoff() -> bool:
+    """True in the final stretch before the close where NEW entries are blocked.
+
+    Wider than the EOD liquidation window so nothing is opened that can't be
+    flattened before the bell. This is the carryover guard: live, the bot opened
+    shorts ~2 min before the close and its flatten then missed the bell (orders
+    submitted after 15:00 are rejected), so the positions orphaned overnight.
+    Set EOD_ENTRY_CUTOFF_MINUTES=0 to disable.
+    """
+    minutes = int(os.getenv("EOD_ENTRY_CUTOFF_MINUTES", 20))
+    return within_minutes_before_close(datetime.now(ZoneInfo("America/Chicago")), minutes)
+
+
+# Once-per-day stamp so the carryover flatten runs on the day's FIRST open cycle
+# but a same-day crash-restart does NOT flatten positions opened earlier today.
+_RECONCILE_STAMP = Path(__file__).resolve().parent / "state" / "last_reconcile.date"
+
+
+def _today_ct() -> str:
+    return datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d")
+
+
+def _already_reconciled_today() -> bool:
+    try:
+        return _RECONCILE_STAMP.read_text().strip() == _today_ct()
+    except Exception:
+        return False
+
+
+def _mark_reconciled_today() -> None:
+    try:
+        _RECONCILE_STAMP.parent.mkdir(parents=True, exist_ok=True)
+        _RECONCILE_STAMP.write_text(_today_ct())
+    except Exception:
+        pass
+
+
+async def reconcile_carryover(executor) -> None:
+    """Flatten orphaned OVERNIGHT carryover on the day's first market-open cycle.
+
+    The bot is flat-overnight by design, so a position open at the first run of a
+    new day is an orphan from a prior session whose EOD flatten didn't complete
+    (seen live: NVDA/SMCI). Date-stamped so a same-day crash-restart does NOT
+    flatten positions the bot legitimately opened today. Opt out with
+    FLATTEN_CARRYOVER_ON_START=false (warns and leaves them instead).
+    """
+    if _already_reconciled_today():
+        return
+    try:
+        positions = await asyncio.to_thread(executor.get_positions)
+    except Exception as e:
+        print(f"[STARTUP] carryover check skipped (position fetch failed: {e}).")
+        return  # don't stamp; retry next cycle
+    if not positions:
+        _mark_reconciled_today()
+        return
+    names = ", ".join(f"{getattr(p, 'symbol', '?')}x{getattr(p, 'qty', '?')}" for p in positions)
+    if not parse_bool(os.getenv("FLATTEN_CARRYOVER_ON_START", "True"), default=True):
+        print(f"[STARTUP] WARNING: {len(positions)} overnight carryover position(s) open "
+              f"and FLATTEN_CARRYOVER_ON_START=false — leaving them: {names}")
+        _mark_reconciled_today()
+        return
+    print(f"[STARTUP] Flattening {len(positions)} overnight carryover position(s) "
+          f"before trading: {names}")
+    await liquidate_all_positions(executor)
+    _mark_reconciled_today()
 
 
 async def liquidate_all_positions(executor):
@@ -638,6 +706,10 @@ async def main():
                 await asyncio.sleep(poll_interval)
                 continue
 
+            # Day's first open cycle: flatten any orphaned overnight carryover
+            # before trading (no-op after the first run each day).
+            await reconcile_carryover(executor)
+
             if is_morning_blackout():
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Morning blackout (9:30-10:00 ET). Sleeping...")
                 await asyncio.sleep(poll_interval)
@@ -675,6 +747,14 @@ async def main():
             raw_results = await asyncio.gather(*eval_tasks)
             all_results = [r for r in raw_results if r is not None]
             candidates = [r for r in all_results if r.get("go_long") or r.get("go_short")]
+
+            # EOD entry cutoff: in the final stretch before the close, take NO new
+            # positions — only manage exits — so nothing is opened that can't be
+            # flattened before the bell (the carryover guard). Channel/EOD exits
+            # below still run.
+            if candidates and is_eod_entry_cutoff():
+                print(f"[EOD] Entry cutoff — blocking {len(candidates)} new entr(ies) near the close.")
+                candidates = []
 
             # Regime gate: drop new longs in a risk-off tape (keep shorts). The
             # sector-aware gate supersedes the SPY-only one and, under "or",

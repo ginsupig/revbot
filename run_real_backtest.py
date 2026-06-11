@@ -29,6 +29,31 @@ def _parse_timeframe(timeframe) -> TimeFrame:
     return tf
 
 
+def _apply_http_timeout(client, timeout):
+    """Inject a default per-request timeout into an alpaca-py client's session.
+
+    alpaca-py issues HTTP requests with no timeout, so a hung connection blocks
+    the worker thread forever (seen live: 'Read timed out (read timeout=None)',
+    which froze a poll cycle). Wrap the session's request() to supply a timeout
+    whenever one isn't already set, so a stalled call aborts and raises — which
+    every caller already handles (skip the symbol / fail-open). Best-effort.
+    """
+    if timeout is None or timeout <= 0:
+        return client
+    session = getattr(client, "_session", None)
+    if session is None:
+        return client
+    original = session.request
+
+    def _request_with_timeout(method, url, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = timeout
+        return original(method, url, **kwargs)
+
+    session.request = _request_with_timeout
+    return client
+
+
 def fetch_alpaca_bars(symbol, start, end, timeframe='1Day'):
     load_dotenv()
     api_key = os.getenv('APCA_API_KEY_ID')
@@ -42,6 +67,9 @@ def fetch_alpaca_bars(symbol, start, end, timeframe='1Day'):
         client = StockHistoricalDataClient(api_key, api_secret, url_override=base_url)
     else:
         client = StockHistoricalDataClient(api_key, api_secret)
+
+    # Bound every HTTP call so a hung data connection can't freeze a poll cycle.
+    _apply_http_timeout(client, float(os.getenv("ALPACA_HTTP_TIMEOUT", "15")))
 
     tf = _parse_timeframe(timeframe)
 

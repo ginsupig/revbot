@@ -17,6 +17,7 @@ The translation surface (legacy method -> alpaca-py call):
   list_orders(status, limit)          -> TradingClient.get_orders(GetOrdersRequest)
   submit_order(**bracket_or_market)   -> TradingClient.submit_order(OrderRequest)
   cancel_all_orders()                 -> TradingClient.cancel_orders()
+  cancel_order(order_id)              -> TradingClient.cancel_order_by_id(order_id)
   list_assets(status, asset_class)    -> TradingClient.get_all_assets(GetAssetsRequest)
   get_latest_trade(symbol)            -> StockHistoricalDataClient.get_stock_latest_trade(...)
   get_bars(symbol, tf, limit).df      -> StockHistoricalDataClient.get_stock_bars(...).df
@@ -163,6 +164,11 @@ class AlpacaPyClient:
 
     def cancel_all_orders(self):
         return self._trading.cancel_orders()
+
+    def cancel_order(self, order_id: str):
+        # Cancel a single working order (mirrors the legacy REST cancel_order):
+        # used to drop a symbol's bracket legs before liquidating its position.
+        return self._trading.cancel_order_by_id(order_id)
 
     def close_position(self, symbol: str):
         # Market-closes the position and cancels its related open orders.

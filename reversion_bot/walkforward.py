@@ -13,6 +13,7 @@ STOP_ATR_MULTIPLE = 1.20        # risk.py RiskConfig.stop_atr_multiple
 TARGET_ATR_MULTIPLE = 2.00      # risk.py RiskConfig.target_atr_multiple
 ATR_FLOOR_PCT = 0.0035          # risk.py RiskConfig.atr_floor_pct
 SLIPPAGE_PCT = 0.0008           # 8 bps round-trip friction on leveraged ETFs
+PERIODS_PER_YEAR_5MIN = 78 * 252  # 5-min RTH bars: correct Sharpe annualization
 MORNING_BLACKOUT_HOUR_CT = 9    # is_morning_blackout(): block entries before 9:00 CT
 EOD_LIQUIDATION_HOUR_CT = 14    # liquidate_all_positions(): force flat at 14:50 CT
 EOD_LIQUIDATION_MINUTE_CT = 50
@@ -133,7 +134,12 @@ def mean_reversion_strategy(df, **kwargs):
             )
             cooldown = in_cooldown(i, last_exit_idx, reentry_cooldown_bars)
             if not morning_blackout and not eod and not cooldown:
-                dec = engine.get_decision(enriched.iloc[: i + 1])
+                # get_decision reads only the last row (current bar) and the
+                # row before it (for reclaim/bullish checks). Passing the whole
+                # history slice made the backtest O(n^2) in pandas slicing; a
+                # 2-row window is semantically identical (verified by
+                # tests/test_walkforward_window_equivalence.py) and O(n).
+                dec = engine.get_decision(enriched.iloc[max(0, i - 1): i + 1])
                 if dec.signal == "LONG_REVERSION":
                     atr = float(dec.atr or 0.0)
                     atr = max(atr, close * ATR_FLOOR_PCT)   # ATR floor (risk.py)
@@ -353,7 +359,7 @@ def evaluate_fixed_params(df, params, n_splits=3):
         metrics.append({
             "fold": fold + 1,
             "profit_factor": profit_factor(res),
-            "sharpe": sharpe_ratio(res),
+            "sharpe": sharpe_ratio(res, periods_per_year=PERIODS_PER_YEAR_5MIN),
             "max_drawdown": max_drawdown(res),
         })
     return metrics
@@ -382,7 +388,7 @@ def run_walkforward_backtest(df, param_grid=None, n_splits=5):
         res = mean_reversion_strategy(test, **best_params)
         results.append(res)
         pf = profit_factor(res)
-        sr = sharpe_ratio(res)
+        sr = sharpe_ratio(res, periods_per_year=PERIODS_PER_YEAR_5MIN)
         dd = max_drawdown(res)
         oos_metrics.append({"fold": fold + 1, "profit_factor": pf, "sharpe": sr, "max_drawdown": dd})
         print(f"Fold {fold + 1}: PF={pf:.2f}, Sharpe={sr:.2f}, MaxDD={dd:.4f}")
@@ -427,7 +433,7 @@ def run_exhaustion_walkforward(df, param_grid=None, n_splits=5, verbose=True, fi
         res = short_exhaustion_strategy(df.iloc[test_idx], **best_params)
         results.append(res)
         pf = profit_factor(res)
-        sr = sharpe_ratio(res)
+        sr = sharpe_ratio(res, periods_per_year=PERIODS_PER_YEAR_5MIN)
         dd = max_drawdown(res)
         oos_metrics.append({"fold": fold + 1, "profit_factor": pf, "sharpe": sr, "max_drawdown": dd})
         if verbose:

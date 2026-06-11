@@ -29,17 +29,26 @@ def profit_factor(trades):
         return 10.0 if gross_profit > 0 else 0.0
     return gross_profit / gross_loss
 
-def sharpe_ratio(trades, risk_free_rate=0.0):
+def sharpe_ratio(trades, risk_free_rate=0.0, periods_per_year: float = 252.0):
+    """Annualized Sharpe of the per-bar return stream.
+
+    ``periods_per_year`` must match the bar frequency or the number is on the
+    wrong scale entirely: daily bars -> 252 (the old hardcoded behavior, kept
+    as the default for backward compatibility); 5-minute RTH bars -> 78 * 252
+    = 19_656. The walkforward passes the right factor for its timeframe.
+    Note the magnitude only matters for absolute interpretation — autotune
+    rankings are unaffected because the factor is constant within a run.
+    """
     returns = trades['pnl'].dropna()
     if len(returns) < 2:
         return 0.0
-    excess = returns - risk_free_rate / 252
+    excess = returns - risk_free_rate / periods_per_year
     std = excess.std(ddof=0)
     # No dispersion (e.g. an all-zero / no-trade fold) -> undefined Sharpe.
     # Return 0.0 rather than nan so it doesn't poison out-of-sample averages.
     if std == 0 or np.isnan(std):
         return 0.0
-    return excess.mean() / std * np.sqrt(252)
+    return excess.mean() / std * np.sqrt(periods_per_year)
 
 def max_drawdown(trades):
     equity = trades['pnl'].cumsum()

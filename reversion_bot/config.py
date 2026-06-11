@@ -6,6 +6,10 @@ from dataclasses import dataclass
 class ReversionConfig:
     trendfail_window: int = 20
     trendfail_threshold: float = 0.005
+    # Bars a frozen breakout level may sit unviolated before the breakout is
+    # accepted as genuine (no fade). Tunable: walkforward scan shows the
+    # fade-activity vs trend-bleed tradeoff lives on this axis.
+    trendfail_confirmation_window: int = 3
     band_length: int = 20
     band_std_1: float = 1.0
     band_std_2: float = 2.0

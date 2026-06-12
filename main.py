@@ -422,6 +422,80 @@ def _safe_qty(position) -> float:
         return 0.0
 
 
+# Activity fetches use the legacy REST client (get_activities), independent of
+# the order path: the opt-in alpaca-py order client doesn't expose activities.
+# Built once and cached — reconcile runs at most twice a session.
+_activity_client = None
+
+
+def _get_activity_client(api_key, api_secret, base_url):
+    global _activity_client
+    if _activity_client is None:
+        from alpaca_trade_api.rest import REST
+        _activity_client = REST(api_key, api_secret, base_url)
+    return _activity_client
+
+
+def _attr(obj, name, default=None):
+    """Read a field whether the activity is an SDK object or a raw dict."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _fetch_recent_fills(client, days: int):
+    """Normalized FILL activities over the last ``days`` (paginated, ascending).
+
+    Same normalized shape pnl_report uses (symbol/side/qty/price/time) so the
+    pure FIFO helpers consume it directly.
+    """
+    after = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    fills = []
+    page_token = None
+    page_size = 100
+    while True:
+        batch = client.get_activities(
+            activity_types="FILL", after=after, direction="asc",
+            page_size=page_size, page_token=page_token,
+        )
+        if not batch:
+            break
+        for a in batch:
+            qty, price = _attr(a, "qty"), _attr(a, "price")
+            symbol, side = _attr(a, "symbol"), _attr(a, "side")
+            if qty is None or price is None or not symbol or not side:
+                continue
+            fills.append({
+                "symbol": str(symbol), "side": str(side).lower(),
+                "qty": abs(float(qty)), "price": float(price),
+                "time": str(_attr(a, "transaction_time", "")),
+            })
+        if len(batch) < page_size:
+            break
+        page_token = _attr(batch[-1], "id")
+        if not page_token:
+            break
+    return fills
+
+
+async def reconcile_trade_outcomes(service, api_key, api_secret, base_url, days) -> None:
+    """Book realized PnL of CLOSED round-trips into outcomes so the adaptive
+    threshold can learn from results (not from its own entry-time opinion).
+
+    Best-effort: any failure (missing creds, SDK, network) is logged and skipped
+    so it never disrupts the trading loop. Idempotent via the tracker's cursor,
+    so calling it at startup and at EOD never double-counts a trade.
+    """
+    try:
+        client = await asyncio.to_thread(_get_activity_client, api_key, api_secret, base_url)
+        fills = await asyncio.to_thread(_fetch_recent_fills, client, days)
+        n = await asyncio.to_thread(service.reconcile_outcomes, fills)
+        if n:
+            print(f"[OUTCOMES] Booked {n} realized trade outcome(s) for threshold adaptation.")
+    except Exception as e:
+        print(f"[OUTCOMES] Reconcile skipped ({e}).")
+
+
 # --- Main Entry Point ---
 
 async def main():
@@ -669,6 +743,12 @@ async def main():
               f"— set a WIDE TARGET_ATR_MULTIPLE as the backstop.")
     print(f"Monitoring: {', '.join(symbols)}")
 
+    # Book outcomes from any closes since the last run (a prior session, or a
+    # crash mid-day) before trading, so today's threshold adaptation starts from
+    # the freshest realized evidence.
+    outcome_reconcile_days = int(os.getenv("OUTCOME_RECONCILE_DAYS", "7"))
+    await reconcile_trade_outcomes(service, api_key, api_secret, base_url, outcome_reconcile_days)
+
     cycle = 0
     try:
         while True:
@@ -694,6 +774,9 @@ async def main():
                 # tomorrow's open trigger. Pre-open, just sleep until the bell.
                 if await asyncio.to_thread(is_session_over, executor):
                     await liquidate_all_positions(executor)
+                    # Day is done and positions are flat — book the session's
+                    # realized outcomes so adaptation reflects what actually happened.
+                    await reconcile_trade_outcomes(service, api_key, api_secret, base_url, outcome_reconcile_days)
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] [SESSION] Market closed for the day. Exiting cleanly.")
                     break
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed (pre-open). Sleeping...")

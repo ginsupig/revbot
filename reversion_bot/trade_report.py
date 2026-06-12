@@ -95,6 +95,63 @@ def realized_pnl_fifo(fills: Iterable[dict]) -> Dict[str, float]:
     return dict(realized)
 
 
+def realized_pnl_events(fills: Iterable[dict]) -> List[dict]:
+    """Per-closing-fill realized-PnL events from a fill stream.
+
+    Runs the same global long/short-aware FIFO as ``realized_pnl_fifo`` but,
+    instead of only the per-symbol total, emits one event for every fill that
+    realizes PnL (i.e. consumes opposing inventory). Each event is::
+
+        {"symbol": str, "time": str, "realized_pnl": float}
+
+    where ``realized_pnl`` is the PnL booked by that single closing fill (summed
+    over every lot it matched). A fill that only opens or extends a position
+    produces no event. The events' realized_pnl sum to ``realized_pnl_fifo`` over
+    the same fills. This is the per-round-trip granularity that outcome-based
+    threshold adaptation needs: one win/loss per closed trade, not a daily net.
+    """
+    ordered = sorted(fills, key=lambda f: f.get("time") or "")
+    lots: Dict[str, deque] = defaultdict(deque)
+    events: List[dict] = []
+
+    for f in ordered:
+        sym = f["symbol"]
+        price = float(f["price"])
+        qty = _signed_qty(f)
+        book = lots[sym]
+        booked = 0.0
+        closed_any = False
+
+        # Consume opposing inventory first (closing an existing position).
+        while qty != 0 and book and (book[0][0] > 0) != (qty > 0):
+            lot_qty, lot_price = book[0]
+            match = min(abs(lot_qty), abs(qty))
+            if lot_qty > 0:                      # closing a long
+                booked += (price - lot_price) * match
+            else:                                # covering a short
+                booked += (lot_price - price) * match
+
+            new_lot_qty = lot_qty - match if lot_qty > 0 else lot_qty + match
+            if new_lot_qty == 0:
+                book.popleft()
+            else:
+                book[0][0] = new_lot_qty
+            qty = qty - match if qty > 0 else qty + match
+            closed_any = True
+
+        if closed_any:
+            events.append(
+                {"symbol": sym, "time": str(f.get("time") or ""), "realized_pnl": booked}
+            )
+
+        # Whatever is left opens (or extends) a position in the same direction.
+        if qty != 0:
+            book.append([qty, price])
+
+    return events
+
+
+
 def traded_notional(fills: Iterable[dict]) -> Dict[str, float]:
     """Gross dollar volume traded per symbol (sum of price * qty over fills)."""
     notional: Dict[str, float] = defaultdict(float)

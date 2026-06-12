@@ -85,6 +85,10 @@ class PerformanceTracker:
         self.evals_path = self.state_dir / "evaluations.jsonl"
         self.trades_path = self.state_dir / "trades.jsonl"
         self.outcomes_path = self.state_dir / "outcomes.jsonl"
+        # High-water mark (ISO timestamp of the last closing fill turned into an
+        # outcome) so repeated reconciles over an overlapping fill window never
+        # double-log the same closed trade.
+        self.outcomes_cursor_path = self.state_dir / "outcomes_cursor.txt"
 
     def _append_jsonl(self, path: Path, obj: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,6 +120,87 @@ class PerformanceTracker:
         """Call when a position CLOSES (fill reconciliation in main.py is the
         natural place). Without outcomes, threshold adaptation stays inert."""
         self._append_jsonl(self.outcomes_path, asdict(record))
+
+    def _read_outcomes_cursor(self) -> str:
+        try:
+            return self.outcomes_cursor_path.read_text(encoding="utf-8").strip()
+        except (FileNotFoundError, OSError):
+            return ""
+
+    def _write_outcomes_cursor(self, cursor: str) -> None:
+        # Atomic replace so a crash mid-write can't corrupt the high-water mark.
+        tmp = self.outcomes_cursor_path.with_suffix(".tmp")
+        tmp.write_text(cursor, encoding="utf-8")
+        tmp.replace(self.outcomes_cursor_path)
+
+    def reconcile_outcomes(self, fills: List[Dict[str, Any]]) -> int:
+        """Turn broker FILL activities into realized-trade outcomes.
+
+        Pairs the fills into closed round-trips (long/short-aware FIFO), and for
+        each closing fill recovers the entry's style/regime from trades.jsonl —
+        the most recent logged entry for that symbol at or before the close — so
+        the realized PnL is attributed to the (entry_style, regime) it belongs
+        to. Idempotent: a persisted cursor (the latest close timestamp already
+        booked) means re-running over an overlapping fill window is a no-op.
+
+        ``fills`` are normalized dicts (symbol/side/qty/price/time), exactly the
+        shape ``pnl_report.fetch_fills`` produces. Returns the number of new
+        outcomes logged. Best-effort by contract — callers pass whatever the
+        broker returned; an empty/garbage list simply logs nothing.
+        """
+        from .trade_report import realized_pnl_events
+
+        events = realized_pnl_events(fills)
+        if not events:
+            return 0
+
+        cursor = self._read_outcomes_cursor()
+        # Newest entry per symbol wins when several precede a close; entries are
+        # logged at decision time so an entry's timestamp <= its exit's time.
+        entries = sorted(
+            (e for e in self._read_jsonl(self.trades_path) if e.get("symbol")),
+            key=lambda e: str(e.get("timestamp") or ""),
+        )
+
+        def attribute(symbol: str, when: str):
+            sym = str(symbol).upper()
+            best = None
+            for e in entries:
+                if str(e.get("symbol")).upper() != sym:
+                    continue
+                if str(e.get("timestamp") or "") <= when:
+                    best = e            # entries are time-sorted -> last match is newest
+                else:
+                    break
+            return best
+
+        logged = 0
+        newest = cursor
+        for ev in events:
+            when = ev["time"]
+            if cursor and when <= cursor:
+                continue                # already booked on a prior reconcile
+            entry = attribute(ev["symbol"], when)
+            if entry is None:
+                continue                # no entry to attribute style/regime to
+            self.log_outcome(
+                OutcomeRecord(
+                    timestamp=when or utc_now_iso(),
+                    symbol=str(ev["symbol"]).upper(),
+                    regime=str(entry.get("regime") or "unknown"),
+                    entry_style=str(entry.get("entry_style") or "unknown"),
+                    realized_pnl=float(ev["realized_pnl"]),
+                    entry_price=entry.get("entry_price"),
+                    qty=entry.get("qty"),
+                )
+            )
+            logged += 1
+            if when > newest:
+                newest = when
+
+        if newest and newest != cursor:
+            self._write_outcomes_cursor(newest)
+        return logged
 
     def summarize_recent(self, limit: int = 500) -> Dict[str, Any]:
         evals = self._read_jsonl(self.evals_path)[-limit:]

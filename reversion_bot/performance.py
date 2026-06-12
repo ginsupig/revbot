@@ -64,12 +64,27 @@ class TradeRecord:
     time_bucket: str | None = None
 
 
+@dataclass
+class OutcomeRecord:
+    """A CLOSED trade with its realized result. This — not the entry-time
+    trade_score — is what threshold adaptation is allowed to learn from."""
+    timestamp: str
+    symbol: str
+    regime: str
+    entry_style: str
+    realized_pnl: float
+    entry_price: float | None = None
+    exit_price: float | None = None
+    qty: int | None = None
+
+
 class PerformanceTracker:
     def __init__(self, state_dir: str) -> None:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.evals_path = self.state_dir / "evaluations.jsonl"
         self.trades_path = self.state_dir / "trades.jsonl"
+        self.outcomes_path = self.state_dir / "outcomes.jsonl"
 
     def _append_jsonl(self, path: Path, obj: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,6 +111,11 @@ class PerformanceTracker:
 
     def log_trade(self, record: TradeRecord) -> None:
         self._append_jsonl(self.trades_path, asdict(record))
+
+    def log_outcome(self, record: OutcomeRecord) -> None:
+        """Call when a position CLOSES (fill reconciliation in main.py is the
+        natural place). Without outcomes, threshold adaptation stays inert."""
+        self._append_jsonl(self.outcomes_path, asdict(record))
 
     def summarize_recent(self, limit: int = 500) -> Dict[str, Any]:
         evals = self._read_jsonl(self.evals_path)[-limit:]
@@ -132,16 +152,30 @@ class PerformanceTracker:
         min_samples: int,
         max_adj: float,
     ) -> float:
-        trades = self._read_jsonl(self.trades_path)
+        # REWRITTEN: the old version adapted the threshold from the average
+        # entry-time trade_score of past trades — a feedback loop on the
+        # system's own opinion (high scores "earned" a lower bar regardless of
+        # whether those trades made money). Adaptation now requires REALIZED
+        # OUTCOMES; with no outcome evidence it is a strict no-op.
+        outcomes = self._read_jsonl(self.outcomes_path)
         matching = [
-            t for t in trades
-            if t.get("entry_style") == entry_style and t.get("regime") == regime
+            o for o in outcomes
+            if o.get("entry_style") == entry_style and o.get("regime") == regime
+            and o.get("realized_pnl") is not None
         ]
         if len(matching) < min_samples:
             return baseline_threshold
-        avg_score = sum(float(t.get("trade_score", baseline_threshold)) for t in matching) / len(matching)
-        if avg_score > baseline_threshold + 0.08:
-            return max(baseline_threshold - max_adj, 0.20)
-        if avg_score < baseline_threshold - 0.05:
+
+        pnls = [float(o["realized_pnl"]) for o in matching]
+        wins = sum(1 for p in pnls if p > 0)
+        win_rate = wins / len(pnls)
+        expectancy = sum(pnls) / len(pnls)
+
+        # Losing combination (negative expectancy, sub-coin-flip hit rate):
+        # demand MORE conviction before the next entry in this style/regime.
+        if expectancy < 0 and win_rate < 0.45:
             return min(baseline_threshold + max_adj, 0.80)
+        # Strongly working combination: allow slightly easier entries, floored.
+        if expectancy > 0 and win_rate > 0.55:
+            return max(baseline_threshold - max_adj, 0.20)
         return baseline_threshold

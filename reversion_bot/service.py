@@ -478,6 +478,7 @@ class ReversionService:
                 df,
                 window=getattr(engine.config, "trendfail_window", 20),
                 threshold=getattr(engine.config, "trendfail_threshold", 0.005),
+                confirmation_window=getattr(engine.config, "trendfail_confirmation_window", 3),
             )
             signal = int(tf_out["signal"].iloc[-1])
             if signal == 1:

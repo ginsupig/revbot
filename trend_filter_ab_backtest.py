@@ -115,6 +115,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Trend-filter OFF vs ON A/B (research-only)")
     parser.add_argument("symbols", nargs="*", help="symbols (default: core universe)")
     parser.add_argument("--days", type=int, default=20, help="lookback in days (default 20)")
+    parser.add_argument("--end", default=None,
+                        help="window end date YYYY-MM-DD (default: today; use for OOS validation)")
     parser.add_argument("--timeframe", default="5Min")
     parser.add_argument("--band", type=float, default=0.035,
                         help="trend_filter_band_pct for the ON arm (default 0.035 = 3.5%%)")
@@ -127,7 +129,7 @@ def main() -> None:
         pass
 
     symbols = [s.strip().upper() for s in args.symbols] if args.symbols else CORE_UNIVERSE
-    end = datetime.now()
+    end = datetime.strptime(args.end, "%Y-%m-%d") if args.end else datetime.now()
     start = (end - timedelta(days=args.days)).strftime("%Y-%m-%d")
     end_s = end.strftime("%Y-%m-%d")
     print(f"Trend-filter A/B (long-only) | symbols={len(symbols)} | "

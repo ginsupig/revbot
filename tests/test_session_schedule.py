@@ -5,9 +5,31 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from reversion_bot.schedule import session_done
+from reversion_bot.schedule import session_done, within_minutes_before_close
 
 CT = ZoneInfo("America/Chicago")
+
+
+# --- within_minutes_before_close (EOD entry cutoff) -------------------------
+
+def test_inside_cutoff_window_blocks_entries():
+    # 14:58, 2 min before the 15:00 close, cutoff 20 min -> True (block).
+    assert within_minutes_before_close(datetime(2026, 6, 11, 14, 58, tzinfo=CT), 20) is True
+
+
+def test_before_cutoff_window_allows_entries():
+    # 14:30 with a 20-min cutoff (window starts 14:40) -> not yet in it.
+    assert within_minutes_before_close(datetime(2026, 6, 11, 14, 30, tzinfo=CT), 20) is False
+
+
+def test_at_or_after_close_is_not_in_window():
+    # The window is [close-minutes, close); 15:00 and later are outside it.
+    assert within_minutes_before_close(datetime(2026, 6, 11, 15, 0, tzinfo=CT), 20) is False
+    assert within_minutes_before_close(datetime(2026, 6, 11, 15, 5, tzinfo=CT), 20) is False
+
+
+def test_zero_minutes_disables_cutoff():
+    assert within_minutes_before_close(datetime(2026, 6, 11, 14, 58, tzinfo=CT), 0) is False
 
 
 def test_open_market_is_never_done():

@@ -33,7 +33,18 @@ class MLSignalLearner:
         # calibration=None for the raw forest (e.g. an A/B comparison).
         base = RandomForestClassifier(n_estimators=100, random_state=42)
         if calibration:
-            self.model = CalibratedClassifierCV(base, method=calibration, cv=calibration_cv)
+            # Calibrate on CHRONOLOGICAL folds, not sklearn's default stratified
+            # K-fold. With shuffled folds, temporally adjacent bars land in
+            # opposite folds and rolling-window features let the forest score
+            # its own neighborhood. Measured on driftless noise (true AUC 0.50):
+            # negligible under today's 1-bar label, but a 5-bar overlapping
+            # label inflates shuffled-fold AUC to ~0.65 while TimeSeriesSplit
+            # stays ~0.51 — so this guards the calibration against any future
+            # label-horizon change at zero cost.
+            from sklearn.model_selection import TimeSeriesSplit
+            self.model = CalibratedClassifierCV(
+                base, method=calibration, cv=TimeSeriesSplit(n_splits=calibration_cv)
+            )
         else:
             self.model = base
 

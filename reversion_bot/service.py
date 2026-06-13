@@ -249,6 +249,12 @@ class ReversionService:
     def recent_performance_summary(self) -> Dict[str, Any]:
         return self.perf.summarize_recent(limit=500)
 
+    def reconcile_outcomes(self, fills) -> int:
+        """Book realized PnL from broker FILLs into outcomes so the adaptive
+        threshold has evidence to learn from. Delegates to the tracker; returns
+        the number of new outcomes logged."""
+        return self.perf.reconcile_outcomes(fills)
+
     def _log_eval(self, symbol, regime, decision, router_reason, component_scores, weighted_score, threshold, row):
         self.logger.info(
             "symbol=%s regime=%s decision=%s reason=%s router_reason=%s component_scores=%s trade_score=%.4f threshold=%.4f close=%.2f ri=%.4f rsi=%.4f adx=%.4f",
@@ -478,6 +484,7 @@ class ReversionService:
                 df,
                 window=getattr(engine.config, "trendfail_window", 20),
                 threshold=getattr(engine.config, "trendfail_threshold", 0.005),
+                confirmation_window=getattr(engine.config, "trendfail_confirmation_window", 3),
             )
             signal = int(tf_out["signal"].iloc[-1])
             if signal == 1:

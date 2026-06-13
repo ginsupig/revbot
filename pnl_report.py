@@ -23,11 +23,13 @@ from reversion_bot.trade_report import (
     build_daily_timeline,
     build_report,
     build_scoreboard,
+    build_trades,
     format_csv,
     format_daily_csv,
     format_daily_timeline,
     format_report,
     format_scoreboard,
+    format_trades,
 )
 
 
@@ -114,6 +116,12 @@ def main() -> None:
         "--daily", action="store_true",
         help="per-day timeline: each day's total realized PnL and the tickers traded",
     )
+    parser.add_argument(
+        "--trades", nargs="?", const="", metavar="SYMBOL",
+        help="per-round-trip drill-down (entry/exit/hold/PnL), worst first. "
+             "Pass a symbol (e.g. --trades WDC) to isolate one name, or bare "
+             "--trades for every round-trip in the window.",
+    )
     out_group = parser.add_mutually_exclusive_group()
     out_group.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     out_group.add_argument("--csv", action="store_true", help="emit CSV instead of a table")
@@ -122,6 +130,14 @@ def main() -> None:
     _load_env()
     client = _make_client()
     fills = fetch_fills(client, args.days)
+
+    if args.trades is not None:
+        report = build_trades(fills, symbol=args.trades or None)
+        if args.json:
+            print(json.dumps({**report, "days": args.days}, indent=2))
+        else:
+            print(format_trades(report, args.days))
+        return
 
     if args.daily:
         report = build_daily_timeline(fills)

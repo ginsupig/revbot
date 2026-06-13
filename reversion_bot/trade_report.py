@@ -152,6 +152,175 @@ def realized_pnl_events(fills: Iterable[dict]) -> List[dict]:
 
 
 
+def round_trips(fills: Iterable[dict]) -> List[dict]:
+    """Per-lot closed round-trips from a fill stream (the diagnosis granularity).
+
+    Like ``realized_pnl_events`` this runs the global long/short-aware FIFO, but
+    it emits one record for every *lot match* — i.e. every (entry lot, closing
+    fill) pair — carrying the entry and exit prices/times so a loser can be
+    localized to specific trades rather than a daily net. Each record is::
+
+        {
+            "symbol": str,
+            "direction": "long" | "short",
+            "qty": float,
+            "entry_price": float, "exit_price": float,
+            "entry_time": str, "exit_time": str,
+            "pnl": float,
+            "hold_seconds": float | None,   # None if either timestamp is unparseable
+            "return_pct": float,            # pnl / (entry_price * qty), signed
+        }
+
+    Records are returned in closing order. Their ``pnl`` sums to
+    ``realized_pnl_fifo`` over the same fills. Inventory still open at the end
+    produces no record.
+    """
+    ordered = sorted(fills, key=lambda f: f.get("time") or "")
+    # symbol -> deque of [signed_qty, price, time]
+    lots: Dict[str, deque] = defaultdict(deque)
+    trips: List[dict] = []
+
+    for f in ordered:
+        sym = f["symbol"]
+        price = float(f["price"])
+        qty = _signed_qty(f)
+        exit_time = str(f.get("time") or "")
+        book = lots[sym]
+
+        while qty != 0 and book and (book[0][0] > 0) != (qty > 0):
+            lot_qty, lot_price, lot_time = book[0]
+            match = min(abs(lot_qty), abs(qty))
+            if lot_qty > 0:                      # closing a long
+                pnl = (price - lot_price) * match
+                direction = "long"
+            else:                                # covering a short
+                pnl = (lot_price - price) * match
+                direction = "short"
+
+            cost = lot_price * match
+            trips.append(
+                {
+                    "symbol": sym,
+                    "direction": direction,
+                    "qty": match,
+                    "entry_price": lot_price,
+                    "exit_price": price,
+                    "entry_time": lot_time,
+                    "exit_time": exit_time,
+                    "pnl": pnl,
+                    "hold_seconds": _hold_seconds(lot_time, exit_time),
+                    "return_pct": (pnl / cost) if cost else 0.0,
+                }
+            )
+
+            new_lot_qty = lot_qty - match if lot_qty > 0 else lot_qty + match
+            if new_lot_qty == 0:
+                book.popleft()
+            else:
+                book[0][0] = new_lot_qty
+            qty = qty - match if qty > 0 else qty + match
+
+        if qty != 0:
+            book.append([qty, price, exit_time])
+
+    return trips
+
+
+def _hold_seconds(entry_time: str, exit_time: str):
+    """Seconds between two ISO8601 timestamps, or None if either is unparseable."""
+    from datetime import datetime
+
+    def _parse(t: str):
+        t = (t or "").strip()
+        if not t:
+            return None
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(t)
+        except ValueError:
+            return None
+
+    a, b = _parse(entry_time), _parse(exit_time)
+    if a is None or b is None:
+        return None
+    return (b - a).total_seconds()
+
+
+def _fmt_hold(seconds) -> str:
+    """Compact human hold time: '45s', '12m', '3.4h', '2.1d', or '-'."""
+    if seconds is None:
+        return "-"
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 172800:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
+def build_trades(fills: List[dict], symbol: str | None = None) -> dict:
+    """Per-round-trip drill-down, optionally filtered to one ``symbol``.
+
+    Surfaces the round-trips behind a symbol's realized PnL, sorted worst-first
+    so the biggest bleeders are at the top, with win/loss and cost summaries.
+    """
+    sym = symbol.upper() if symbol else None
+    trips = [t for t in round_trips(fills) if sym is None or t["symbol"] == sym]
+    trips.sort(key=lambda t: t["pnl"])   # worst first
+
+    wins = [t for t in trips if t["pnl"] > 0]
+    losses = [t for t in trips if t["pnl"] < 0]
+    gross_win = sum(t["pnl"] for t in wins)
+    gross_loss = sum(t["pnl"] for t in losses)
+
+    return {
+        "symbol": sym,
+        "trips": trips,
+        "total_pnl": sum(t["pnl"] for t in trips),
+        "round_trips": len(trips),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": (len(wins) / len(trips)) if trips else 0.0,
+        "gross_win": gross_win,
+        "gross_loss": gross_loss,
+        "avg_win": (gross_win / len(wins)) if wins else 0.0,
+        "avg_loss": (gross_loss / len(losses)) if losses else 0.0,
+        "profit_factor": (gross_win / -gross_loss) if gross_loss else float("inf"),
+    }
+
+
+def format_trades(report: dict, days: int) -> str:
+    trips = report["trips"]
+    scope = report["symbol"] or "ALL SYMBOLS"
+    pf = report["profit_factor"]
+    pf_str = "inf" if pf == float("inf") else f"{pf:.2f}"
+    lines = [
+        f"Round-trip drill-down — {scope}, last {days} days",
+        f"  round-trips: {report['round_trips']}   "
+        f"W-L: {report['wins']}-{report['losses']}   "
+        f"win-rate: {report['win_rate']*100:.0f}%",
+        f"  realized PnL: ${report['total_pnl']:,.2f}   "
+        f"profit factor: {pf_str}",
+        f"  avg win: ${report['avg_win']:,.2f}   "
+        f"avg loss: ${report['avg_loss']:,.2f}",
+        "",
+        f"  {'SYMBOL':<8}{'DIR':<6}{'QTY':>8}{'ENTRY':>10}{'EXIT':>10}"
+        f"{'RET':>8}{'HOLD':>7}{'PnL':>12}",
+        f"  {'-'*8:<8}{'-'*5:<6}{'-'*7:>8}{'-'*9:>10}{'-'*9:>10}"
+        f"{'-'*7:>8}{'-'*6:>7}{'-'*11:>12}",
+    ]
+    for t in trips:
+        lines.append(
+            f"  {t['symbol']:<8}{t['direction']:<6}{t['qty']:>8.2f}"
+            f"{t['entry_price']:>10.2f}{t['exit_price']:>10.2f}"
+            f"{t['return_pct']*100:>7.2f}%{_fmt_hold(t['hold_seconds']):>7}"
+            f"{t['pnl']:>12,.2f}"
+        )
+    return "\n".join(lines)
+
+
 def traded_notional(fills: Iterable[dict]) -> Dict[str, float]:
     """Gross dollar volume traded per symbol (sum of price * qty over fills)."""
     notional: Dict[str, float] = defaultdict(float)

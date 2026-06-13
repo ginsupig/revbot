@@ -7,12 +7,15 @@ from reversion_bot.trade_report import (
     build_daily_timeline,
     build_report,
     build_scoreboard,
+    build_trades,
     format_csv,
     format_daily_csv,
     format_daily_timeline,
     format_scoreboard,
+    format_trades,
     realized_pnl_by_day,
     realized_pnl_fifo,
+    round_trips,
     symbol_weights,
     traded_notional,
 )
@@ -279,3 +282,90 @@ def test_daily_timeline_empty():
     assert report["rows"] == []
     assert report["days_in_window"] == 0
     assert "Daily PnL timeline" in format_daily_timeline(report, days=60)
+
+
+def test_round_trips_long_and_short_pnl_and_dir():
+    fills = [
+        _fill("L", "buy", 10, 100.0, "2026-06-01T14:00:00Z"),
+        _fill("L", "sell", 10, 110.0, "2026-06-01T15:00:00Z"),
+        _fill("S", "sell", 5, 200.0, "2026-06-01T14:00:00Z"),
+        _fill("S", "buy", 5, 180.0, "2026-06-01T14:30:00Z"),
+    ]
+    trips = round_trips(fills)
+    assert len(trips) == 2
+    by_sym = {t["symbol"]: t for t in trips}
+    assert by_sym["L"]["direction"] == "long"
+    assert by_sym["L"]["pnl"] == 100.0
+    assert by_sym["L"]["hold_seconds"] == 3600.0
+    assert by_sym["S"]["direction"] == "short"
+    assert by_sym["S"]["pnl"] == 100.0
+    assert abs(by_sym["S"]["return_pct"] - (100.0 / 1000.0)) < 1e-9
+
+
+def test_round_trips_split_lots_emit_per_lot_records():
+    # One closing fill consumes two entry lots -> two round-trip records.
+    fills = [
+        _fill("X", "buy", 10, 100.0, "2026-06-01T14:00:00Z"),
+        _fill("X", "buy", 10, 120.0, "2026-06-01T14:05:00Z"),
+        _fill("X", "sell", 15, 130.0, "2026-06-01T15:00:00Z"),
+    ]
+    trips = round_trips(fills)
+    assert len(trips) == 2
+    assert sum(t["pnl"] for t in trips) == 350.0  # 10*(130-100) + 5*(130-120)
+
+
+def test_round_trips_sum_to_fifo_total():
+    fills = [
+        _fill("A", "buy", 10, 100.0, "t1"),
+        _fill("A", "sell", 4, 90.0, "t2"),
+        _fill("A", "sell", 6, 130.0, "t3"),
+        _fill("B", "sell", 5, 50.0, "t4"),
+        _fill("B", "buy", 5, 55.0, "t5"),
+    ]
+    trips = round_trips(fills)
+    fifo = realized_pnl_fifo(fills)
+    assert abs(sum(t["pnl"] for t in trips) - sum(fifo.values())) < 1e-9
+
+
+def test_open_position_no_round_trip():
+    fills = [_fill("Y", "buy", 10, 50.0, "t1")]
+    assert round_trips(fills) == []
+
+
+def test_build_trades_filter_sort_and_stats():
+    fills = [
+        _fill("WDC", "buy", 10, 100.0, "2026-06-01T14:00:00Z"),
+        _fill("WDC", "sell", 10, 95.0, "2026-06-01T15:00:00Z"),   # -50 (worst)
+        _fill("WDC", "buy", 10, 100.0, "2026-06-01T16:00:00Z"),
+        _fill("WDC", "sell", 10, 102.0, "2026-06-01T17:00:00Z"),  # +20
+        _fill("AAPL", "buy", 1, 200.0, "2026-06-01T14:00:00Z"),
+        _fill("AAPL", "sell", 1, 210.0, "2026-06-01T15:00:00Z"),  # filtered out
+    ]
+    report = build_trades(fills, symbol="wdc")  # case-insensitive
+    assert report["symbol"] == "WDC"
+    assert report["round_trips"] == 2
+    assert report["wins"] == 1 and report["losses"] == 1
+    assert report["trips"][0]["pnl"] == -50.0   # worst first
+    assert abs(report["total_pnl"] - (-30.0)) < 1e-9
+    assert abs(report["profit_factor"] - (20.0 / 50.0)) < 1e-9
+    assert "WDC" in format_trades(report, days=1)
+
+
+def test_build_trades_all_symbols_when_unfiltered():
+    fills = [
+        _fill("A", "buy", 1, 10.0, "t1"),
+        _fill("A", "sell", 1, 12.0, "t2"),
+        _fill("B", "buy", 1, 10.0, "t3"),
+        _fill("B", "sell", 1, 9.0, "t4"),
+    ]
+    report = build_trades(fills)
+    assert report["symbol"] is None
+    assert report["round_trips"] == 2
+    assert report["profit_factor"] == 2.0  # +2 win / 1 loss
+
+
+def test_build_trades_empty():
+    report = build_trades([], symbol="WDC")
+    assert report["round_trips"] == 0
+    assert report["win_rate"] == 0.0
+    assert "WDC" in format_trades(report, days=1)

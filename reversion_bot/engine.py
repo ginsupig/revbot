@@ -264,7 +264,7 @@ class ReversionEngine:
             vwap_ok = abs((close - vwap) / vwap) <= self.config.max_vwap_extension_pct
 
         if self.config.use_trend_filter:
-            trend_ok = close >= trend_ema * 0.965
+            trend_ok = close >= trend_ema * (1.0 - self.config.trend_filter_band_pct)
 
         if not in_reversion_zone:
             reason = "Not_In_Reversion_Zone"
@@ -423,7 +423,7 @@ class ReversionEngine:
         if self.config.use_trend_filter:
             # Mirror of the long trend filter: only short when not far *above* the
             # higher-timeframe trend (i.e. price is not in a strong uptrend).
-            trend_ok = close <= trend_ema * 1.035
+            trend_ok = close <= trend_ema * (1.0 + self.config.trend_filter_band_pct)
 
         if self.config.require_reclaim_lb1 and not reject_ub1:
             return None

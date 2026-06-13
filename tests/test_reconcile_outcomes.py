@@ -98,3 +98,49 @@ def test_new_close_after_cursor_is_picked_up_on_next_run():
         ]
         assert pt.reconcile_outcomes(second) == 1     # only the new close
         assert len(pt.outcomes_path.read_text().splitlines()) == 2
+
+
+def test_recent_loss_exit_brake():
+    from datetime import datetime, timezone, timedelta
+    from reversion_bot.performance import OutcomeRecord
+
+    with tempfile.TemporaryDirectory() as d:
+        pt = PerformanceTracker(d)
+        now = datetime(2026, 6, 12, 16, 0, tzinfo=timezone.utc)
+
+        # No outcomes yet -> never braked.
+        assert pt.recent_loss_exit("WDC", now, 90) is False
+
+        # A losing close 20 min ago -> braked within a 90-min window...
+        pt.log_outcome(OutcomeRecord(
+            timestamp=(now - timedelta(minutes=20)).isoformat(),
+            symbol="WDC", regime="reversion", entry_style="mean_reversion",
+            realized_pnl=-110.0,
+        ))
+        assert pt.recent_loss_exit("WDC", now, 90) is True
+        # ...but not once the window has elapsed, and not when disabled.
+        assert pt.recent_loss_exit("WDC", now, 10) is False
+        assert pt.recent_loss_exit("WDC", now, 0) is False
+        # Different symbol is unaffected.
+        assert pt.recent_loss_exit("AAPL", now, 90) is False
+
+
+def test_recent_loss_exit_uses_latest_outcome_only():
+    from datetime import datetime, timezone, timedelta
+    from reversion_bot.performance import OutcomeRecord
+
+    with tempfile.TemporaryDirectory() as d:
+        pt = PerformanceTracker(d)
+        now = datetime(2026, 6, 12, 16, 0, tzinfo=timezone.utc)
+        # Earlier loss, then a more recent WIN -> not braked (winners re-enter).
+        pt.log_outcome(OutcomeRecord(
+            timestamp=(now - timedelta(minutes=40)).isoformat(),
+            symbol="WDC", regime="reversion", entry_style="mean_reversion",
+            realized_pnl=-50.0,
+        ))
+        pt.log_outcome(OutcomeRecord(
+            timestamp=(now - timedelta(minutes=5)).isoformat(),
+            symbol="WDC", regime="reversion", entry_style="mean_reversion",
+            realized_pnl=30.0,
+        ))
+        assert pt.recent_loss_exit("WDC", now, 90) is False

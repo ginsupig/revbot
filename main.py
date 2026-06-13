@@ -563,7 +563,9 @@ async def main():
         require_bullish_close=parse_bool(os.getenv("REQUIRE_BULLISH_CLOSE", "False")),
         require_volume_expansion=parse_bool(os.getenv("REQUIRE_VOLUME_EXPANSION", "False")),
         use_vwap_filter=parse_bool(os.getenv("USE_VWAP_FILTER", "False")),
-        use_trend_filter=parse_bool(os.getenv("USE_TREND_FILTER", "False")),
+        use_trend_filter=parse_bool(os.getenv("USE_TREND_FILTER", "True")),
+        trend_filter_band_pct=float(os.getenv("TREND_FILTER_BAND_PCT", 0.035)),
+        loss_reentry_cooldown_minutes=int(os.getenv("LOSS_REENTRY_COOLDOWN_MINUTES", 90)),
         # Volume confirmation.
         volume_lookback=int(os.getenv("VOLUME_LOOKBACK", 20)),
         volume_multiplier_min=float(os.getenv("VOLUME_MULTIPLIER_MIN", 1.0)),

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import hashlib
 import logging
@@ -179,6 +179,15 @@ class ReversionService:
         if entry_style == "trendfail" and component_scores["trendfail"] < 0.60:
             go_long = False
             router_reason = "trendfail_below_min"
+
+        # Loss-aware re-entry brake: don't re-buy a name that just stopped us out
+        # at a loss and may still be falling (the WDC failure mode). Longs only —
+        # shorts are governed separately and were not the bleed source.
+        if go_long and self.perf.recent_loss_exit(
+            symbol, datetime.now(timezone.utc), engine.config.loss_reentry_cooldown_minutes
+        ):
+            go_long = False
+            router_reason = "loss_reentry_cooldown"
 
         payload: Dict[str, Any] = {
             "symbol": symbol,

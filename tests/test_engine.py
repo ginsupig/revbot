@@ -110,3 +110,50 @@ def test_short_bias_relaxes_overbought_threshold():
 
     assert engine.get_decision(df, symbol='SPY', short_bias=False).signal != 'SHORT_REVERSION'
     assert engine.get_decision(df, symbol='SPY', short_bias=True).signal == 'SHORT_REVERSION'
+
+
+def make_oversold_dip_df(n=160):
+    """A ranging oscillation (keeps ADX low so the extreme falling-knife veto
+    does NOT fire) that ends on a sharp swing low poking well below the lower
+    band AND well under the 50-bar trend EMA — exactly the 'extended dip' the
+    per-symbol trend filter is meant to refuse."""
+    idx = pd.date_range('2026-01-01', periods=n, freq='min')
+    t = np.arange(n)
+    close = 100 + 3.0 * np.sin(2 * np.pi * t / 25.0)
+    close[-1] = close.min() - 4.0          # deep final dip: below lb1 and <<trend_ema
+    open_ = close + 0.05
+    high = np.maximum(open_, close) + 0.10
+    low = np.minimum(open_, close) - 0.10
+    volume = np.full(n, 60000)
+    return pd.DataFrame({
+        'open': open_, 'high': high, 'low': low, 'close': close, 'volume': volume,
+    }, index=idx)
+
+
+def test_trend_filter_vetoes_extended_dip_when_enabled():
+    df = make_oversold_dip_df()
+    # Precondition: not an *extreme* downtrend, so Downtrend_Too_Extended (the
+    # only per-symbol guard that was active before) must NOT be what stops it.
+    enriched = ReversionEngine(ReversionConfig(min_history=60)).calculate_indicators(df)
+    row = enriched.iloc[-1]
+    assert not (row['adx'] >= 50 and row['rsi'] <= 30)
+    assert row['close'] < row['trend_ema'] * 0.965   # genuinely extended below trend
+
+    # Filter OFF: the dip is a valid long-reversion candidate.
+    off = ReversionEngine(ReversionConfig(min_history=60, use_trend_filter=False))
+    assert off.get_decision(off.calculate_indicators(df), symbol='WDC').signal == 'LONG_REVERSION'
+
+    # Filter ON (now the default): the same extended dip is refused.
+    on = ReversionEngine(ReversionConfig(min_history=60, use_trend_filter=True))
+    decision = on.get_decision(on.calculate_indicators(df), symbol='WDC')
+    assert decision.signal == 'WAIT'
+    assert decision.reason == 'Higher_Timeframe_Trend_Too_Weak'
+
+
+def test_trend_filter_band_pct_widens_tolerance():
+    # A wide enough band lets the same extended dip back through -> proves the
+    # knob actually controls the veto distance.
+    df = make_oversold_dip_df()
+    wide = ReversionEngine(ReversionConfig(
+        min_history=60, use_trend_filter=True, trend_filter_band_pct=0.20))
+    assert wide.get_decision(wide.calculate_indicators(df), symbol='WDC').signal == 'LONG_REVERSION'

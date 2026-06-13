@@ -56,7 +56,11 @@ def make_overbought_df(n=160):
 
 
 def test_short_signal_on_overbought_when_enabled():
-    engine = ReversionEngine(ReversionConfig(min_history=60, enable_shorts=True))
+    # use_trend_filter is off here: this test is about short-enablement, not the
+    # higher-timeframe trend gate (which has its own tests). The overbought
+    # fixture peaks ~3.5% above the trend EMA, beyond the default 2% band.
+    engine = ReversionEngine(ReversionConfig(
+        min_history=60, enable_shorts=True, use_trend_filter=False))
     df = engine.calculate_indicators(make_overbought_df())
     decision = engine.get_decision(df, symbol='SPY')
     assert decision.signal == 'SHORT_REVERSION'
@@ -101,7 +105,7 @@ def test_short_bias_relaxes_overbought_threshold():
     # Normal thresholds are set so high that nothing ever counts as overbought;
     # the risk-off thresholds are low. So a short only appears under short_bias.
     cfg = ReversionConfig(
-        min_history=60, enable_shorts=True,
+        min_history=60, enable_shorts=True, use_trend_filter=False,  # isolate short_bias
         rsi_min=99.0, ri_short_threshold=9.0,           # normal: unreachable
         risk_off_rsi_min=30.0, risk_off_ri_short_threshold=0.0,  # risk-off: easy
     )

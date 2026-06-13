@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 import json
@@ -120,6 +120,40 @@ class PerformanceTracker:
         """Call when a position CLOSES (fill reconciliation in main.py is the
         natural place). Without outcomes, threshold adaptation stays inert."""
         self._append_jsonl(self.outcomes_path, asdict(record))
+
+    def recent_loss_exit(self, symbol: str, now: datetime, within_minutes: int) -> bool:
+        """True if this symbol's most recent CLOSED trade was a loss within
+        ``within_minutes`` of ``now``.
+
+        Drives the loss-aware re-entry brake: after a reversion long stops out,
+        re-buying the same name while it is still falling just repeats the loss
+        (the WDC failure mode — bought, stopped, bought again lower, stopped
+        again). The plain symbol cooldown re-arms on a timer regardless of
+        outcome; this fires only after a *losing* close, so winners re-enter
+        freely. Reads outcomes.jsonl (written on every close); an empty or
+        unparseable log fails open (False) so a bookkeeping gap never freezes
+        trading.
+        """
+        if within_minutes <= 0:
+            return False
+        sym = str(symbol).upper()
+        latest = None
+        latest_ts = ""
+        for r in self._read_jsonl(self.outcomes_path):
+            if str(r.get("symbol", "")).upper() != sym:
+                continue
+            ts = str(r.get("timestamp") or "")
+            if ts >= latest_ts:                 # ISO timestamps sort lexically
+                latest_ts, latest = ts, r
+        if latest is None:
+            return False
+        try:
+            if float(latest.get("realized_pnl", 0.0)) >= 0:
+                return False                    # last close was a win/scratch
+            exit_dt = datetime.fromisoformat(latest_ts.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return False
+        return now <= exit_dt + timedelta(minutes=within_minutes)
 
     def _read_outcomes_cursor(self) -> str:
         try:

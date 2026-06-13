@@ -53,8 +53,20 @@ class ReversionConfig:
     use_vwap_filter: bool = False
     max_vwap_extension_pct: float = 0.012
 
-    use_trend_filter: bool = False
+    use_trend_filter: bool = True
     trend_ema_length: int = 50
+    # How far below the trend EMA a long-reversion entry is still allowed (and,
+    # mirrored, how far above for a short). A dip-buy more than this fraction
+    # under the trend is judged too extended — buying a falling knife — and
+    # vetoed with reason "Higher_Timeframe_Trend_Too_Weak". 0.035 = 3.5%.
+    trend_filter_band_pct: float = 0.035
+    # Loss-aware re-entry brake: after a CLOSED losing trade on a symbol, block
+    # a new long-reversion entry in it for this many minutes. Unlike the plain
+    # symbol cooldown (a fixed timer that re-arms regardless of result), this
+    # only triggers after a loss — so it stops the bot re-buying a name that
+    # just stopped it out and is still falling, without slowing winners.
+    # 0 = off. Longer than symbol_cooldown_minutes (30) by design.
+    loss_reentry_cooldown_minutes: int = 90
 
     max_spread_bps: float = 40.0
     min_dollar_volume: float = 750_000.0

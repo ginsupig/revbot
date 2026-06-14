@@ -130,3 +130,49 @@ def test_unmapped_symbol_uses_fallback_under_or():
     assert [c["symbol"] for c in dropped] == ["ASTS"]
     kept, dropped = suppress_longs_by_sector(cands, {}, fallback_risk_off=False)
     assert [c["symbol"] for c in kept] == ["ASTS"]
+
+
+# --- classify_regime_series ------------------------------------------------
+
+from reversion_bot.market_regime import classify_regime_series
+
+
+def _ohlc_from_close(close):
+    close = np.asarray(close, dtype=float)
+    return pd.DataFrame({
+        "open": close, "high": close + 0.5, "low": close - 0.5,
+        "close": close, "volume": np.full(len(close), 1e6),
+    })
+
+
+def test_classify_regime_columns_and_empty():
+    out = classify_regime_series(None)
+    assert list(out.columns) == ["trend_down", "adx_high", "vol_up"]
+    assert len(out) == 0
+    out2 = classify_regime_series(_ohlc_from_close(np.linspace(100, 90, 120)))
+    assert set(out2.columns) == {"trend_down", "adx_high", "vol_up"}
+    assert out2.dtypes.apply(lambda d: d == bool).all()
+
+
+def test_classify_regime_trend_down_flag():
+    # A sustained decline: the last bar sits below its 50-EMA -> trend_down True.
+    down = classify_regime_series(_ohlc_from_close(np.linspace(120, 80, 150)))
+    assert bool(down["trend_down"].iloc[-1]) is True
+    # A sustained rise: last bar above its EMA -> trend_down False.
+    up = classify_regime_series(_ohlc_from_close(np.linspace(80, 120, 150)))
+    assert bool(up["trend_down"].iloc[-1]) is False
+
+
+def test_classify_regime_vol_up_on_expansion():
+    # Flat price, but the bar RANGE ramps up at the end -> ATR% rises above its
+    # trailing mean -> vol_up True on the last bar (and not during the calm part).
+    n = 150
+    close = np.full(n, 100.0)
+    spread = np.concatenate([np.full(120, 0.5), np.linspace(0.5, 6.0, 30)])
+    df = pd.DataFrame({
+        "open": close, "high": close + spread, "low": close - spread,
+        "close": close, "volume": np.full(n, 1e6),
+    })
+    out = classify_regime_series(df)
+    assert bool(out["vol_up"].iloc[-1]) is True       # expanding at the end
+    assert bool(out["vol_up"].iloc[100]) is False      # calm in the middle

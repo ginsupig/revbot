@@ -87,3 +87,36 @@ def test_extract_then_bootstrap_pipeline():
     df = pd.DataFrame({"strategy_return": [0.0, 0.02, -0.01, 0.0, 0.015, -0.03]})
     out = run_bootstrap_monte_carlo(10000, extract_trade_returns(df), sims=500, seed=2)
     assert out['sample_size'] == 4
+
+
+# --- Ulcer index & worst losing streak -------------------------------------
+
+from reversion_bot.analytics import ulcer_index, worst_losing_streak
+
+
+def test_ulcer_index_zero_when_monotonic_up():
+    eq = np.cumprod(1 + np.full(20, 0.01))   # never underwater
+    assert ulcer_index(eq) == 0.0
+
+
+def test_ulcer_index_positive_and_punishes_depth():
+    shallow = np.array([1.0, 1.02, 1.01, 1.03, 1.02, 1.04])   # small dips
+    deep = np.array([1.0, 1.20, 0.80, 0.95, 0.70, 1.05])       # big dips
+    assert ulcer_index(shallow) > 0.0
+    assert ulcer_index(deep) > ulcer_index(shallow)
+
+
+def test_ulcer_index_empty():
+    assert ulcer_index([]) == 0.0
+
+
+def test_worst_losing_streak_counts_longest_run():
+    # losers: a run of 1, then a run of 3 -> 3
+    rets = [0.01, -0.02, 0.01, -0.01, -0.03, -0.02, 0.04, -0.01]
+    assert worst_losing_streak(rets) == 3
+
+
+def test_worst_losing_streak_edges():
+    assert worst_losing_streak([]) == 0
+    assert worst_losing_streak([0.01, 0.0, 0.02]) == 0       # zero is not a loss
+    assert worst_losing_streak([-0.01, -0.02, -0.03]) == 3   # all losers

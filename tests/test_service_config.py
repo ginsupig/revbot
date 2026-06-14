@@ -115,7 +115,7 @@ def test_short_bias_threads_through_service(tmp_path):
     from test_engine import make_overbought_df
 
     cfg = ReversionConfig(
-        min_history=60, enable_shorts=True,
+        min_history=60, enable_shorts=True, use_trend_filter=False,  # isolate short_bias threading
         rsi_min=99.0, ri_short_threshold=9.0,
         risk_off_rsi_min=30.0, risk_off_ri_short_threshold=0.0,
     )

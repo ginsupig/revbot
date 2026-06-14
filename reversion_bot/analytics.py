@@ -94,3 +94,69 @@ def run_monte_carlo(
         'days': int(days),
         'sims': int(sims),
     }
+
+
+def extract_trade_returns(trades) -> np.ndarray:
+    """Per-trade realized returns from a backtest frame: the nonzero entries of
+    ``strategy_return`` (or ``pnl``). This is the empirical population the
+    bootstrap resamples — the same trades ``_trade_count`` counts.
+    """
+    col = "strategy_return" if "strategy_return" in trades else "pnl"
+    series = trades[col].dropna()
+    return series[series != 0].to_numpy(dtype=float)
+
+
+def run_bootstrap_monte_carlo(
+    initial_invest: float,
+    trade_returns,
+    n_trades: Optional[int] = None,
+    sims: int = 10_000,
+    seed: Optional[int] = 42,
+) -> dict:
+    """Monte Carlo over the EMPIRICAL trade-return distribution.
+
+    Unlike ``run_monte_carlo`` (which draws from a *fitted normal*), this
+    resamples the strategy's actual per-trade returns with replacement and
+    compounds each draw into an equity curve. It preserves the real skew and fat
+    tails — exactly what drives VaR/CVaR and what a Gaussian understates for a
+    stop-and-target reversion strategy (clipped upside, occasional full-stop
+    losers). Returns the same keys as ``run_monte_carlo`` (``days`` -> ``n_trades``).
+
+    i.i.d. trade bootstrap: trade ORDER is shuffled, so it assumes trades are
+    independent events. If losing/winning streaks (autocorrelation) matter,
+    a block bootstrap would be the next refinement.
+
+    ``trade_returns`` are fractional per-trade returns (e.g. +0.012, -0.008);
+    pass ``extract_trade_returns(backtest_df)`` for a walkforward frame.
+    ``n_trades`` is the path length (default: the observed sample size).
+    """
+    arr = np.asarray(list(trade_returns), dtype=float)
+    if initial_invest <= 0:
+        raise ValueError('initial_invest must be > 0')
+    if arr.size == 0:
+        raise ValueError('trade_returns must be non-empty')
+    if sims <= 0:
+        raise ValueError('sims must be > 0')
+    n = int(n_trades) if n_trades is not None else arr.size
+    if n <= 0:
+        raise ValueError('n_trades must be > 0')
+
+    rng = np.random.default_rng(seed)
+    draws = rng.choice(arr, size=(sims, n), replace=True)
+    finals = initial_invest * np.prod(1.0 + draws, axis=1)
+
+    p5 = float(np.percentile(finals, 5))
+    tail = finals[finals <= p5]
+    return {
+        'initial_invest': float(initial_invest),
+        'expected_final_value': float(finals.mean()),
+        'median_final_value': float(np.median(finals)),
+        'best_case': float(finals.max()),
+        'worst_case': float(finals.min()),
+        'percentile_5_value': p5,
+        'var_95': float(initial_invest - p5),
+        'cvar_95': float(initial_invest - tail.mean()),
+        'n_trades': n,
+        'sims': int(sims),
+        'sample_size': int(arr.size),
+    }

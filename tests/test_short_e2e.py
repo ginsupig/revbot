@@ -72,7 +72,9 @@ def make_executor():
 def test_short_flows_signal_to_sell_bracket(tmp_path):
     # 1. Signal: overbought bar -> go_short candidate with a short plan.
     svc = ReversionService(
-        ReversionConfig(min_history=60, enable_shorts=True),
+        # use_trend_filter off: this is a short-routing e2e, not a trend-gate test;
+        # the overbought fixture peaks ~3.5% above the EMA, beyond the 2% band.
+        ReversionConfig(min_history=60, enable_shorts=True, use_trend_filter=False),
         RiskConfig(),
         PerformanceConfig(state_dir=str(tmp_path / "perf")),
         log_file=str(tmp_path / "svc.log"),

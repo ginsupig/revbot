@@ -58,8 +58,11 @@ class ReversionConfig:
     # How far below the trend EMA a long-reversion entry is still allowed (and,
     # mirrored, how far above for a short). A dip-buy more than this fraction
     # under the trend is judged too extended — buying a falling knife — and
-    # vetoed with reason "Higher_Timeframe_Trend_Too_Weak". 0.035 = 3.5%.
-    trend_filter_band_pct: float = 0.035
+    # vetoed with reason "Higher_Timeframe_Trend_Too_Weak". 0.02 = 2%.
+    # Tuned from 0.035: a 0.02 vs 0.035 A/B on two non-overlapping 20-day
+    # windows had 0.02 cutting/flipping the universe loss on both while 0.035
+    # was marginal-to-harmful (see trend_filter_ab_backtest.py).
+    trend_filter_band_pct: float = 0.02
     # Loss-aware re-entry brake: after a CLOSED losing trade on a symbol, block
     # a new long-reversion entry in it for this many minutes. Unlike the plain
     # symbol cooldown (a fixed timer that re-arms regardless of result), this

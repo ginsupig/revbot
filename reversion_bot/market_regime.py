@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 from .sectors import sector_for, etf_for_sector
@@ -27,6 +28,45 @@ def is_risk_off(bars: pd.DataFrame | None, ema_length: int = 50) -> bool:
     if last_close != last_close or last_ema != last_ema:
         return False
     return last_close < last_ema
+
+
+def classify_regime_series(
+    bars: pd.DataFrame | None,
+    ema_length: int = 50,
+    adx_length: int = 14,
+    adx_min: float = 20.0,
+    atr_length: int = 14,
+    vol_lookback: int = 20,
+) -> pd.DataFrame:
+    """Per-bar market-regime flags from a benchmark's OHLC bars (intended: daily SPY).
+
+    The scalar ``is_risk_off`` answers only "is the benchmark below trend?". This
+    returns the three orthogonal legs of a *hostile* regime so a caller can test
+    them as a ladder (which one actually does the work?):
+
+      trend_down : close < EMA(ema_length)            -- below trend
+      adx_high   : ADX(adx_length) >= adx_min          -- the move is a real trend, not chop
+      vol_up     : ATR%(atr_length) > its rolling mean -- volatility expanding
+
+    Pure / network-free. Warm-up rows are False. Returns a bool DataFrame aligned
+    to ``bars.index``; an empty/None frame yields an empty result.
+    """
+    from .indicators import calculate_adx, calculate_atr, calculate_ema
+
+    if bars is None or len(bars) == 0 or "close" not in bars.columns:
+        return pd.DataFrame(columns=["trend_down", "adx_high", "vol_up"])
+
+    close = bars["close"].astype(float)
+    ema = calculate_ema(close, ema_length)
+    adx = calculate_adx(bars, adx_length)
+    atr_pct = calculate_atr(bars, atr_length) / close.replace(0.0, np.nan)
+    atr_pct_avg = atr_pct.rolling(vol_lookback, min_periods=vol_lookback).mean()
+
+    out = pd.DataFrame(index=bars.index)
+    out["trend_down"] = (close < ema).fillna(False)
+    out["adx_high"] = (adx >= adx_min).fillna(False)
+    out["vol_up"] = (atr_pct > atr_pct_avg).fillna(False)
+    return out.astype(bool)
 
 
 def suppress_longs_if_risk_off(

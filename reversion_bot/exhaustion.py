@@ -168,3 +168,24 @@ def capitulation_candle(
     return (
         (lower_wick_fraction(df) >= min_wick) & (close_position(df) >= min_close_pos)
     ).astype(bool)
+
+
+def range_atr_ratio(df: pd.DataFrame, atr) -> pd.Series:
+    """Each bar's range (high - low) as a multiple of ATR.
+
+    1.0 == an average-sized bar; capitulation bars are wide (typically > 1.5x).
+    The ATR-normalization makes it comparable across symbols and price levels.
+    ``atr`` may be a Series (aligned to ``df``) or array-like; zero/NaN ATR -> NaN.
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    atr_s = atr if isinstance(atr, pd.Series) else pd.Series(np.asarray(atr, dtype=float), index=df.index)
+    return (high - low) / atr_s.astype(float).replace(0.0, np.nan)
+
+
+def range_expansion(df: pd.DataFrame, atr, mult: float = 1.5) -> pd.Series:
+    """Boolean Series: bar range >= ``mult`` x ATR — an expanding (capitulation-
+    sized) bar. The fourth leg of a real exhaustion event: a big move (range) on
+    big volume that then fails to extend. Warm-up/zero-ATR bars -> False.
+    """
+    return (range_atr_ratio(df, atr) >= mult).fillna(False).astype(bool)

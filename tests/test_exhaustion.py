@@ -255,3 +255,25 @@ def test_capitulation_candle_needs_wick_and_recovery():
     })
     cap = capitulation_candle(df, min_wick=0.5, min_close_pos=0.5)
     assert list(cap) == [True, False, False]
+
+
+def test_range_atr_ratio_and_expansion():
+    from reversion_bot.exhaustion import range_atr_ratio, range_expansion
+    df = pd.DataFrame({
+        "open":  [10.0, 10.0, 10.0],
+        "high":  [10.5, 11.0, 12.0],   # ranges: 1.0, 2.0, 3.0
+        "low":   [ 9.5,  9.0,  9.0],
+        "close": [10.0, 10.0, 10.0],
+    })
+    atr = pd.Series([1.0, 1.0, 1.0])
+    ratio = range_atr_ratio(df, atr)
+    assert list(ratio) == [1.0, 2.0, 3.0]
+    exp = range_expansion(df, atr, mult=1.5)
+    assert list(exp) == [False, True, True]      # 1.0x not expanded; 2x/3x are
+
+
+def test_range_expansion_handles_zero_atr():
+    from reversion_bot.exhaustion import range_expansion
+    df = pd.DataFrame({"open": [10.0], "high": [11.0], "low": [9.0], "close": [10.0]})
+    # Zero ATR -> ratio NaN -> not flagged (fails open to False, never True).
+    assert list(range_expansion(df, pd.Series([0.0]), mult=1.5)) == [False]

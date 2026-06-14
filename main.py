@@ -194,6 +194,17 @@ async def liquidate_all_positions(executor):
             print(f"[EOD] Failed to submit sell for {symbol}: {e}")
 
 
+def is_account_flat(executor) -> bool:
+    """True when there are no open positions (EOD liquidation has fully filled)."""
+    try:
+        return len(executor.client.list_positions()) == 0
+    except Exception as e:
+        # If we can't confirm, treat as not-flat so the caller retries rather
+        # than exiting on a transient API error with positions still open.
+        print(f"[EOD] Could not confirm flat: {e}")
+        return False
+
+
 # --- Main Entry Point ---
 
 async def main():
@@ -284,6 +295,7 @@ async def main():
     start_ct = get_session_start_ct()
     close_ct = get_session_close_ct()
     lead_minutes = int(os.getenv("EOD_LIQUIDATION_MINUTES", 10))
+    exit_on_close = parse_bool(os.getenv("EXIT_ON_SESSION_CLOSE", "True"))
 
     print(f"--- REVERSION BOT STARTING ---")
     print(f"Timeframe: {timeframe} | Lookback: {lookback} | Mode: {'PAPER' if exec_config.paper else 'LIVE'}")
@@ -292,6 +304,7 @@ async def main():
         f"Schedule (CT): launch {start_ct.strftime('%H:%M')} | "
         f"flatten {(close_ct - timedelta(minutes=lead_minutes)).strftime('%H:%M')} | "
         f"close {close_ct.strftime('%H:%M')}"
+        f"{' | self-exit after flatten' if exit_on_close else ''}"
     )
 
     try:
@@ -305,6 +318,16 @@ async def main():
 
             if is_session_closing():
                 await liquidate_all_positions(executor)
+                if exit_on_close:
+                    # Only exit once we've confirmed the account is flat, so a
+                    # partially-filled liquidation gets retried next poll instead
+                    # of leaving positions open overnight.
+                    if await asyncio.to_thread(is_account_flat, executor):
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Session closed and flat. Exiting process.")
+                        break
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Liquidation not yet flat; retrying next poll...")
+                    await asyncio.sleep(poll_interval)
+                    continue
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Session closed (>= {os.getenv('SESSION_END', '15:00')} CT). Flattened. Sleeping...")
                 await asyncio.sleep(poll_interval)
                 continue
@@ -336,6 +359,8 @@ async def main():
             
     except KeyboardInterrupt:
         print("\n[STOP] Shutting down...")
+
+    print("[STOP] Bot exited cleanly.")
 
 if __name__ == "__main__":
     asyncio.run(main())

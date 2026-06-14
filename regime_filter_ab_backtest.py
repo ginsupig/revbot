@@ -15,9 +15,12 @@ Two design choices are left to the data, not pre-picked:
                trend+adx+vol  : all three
 
 The daily regime is shifted one day (known at the OPEN of the entry day) so there
-is no look-ahead. Per-setup expectancy on the standard bracket; research-only,
-nothing wired into the engine. The eventual home is the governor / market_regime
-layer (suppress_longs_*), never get_decision. Validate OOS (--end).
+is no look-ahead, and is joined to intraday entries by CALENDAR DATE (fetch_alpaca_bars
+returns a 'date' column + RangeIndex, not a DatetimeIndex). Per-setup expectancy on
+the standard bracket; overlapping trades, so this measures expectancy/PF/Sharpe, not
+a sequenced equity curve (drawdown is deferred to a sequenced test). Research-only,
+nothing wired into the engine; eventual home is the governor / market_regime
+suppressor (suppress_longs_*), never get_decision. Validate OOS (--end).
 
 Usage:
     python regime_filter_ab_backtest.py --days 180
@@ -34,7 +37,6 @@ import pandas as pd
 from reversion_bot.config import ReversionConfig
 from reversion_bot.engine import ReversionEngine
 from reversion_bot.market_regime import classify_regime_series
-from reversion_bot.analytics import ulcer_index, worst_losing_streak
 from run_real_backtest import fetch_alpaca_bars
 
 CORE_UNIVERSE = [
@@ -56,6 +58,14 @@ VARIANTS = {
 }
 
 
+def _dates(bars) -> np.ndarray:
+    """Calendar date per bar from the 'date' column (fetch returns RangeIndex)."""
+    if "date" in bars.columns:
+        return pd.to_datetime(bars["date"], utc=True).dt.date.to_numpy()
+    idx = pd.to_datetime(bars.index, utc=True)
+    return np.array([t.date() for t in idx])
+
+
 def _outcome(high, low, close, i, entry, atr, br) -> float:
     stop = entry - atr * br["stop"]
     target = entry + atr * br["target"]
@@ -68,17 +78,17 @@ def _outcome(high, low, close, i, entry, atr, br) -> float:
     return (close[end] / entry - 1.0) - COST_PCT
 
 
-def _daily_regime_by_date(start, end_s, timeframe_warmup_start) -> dict:
+def _daily_regime_by_date(warmup_start, end_s) -> dict:
     """{date -> (trend_down, adx_high, vol_up)} from daily SPY, shifted one day
     (so the flag for day D reflects data through D-1: no look-ahead)."""
-    spy = fetch_alpaca_bars(BENCHMARK, timeframe_warmup_start, end_s, "1Day")
+    spy = fetch_alpaca_bars(BENCHMARK, warmup_start, end_s, "1Day")
     if spy is None or len(spy) < 60:
         return {}
     reg = classify_regime_series(spy).shift(1).fillna(False).astype(bool)
-    idx = pd.to_datetime(spy.index)
+    dates = _dates(spy)
     out = {}
-    for ts, (td, ah, vu) in zip(idx, reg[["trend_down", "adx_high", "vol_up"]].to_numpy()):
-        out[ts.date()] = (bool(td), bool(ah), bool(vu))
+    for d, td, ah, vu in zip(dates, reg["trend_down"], reg["adx_high"], reg["vol_up"]):
+        out[d] = (bool(td), bool(ah), bool(vu))
     return out
 
 
@@ -90,7 +100,7 @@ def _simulate(bars, regime_by_date) -> list:
     low = bars["low"].astype(float).to_numpy()
     close = bars["close"].astype(float).to_numpy()
     atr_col = enriched["atr"].to_numpy()
-    index = pd.to_datetime(bars.index)
+    dates = _dates(bars)
 
     out = []
     for i in range(len(enriched)):
@@ -99,31 +109,31 @@ def _simulate(bars, regime_by_date) -> list:
         c = close[i]
         atr = max(float(atr_col[i]) if not np.isnan(atr_col[i]) else 0.0, c * ATR_FLOOR_PCT)
         r = _outcome(high, low, close, i, c, atr, STD)
-        td, ah, vu = regime_by_date.get(index[i].date(), (False, False, False))
+        td, ah, vu = regime_by_date.get(dates[i], (False, False, False))
         out.append((r, td, ah, vu))
     return out
 
 
 def _metrics(stream) -> dict:
+    """Order-independent expectancy metrics for one (overlapping) return stream.
+    No drawdown/ulcer here: the streams overlap across symbols, so a compounded
+    equity curve isn't a real sequenced curve — defer drawdown to a sequenced test."""
     arr = np.asarray(stream, dtype=float)
     if arr.size == 0:
-        return dict(n=0, net=0.0, pf=0.0, sharpe=0.0, max_dd=0.0, ulcer=0.0, streak=0)
+        return dict(n=0, net=0.0, expectancy=0.0, pf=0.0, sharpe=0.0, win=0.0)
     wins, losses = arr[arr > 0].sum(), -arr[arr < 0].sum()
-    eq = np.cumprod(1.0 + arr)
-    peak = np.maximum.accumulate(eq)
     std = arr.std(ddof=0)
     return dict(
-        n=int(arr.size), net=float(arr.sum()),
+        n=int(arr.size), net=float(arr.sum()), expectancy=float(arr.mean()),
         pf=float(wins / losses) if losses > 0 else (10.0 if wins > 0 else 0.0),
         sharpe=float(arr.mean() / std) if std > 0 else 0.0,
-        max_dd=float(((eq - peak) / peak).min()),
-        ulcer=ulcer_index(eq), streak=worst_losing_streak(arr),
+        win=float((arr > 0).mean()),
     )
 
 
 def _row(label, m):
-    return (f"  {label:<22}{m['n']:>6}{m['net']:>10.4f}{m['pf']:>7.2f}{m['sharpe']:>8.3f}"
-            f"{m['max_dd']*100:>9.2f}%{m['ulcer']:>8.2f}{m['streak']:>8}")
+    return (f"  {label:<22}{m['n']:>6}{m['net']:>10.4f}{m['expectancy']*100:>9.3f}%"
+            f"{m['pf']:>7.2f}{m['sharpe']:>8.3f}{m['win']*100:>8.1f}%")
 
 
 def main() -> None:
@@ -148,10 +158,12 @@ def main() -> None:
     print(f"Market-regime filter A/B (long-only) | symbols={len(symbols)} | "
           f"{start}->{end_s} | {args.timeframe} | benchmark={BENCHMARK} (daily, shifted 1d)")
 
-    regime_by_date = _daily_regime_by_date(start, end_s, warm)
+    regime_by_date = _daily_regime_by_date(warm, end_s)
     if not regime_by_date:
         print("\n  could not build SPY daily regime (no benchmark data).")
         return
+    hostile_days = sum(1 for v in regime_by_date.values() if v[0])
+    print(f"  SPY regime days={len(regime_by_date)}  (trend_down on {hostile_days})")
 
     records = []
     for sym in symbols:
@@ -173,23 +185,19 @@ def main() -> None:
              "vol_up": np.array([r[3] for r in records])}
 
     print(f"\n  signals={len(records)}")
-    header = (f"  {'ARM':<22}{'N':>6}{'NET':>10}{'PF':>7}{'SHARPE':>8}{'MAXDD':>10}{'ULCER':>8}{'STREAK':>8}")
+    header = f"  {'ARM':<22}{'N':>6}{'NET':>10}{'EXP':>10}{'PF':>7}{'SHARPE':>8}{'WIN':>8}"
     print("\n" + header)
     print(_row("base (take all)", _metrics(base)))
 
     for name, legs in VARIANTS.items():
         hostile = np.logical_and.reduce([flags[l] for l in legs])
-        frac = float(hostile.mean())
-        keep = base[~hostile]                       # suppress: trade only benign regime
-        half = np.where(hostile, base * 0.5, base)  # half-size hostile entries
-        print(f"\n  [{name}]  hostile={frac*100:.0f}% of entries")
-        print(_row(f"  suppress", _metrics(keep)))
-        print(_row(f"  half-size", _metrics(half)))
+        print(f"\n  [{name}]  hostile={hostile.mean()*100:.0f}% of entries")
+        print(_row("  suppress", _metrics(base[~hostile])))
+        print(_row("  half-size", _metrics(np.where(hostile, base * 0.5, base))))
 
-    print("\n  Want: an arm with higher PF/Sharpe and shallower MAXDD/ulcer than base.")
-    print("  suppress that only trims N without lifting PF == the cut trades weren't")
-    print("  losers (no edge). Validate the winning arm OOS (--end) before wiring into")
-    print("  the governor / market_regime suppressor (never get_decision).")
+    print("\n  Want: an arm with higher PF/Sharpe than base on FEWER (suppress) or")
+    print("  de-weighted (half) hostile entries. A suppress that trims N without")
+    print("  lifting PF == the cut trades weren't losers (no edge). Validate OOS.")
 
 
 if __name__ == "__main__":

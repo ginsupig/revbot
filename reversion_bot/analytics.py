@@ -57,6 +57,43 @@ def max_drawdown(trades):
     return drawdown.min()
 
 
+def ulcer_index(equity_curve) -> float:
+    """Ulcer Index: RMS of percentage drawdowns from the running peak.
+
+    Unlike ``max_drawdown`` (the single worst point), the Ulcer Index squares and
+    averages *every* drawdown, so it penalizes downside that is both deep AND
+    prolonged — the right lens for "did upsizing add left-tail pain?". Takes an
+    equity *level* curve (e.g. ``np.cumprod(1 + returns)``), not a return stream.
+    Returns a non-negative percent; 0.0 for an empty/peak-only (never underwater)
+    curve.
+    """
+    eq = np.asarray(equity_curve, dtype=float)
+    if eq.size == 0:
+        return 0.0
+    peak = np.maximum.accumulate(eq)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dd = np.where(peak > 0, (eq - peak) / peak * 100.0, 0.0)
+    return float(np.sqrt(np.mean(np.square(dd))))
+
+
+def worst_losing_streak(returns) -> int:
+    """Longest run of consecutive losing trades (return < 0).
+
+    A streak metric ``max_drawdown`` misses: five −1% losers in a row and one
+    −5% loser produce the same drawdown, but the streak is what breaks operator
+    confidence (and margin). Zero/positive returns reset the run.
+    """
+    worst = current = 0
+    for r in returns:
+        if r < 0:
+            current += 1
+            if current > worst:
+                worst = current
+        else:
+            current = 0
+    return int(worst)
+
+
 def run_monte_carlo(
     initial_invest: float,
     daily_mean: float,

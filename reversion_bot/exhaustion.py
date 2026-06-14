@@ -93,3 +93,78 @@ def exhaustion_short_signal(
         signal = signal & (cmf <= cmf_max)
 
     return signal.fillna(False).astype(bool)
+
+
+# --- Long-side capitulation features ---------------------------------------
+# The bot already measures "price is stretched" three ways (RSI/RI/Bollinger).
+# These measure the orthogonal thing it was missing: "is the SELLING dying?" —
+# the difference between a drop that is finishing (buyable) and one that is just
+# beginning (a falling knife). Pure transforms, like the rest of this module.
+
+
+def selling_velocity_decelerating(
+    df: pd.DataFrame, short: int = 3, long: int = 10, require_decline: bool = True
+) -> pd.Series:
+    """Boolean Series: True where a down-move is DECELERATING.
+
+    Compares the recent per-bar pace (cumulative return over ``short`` bars,
+    divided by ``short``) to the longer per-bar pace (over ``long`` bars). When
+    the recent drop is shallower per bar than the overall drop, selling is losing
+    velocity — the exhaustion the reversion long wants, not a knife still
+    accelerating down::
+
+        per-bar returns  -5, -3, -1  -> decelerating -> True
+        per-bar returns  -2, -3, -5  -> accelerating -> False
+
+    ``require_decline`` gates on ``return_long < 0`` so it only fires inside an
+    actual pullback (not on a shallow wobble during an uptrend). Returns False
+    where the windows aren't warm yet.
+    """
+    close = df["close"].astype(float)
+    ret_short = close / close.shift(short) - 1.0
+    ret_long = close / close.shift(long) - 1.0
+    # Recent per-bar drop less steep than the longer per-bar drop == easing.
+    decel = (ret_short / short) > (ret_long / long)
+    if require_decline:
+        decel = decel & (ret_long < 0)
+    return decel.fillna(False).astype(bool)
+
+
+def lower_wick_fraction(df: pd.DataFrame) -> pd.Series:
+    """Share of each bar's range that is the lower wick (tail below the body).
+
+    1.0 == the whole range is a tail under the body (a long-legged hammer: price
+    was pushed down then bought back up intrabar); 0.0 == the low sits at the
+    body bottom (no rejection from below). Body is min(open, close), so it counts
+    only the wick, not the candle body. Degenerate (high==low) bars -> 0.0.
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    body_low = pd.concat([df["open"].astype(float), df["close"].astype(float)], axis=1).min(axis=1)
+    rng = (high - low).replace(0.0, np.nan)
+    return ((body_low - low) / rng).fillna(0.0)
+
+
+def close_position(df: pd.DataFrame) -> pd.Series:
+    """Where the close sits within the bar's range: 1.0 == closed at the high,
+    0.0 == closed at the low. Degenerate (high==low) bars -> 0.5 (neutral)."""
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    rng = (high - low).replace(0.0, np.nan)
+    return ((close - low) / rng).fillna(0.5)
+
+
+def capitulation_candle(
+    df: pd.DataFrame, min_wick: float = 0.5, min_close_pos: float = 0.5
+) -> pd.Series:
+    """Boolean Series: long lower wick AND close in the upper part of the range.
+
+    A capitulation/hammer bar — sellers drove price down then got rejected, with
+    the close recovering into the top of the bar. This is a stronger, more
+    selective reversal tell than the engine's current ``close >= open``
+    (body-only) confirmation, which a long lower wick subsumes.
+    """
+    return (
+        (lower_wick_fraction(df) >= min_wick) & (close_position(df) >= min_close_pos)
+    ).astype(bool)

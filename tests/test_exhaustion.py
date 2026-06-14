@@ -176,3 +176,82 @@ def test_confirmation_still_trades_a_real_rollover():
     res = short_exhaustion_strategy(_df(highs, vols), confirm_mode="medium", **kw)
     assert int((res["signal"] == -1).sum()) >= 1
     assert res["pnl"].sum() > 0
+
+
+# --- Long-side capitulation features ---------------------------------------
+
+from reversion_bot.exhaustion import (
+    selling_velocity_decelerating,
+    lower_wick_fraction,
+    close_position,
+    capitulation_candle,
+)
+
+
+def _close_series_from_per_bar(per_bar_pcts):
+    """Build a close series whose successive bar-over-bar returns match the given
+    per-bar percentages (so a [-5,-3,-1] list literally produces those moves)."""
+    close = [100.0]
+    for p in per_bar_pcts:
+        close.append(close[-1] * (1.0 + p / 100.0))
+    return pd.DataFrame({"close": close})
+
+
+def test_deceleration_true_when_drop_is_slowing():
+    # A steep early decline that eases: -5, -4, -3, -2, -1 (per bar).
+    df = _close_series_from_per_bar([-5, -4, -3, -2, -1])
+    decel = selling_velocity_decelerating(df, short=2, long=4)
+    assert bool(decel.iloc[-1]) is True       # recent pace shallower than overall
+
+
+def test_deceleration_false_on_accelerating_knife():
+    # An accelerating decline: -1, -2, -3, -4, -5 (per bar) — a falling knife.
+    df = _close_series_from_per_bar([-1, -2, -3, -4, -5])
+    decel = selling_velocity_decelerating(df, short=2, long=4)
+    assert bool(decel.iloc[-1]) is False
+
+
+def test_deceleration_requires_a_decline():
+    # Rising tape: recent "pace" may look shallower but there's no pullback to
+    # exhaust, so require_decline keeps it False.
+    df = _close_series_from_per_bar([1, 2, 1, 2, 1])
+    assert bool(selling_velocity_decelerating(df, short=2, long=4).iloc[-1]) is False
+
+
+def test_lower_wick_fraction_hammer_vs_no_tail():
+    df = pd.DataFrame({
+        # hammer: open/close near the high, long tail down to the low
+        "open":  [10.0, 10.0],
+        "close": [10.2, 10.2],
+        "high":  [10.3, 10.3],
+        "low":   [ 9.0, 10.0],   # row0 long lower wick; row1 no lower wick
+    })
+    frac = lower_wick_fraction(df)
+    assert frac.iloc[0] > 0.7                 # most of the range is tail
+    assert abs(frac.iloc[1] - 0.0) < 1e-9     # low == body bottom -> no wick
+
+
+def test_close_position_and_degenerate_bar():
+    df = pd.DataFrame({
+        "open":  [10.0, 5.0],
+        "close": [10.3, 5.0],
+        "high":  [10.3, 5.0],   # row1 high==low (flat bar)
+        "low":   [ 9.0, 5.0],
+    })
+    pos = close_position(df)
+    assert abs(pos.iloc[0] - 1.0) < 1e-9      # closed at the high
+    assert abs(pos.iloc[1] - 0.5) < 1e-9      # degenerate -> neutral 0.5
+
+
+def test_capitulation_candle_needs_wick_and_recovery():
+    df = pd.DataFrame({
+        # row0 capitulation: pushed down to 9.0, bought back, closes near the high
+        # row1 falling knife: closes near its low, no lower tail
+        # row2 plain green push: closes high but no lower wick
+        "open":  [10.00, 10.00, 10.00],
+        "high":  [10.30, 10.05, 10.45],
+        "low":   [ 9.00,  9.00,  9.98],
+        "close": [10.20,  9.05, 10.40],
+    })
+    cap = capitulation_candle(df, min_wick=0.5, min_close_pos=0.5)
+    assert list(cap) == [True, False, False]

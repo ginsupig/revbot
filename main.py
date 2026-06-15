@@ -616,8 +616,10 @@ async def main():
         # Trend-fail strategy.
         trendfail_window=int(os.getenv("TRENDFAIL_WINDOW", 20)),
         trendfail_threshold=float(os.getenv("TRENDFAIL_THRESHOLD", 0.005)),
-        # Short side (mirror) gates.
-        enable_shorts=parse_bool(os.getenv("ENABLE_SHORTS", "True"), default=True),
+        # Short side (mirror) gates. Default OFF: shorts were never validated —
+        # every backtest this cycle ran long-only, and live shorts lost. Opt back
+        # in with ENABLE_SHORTS=True once the short side is separately backtested.
+        enable_shorts=parse_bool(os.getenv("ENABLE_SHORTS", "False"), default=False),
         ri_short_threshold=float(os.getenv("RI_SHORT_THRESHOLD", 0.5)),
         rsi_min=float(os.getenv("RSI_MIN", 52.0)),
         rsi_hard_min=float(os.getenv("RSI_HARD_MIN", 30.0)),

@@ -82,7 +82,13 @@ class RiskConfig:
     max_position_value_pct: float = 0.20
 
     stop_atr_multiple: float = 1.20
-    target_atr_multiple: float = 2.00
+    target_atr_multiple: float = 3.00
+    # Trailing stop (long): ratchet the stop up to high_water - trail_atr_multiple*ATR.
+    # Validated (execution_tuning_backtest.py) as the load-bearing edge — it lets
+    # winners run while holding the win rate, vs a fixed target that caps/gives back.
+    # 0 disables. Paired with the wider 3.0 target (target is the backstop the trail
+    # rides toward). Gated live by USE_TRAILING_STOP.
+    trail_atr_multiple: float = 1.50
 
     trend_stop_atr_multiple: float = 1.20
     trend_target_atr_multiple: float = 3.00

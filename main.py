@@ -415,6 +415,46 @@ async def manage_channel_exits(executor, exec_config, lookback, timeframe):
             print(f"[CHANNEL-EXIT] {symbol} close failed: {e}")
 
 
+async def manage_trailing_stops(executor, portfolio_state, risk_config):
+    """Ratchet each open long's stop leg up toward the trailing stop.
+
+    Per cycle: update the stored high-water mark from the position's current
+    price, then raise the broker stop toward ``high_water - trail*ATR`` (never
+    down, never above market). Best-effort and per-symbol — a hiccup on one name
+    can't block the loop, and the fixed bracket stop remains the backstop.
+    Uses current_price (not intrabar highs) for the high-water mark, so the live
+    trail is marginally laggier than the backtest — conservative by design.
+    """
+    try:
+        positions = await asyncio.to_thread(executor.get_positions)
+    except Exception as e:
+        print(f"[TRAIL] position fetch failed ({e}); skipping.")
+        return
+    for p in positions:
+        if _safe_qty(p) <= 0:                       # longs only
+            continue
+        symbol = str(getattr(p, "symbol", "")).upper()
+        state = portfolio_state.get_trail_state(symbol)
+        if state is None:                           # carryover / pre-trail position
+            continue
+        entry_price, stop_distance, _ = state
+        try:
+            last_price = float(getattr(p, "current_price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if last_price <= 0:
+            continue
+        hw = portfolio_state.update_high_water(symbol, last_price)
+        if hw is None:
+            continue
+        new_stop = await asyncio.to_thread(
+            executor.update_trailing_stop, symbol, entry_price, stop_distance, hw,
+            last_price, risk_config.stop_atr_multiple, risk_config.trail_atr_multiple,
+        )
+        if new_stop is not None:
+            print(f"[TRAIL] {symbol} stop -> {new_stop:.2f} (high-water {hw:.2f})")
+
+
 def _safe_qty(position) -> float:
     try:
         return float(getattr(position, "qty", 0) or 0)
@@ -524,6 +564,10 @@ async def main():
     # suppress NEW long entries. Dip-buying every oversold name in a market-wide
     # selloff is the losing trade; shorts and existing positions are unaffected.
     use_market_filter = parse_bool(os.getenv("USE_MARKET_REGIME_FILTER", "True"), default=True)
+    # Trailing stop on open longs (default ON): each cycle, ratchet the bracket's
+    # stop leg up toward high_water - TRAIL_ATR_MULTIPLE*ATR. The validated edge
+    # (execution_tuning_backtest.py). Set USE_TRAILING_STOP=False to disable.
+    use_trailing_stop = parse_bool(os.getenv("USE_TRAILING_STOP", "True"), default=True)
     regime_symbol = os.getenv("MARKET_REGIME_SYMBOL", "SPY")
     regime_timeframe = os.getenv("MARKET_REGIME_TIMEFRAME", "1Day")
     regime_ema = int(os.getenv("MARKET_REGIME_EMA", 50))
@@ -587,7 +631,8 @@ async def main():
         min_rr=float(os.getenv("MIN_RR", 1.5)),
         # Per-style ATR stop/target multiples.
         stop_atr_multiple=float(os.getenv("STOP_ATR_MULTIPLE", 1.20)),
-        target_atr_multiple=float(os.getenv("TARGET_ATR_MULTIPLE", 2.00)),
+        target_atr_multiple=float(os.getenv("TARGET_ATR_MULTIPLE", 3.00)),
+        trail_atr_multiple=float(os.getenv("TRAIL_ATR_MULTIPLE", 1.50)),
         trend_stop_atr_multiple=float(os.getenv("TREND_STOP_ATR_MULTIPLE", 1.20)),
         trend_target_atr_multiple=float(os.getenv("TREND_TARGET_ATR_MULTIPLE", 3.00)),
         trendfail_stop_atr_multiple=float(os.getenv("TRENDFAIL_STOP_ATR_MULTIPLE", 1.10)),
@@ -727,6 +772,11 @@ async def main():
     print(f"--- REVERSION BOT STARTING ---")
     print(f"Timeframe: {timeframe} | Lookback: {lookback} | Mode: {'PAPER' if exec_config.paper else 'LIVE'}")
     print(f"Shorts: {'ENABLED' if strategy_config.enable_shorts else 'disabled'}")
+    if use_trailing_stop:
+        print(f"Trailing stop: ON (stop ratchets to high_water - {risk_config.trail_atr_multiple:g}xATR; "
+              f"target {risk_config.target_atr_multiple:g}xATR backstop)")
+    else:
+        print("Trailing stop: off")
     if use_market_filter:
         extra = " + favor shorts" if favor_shorts_risk_off else ""
         print(f"Market regime filter: ON ({regime_symbol} {regime_timeframe} EMA{regime_ema} — block longs when risk-off{extra})")
@@ -867,6 +917,11 @@ async def main():
                     pass
 
             await execute_candidates(governor, executor, portfolio_state, candidates)
+
+            # Trailing stop: ratchet each open long's stop up toward the trailing
+            # level (the validated edge). On by default.
+            if use_trailing_stop:
+                await manage_trailing_stops(executor, portfolio_state, risk_config)
 
             # Breakout exit: take profit on any long that has run to the upper
             # channel, before its (wide backstop) bracket target. Opt-in.

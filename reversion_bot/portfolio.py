@@ -97,19 +97,55 @@ class PortfolioState:
             return 0.0
         return max(0.0, (peak - account_equity) / peak)
 
-    def note_new_position(self, symbol: str, entry_style: str, regime: str, timestamp_iso: str, side: str = "long") -> None:
+    def note_new_position(self, symbol: str, entry_style: str, regime: str, timestamp_iso: str,
+                          side: str = "long", entry_price: float | None = None,
+                          stop_distance: float | None = None) -> None:
         data = self._load()
         today = timestamp_iso[:10]
         daily = [x for x in data.get("daily_new_positions", []) if str(x).startswith(today)]
         daily.append(timestamp_iso)
         data["daily_new_positions"] = daily
         data.setdefault("last_trade_ts_by_symbol", {})[symbol.upper()] = timestamp_iso
-        data.setdefault("position_meta", {})[symbol.upper()] = {
+        meta = {
             "entry_style": entry_style,
             "regime": regime,
             "side": side,
         }
+        # Trail state: stored at entry so the trailing stop survives restarts.
+        # high_water seeds at the entry price and only ratchets up from there.
+        if entry_price is not None:
+            meta["entry_price"] = float(entry_price)
+            meta["high_water"] = float(entry_price)
+        if stop_distance is not None:
+            meta["stop_distance"] = float(stop_distance)
+        data.setdefault("position_meta", {})[symbol.upper()] = meta
         self._save(data)
+
+    def update_high_water(self, symbol: str, price: float) -> float | None:
+        """Ratchet the stored high-water mark for an open long up to ``price``.
+
+        Returns the new high-water mark, or None if the symbol has no trail state
+        (e.g. a carryover position opened before this was tracked). Never lowers.
+        """
+        data = self._load()
+        meta = data.get("position_meta", {}).get(symbol.upper())
+        if not meta or "high_water" not in meta:
+            return None
+        hw = max(float(meta["high_water"]), float(price))
+        if hw != meta["high_water"]:
+            meta["high_water"] = hw
+            self._save(data)
+        return hw
+
+    def get_trail_state(self, symbol: str):
+        """``(entry_price, stop_distance, high_water)`` for an open long, or None
+        if the symbol lacks full trail state."""
+        meta = self._load().get("position_meta", {}).get(symbol.upper())
+        if not meta:
+            return None
+        if not all(k in meta for k in ("entry_price", "stop_distance", "high_water")):
+            return None
+        return float(meta["entry_price"]), float(meta["stop_distance"]), float(meta["high_water"])
 
     def open_style_regime_counts(self, open_symbols) -> tuple[Dict[str, int], Dict[str, int]]:
         """Reconstruct per-style and per-regime counts for currently-open symbols.
@@ -148,7 +184,13 @@ class PortfolioState:
         regime = str(candidate.get("regime", "unknown"))
         side = "short" if candidate.get("go_short") else "long"
         ts = datetime.now(timezone.utc).isoformat()
-        self.note_new_position(symbol, entry_style, regime, ts, side=side)
+        # Pull entry price + stop distance from the plan so the trailing stop has
+        # its anchor (longs only; the trail is a long-side feature).
+        plan = candidate.get("position_plan") or {}
+        entry_price = plan.get("entry_price") if side == "long" else None
+        stop_distance = plan.get("risk_per_share") if side == "long" else None
+        self.note_new_position(symbol, entry_style, regime, ts, side=side,
+                               entry_price=entry_price, stop_distance=stop_distance)
 
     def in_symbol_cooldown(self, symbol: str, now: datetime, cooldown_minutes: int) -> bool:
         data = self._load()

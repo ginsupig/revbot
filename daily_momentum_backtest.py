@@ -34,6 +34,21 @@ CORE = [
     "ASTS", "MU", "AMD", "NVDA", "SMCI", "META", "AAPL", "APP", "ARM", "CRWD",
     "WDC", "MSFT", "LRCX", "JPM", "FCX", "OXY", "LLY", "CLF", "HIMS", "TEM",
 ]
+# Survivorship control: a broad, sector-diverse large-cap set, all liquid well
+# before 2024 (no hindsight selection), DELIBERATELY including laggards/flat names
+# (INTC, PFE, NKE, BA, DIS, T, MO, TGT) — not just trenders. If momentum holds
+# here too, it's a real edge; if it only works on CORE, CORE was survivorship.
+NEUTRAL = [
+    "AAPL", "MSFT", "INTC", "CSCO", "IBM", "ORCL", "QCOM", "TXN",      # tech (mixed)
+    "JPM", "BAC", "WFC", "GS", "C", "AXP",                              # financials
+    "JNJ", "PFE", "MRK", "ABBV", "UNH", "BMY",                          # healthcare
+    "PG", "KO", "PEP", "WMT", "COST", "MO",                             # staples
+    "HD", "MCD", "NKE", "SBUX", "DIS", "TGT",                           # discretionary
+    "XOM", "CVX", "COP",                                                # energy
+    "CAT", "BA", "GE", "HON", "UPS",                                    # industrials
+    "VZ", "T", "CMCSA",                                                 # comms
+]
+UNIVERSES = {"core": CORE, "neutral": NEUTRAL}
 
 ATR_FLOOR_PCT = 0.0035
 # config -> ATR trailing distance (chandelier). No fixed target: trends run until the trail.
@@ -102,7 +117,9 @@ def _pf(arr):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Daily momentum backtest (research-only)")
-    parser.add_argument("symbols", nargs="*", help="symbols (default: core universe)")
+    parser.add_argument("symbols", nargs="*", help="symbols (overrides --universe)")
+    parser.add_argument("--universe", choices=list(UNIVERSES), default="core",
+                        help="core (curated 20) or neutral (survivorship control, ~44 large caps)")
     parser.add_argument("--days", type=int, default=365, help="window length in days (default 365)")
     parser.add_argument("--end", default=None, help="in-sample end YYYY-MM-DD (default today)")
     parser.add_argument("--lookback", type=int, default=20, help="breakout lookback in days (default 20)")
@@ -118,7 +135,7 @@ def main() -> None:
     except Exception:
         pass
 
-    symbols = [s.strip().upper() for s in args.symbols] if args.symbols else CORE
+    symbols = [s.strip().upper() for s in args.symbols] if args.symbols else UNIVERSES[args.universe]
     end = datetime.strptime(args.end, "%Y-%m-%d") if args.end else datetime.now()
     fmt = "%Y-%m-%d"
     windows = {
@@ -127,7 +144,8 @@ def main() -> None:
                       (end - timedelta(days=args.days)).strftime(fmt)),
     }
     costs = [c / 10000.0 for c in args.costs]
-    print(f"Daily momentum (long-only) | universe={len(symbols)} | "
+    uni_label = "custom" if args.symbols else args.universe
+    print(f"Daily momentum (long-only) | universe={uni_label}({len(symbols)}) | "
           f"{args.lookback}d-breakout, SMA{args.trend_sma} filter, max-hold {args.max_hold}d")
     print(f"  in-sample {windows['in-sample'][0]}->{windows['in-sample'][1]} | "
           f"oos {windows['oos'][0]}->{windows['oos'][1]}   (low win-rate is normal — judge on PF)")

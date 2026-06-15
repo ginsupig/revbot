@@ -232,6 +232,62 @@ class AlpacaExecutor:
             limit_price=round(float(new_limit_price), 2)
         )
 
+    def replace_stop_order(self, order_id: str, new_stop_price: float):
+        if not order_id:
+            raise ValueError("order_id is required")
+        if new_stop_price <= 0:
+            raise ValueError("new_stop_price must be > 0")
+        return self.client.replace_order(
+            order_id=order_id,
+            stop_price=round(float(new_stop_price), 2),
+        )
+
+    def open_stop_leg(self, symbol: str):
+        """The symbol's open protective STOP order (the bracket's stop leg), as
+        ``{"id", "stop_price", "qty"}`` — or None. Identified by carrying a
+        stop_price (the take-profit leg is a plain limit). Never raises."""
+        symbol = symbol.strip().upper()
+        try:
+            orders = self.client.list_orders(status="open", limit=500)
+        except Exception as e:  # noqa: BLE001 - best-effort; caller treats None as "skip"
+            logging.warning("open_stop_leg: list_orders failed for %s: %s", symbol, e)
+            return None
+        for o in orders:
+            if str(getattr(o, "symbol", "")).upper() != symbol:
+                continue
+            sp = getattr(o, "stop_price", None)
+            if sp is None:
+                continue
+            return {
+                "id": getattr(o, "id", None),
+                "stop_price": float(sp),
+                "qty": abs(float(getattr(o, "qty", 0) or 0)),
+            }
+        return None
+
+    def update_trailing_stop(self, symbol, entry_price, stop_distance, high_water,
+                             last_price, stop_mult, trail_mult):
+        """Best-effort: raise the symbol's stop leg toward the trailing stop.
+
+        Returns the new stop price if it was moved up, else None. Never raises —
+        a trailing-stop hiccup must not break the poll loop; the fixed bracket
+        stop still protects the position and the next cycle retries.
+        """
+        from .trailing import trailing_stop_price, should_raise_stop
+        try:
+            leg = self.open_stop_leg(symbol)
+            if not leg or not leg.get("id"):
+                return None
+            desired = trailing_stop_price(entry_price, stop_distance, high_water,
+                                          stop_mult, trail_mult)
+            if not should_raise_stop(leg["stop_price"], desired, last_price):
+                return None
+            self.replace_stop_order(leg["id"], desired)
+            return round(float(desired), 2)
+        except Exception as e:  # noqa: BLE001 - guarded; the fixed stop remains
+            logging.warning("update_trailing_stop failed for %s: %s", symbol, e)
+            return None
+
     def get_positions(self):
         return self.client.list_positions()
 

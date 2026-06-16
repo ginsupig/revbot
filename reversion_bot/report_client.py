@@ -79,5 +79,6 @@ def make_client(rest_cls=None):
         raise SystemExit(1)
 
     print(f"[report] Alpaca {mode} ({base_url}) — account "
+          f"{getattr(account, 'account_number', '?')} "
           f"{getattr(account, 'status', '?')}, equity {getattr(account, 'equity', '?')}")
     return client

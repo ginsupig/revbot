@@ -73,7 +73,7 @@ class ReversionConfig:
 
     max_spread_bps: float = 40.0
     min_dollar_volume: float = 750_000.0
-    min_price: float = 5.0
+    min_price: float = 2.0
 
 
 @dataclass(frozen=True)

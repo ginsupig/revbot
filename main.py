@@ -585,7 +585,7 @@ async def main():
     strategy_config = ReversionConfig(
         min_history=lookback,
         min_dollar_volume=float(os.getenv("MIN_DOLLAR_VOLUME", 750000.0)),
-        min_price=float(os.getenv("MIN_PRICE", 5.0)),
+        min_price=float(os.getenv("MIN_PRICE", 2.0)),
         max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", 40.0)),
         # Bollinger band entry zone (lb1/lb2 = sma -/+ band_std * std).
         band_length=int(os.getenv("BAND_LENGTH", 20)),

@@ -35,6 +35,16 @@ CORE_UNIVERSE = [
     "ASTS", "MU", "AMD", "NVDA", "SMCI", "META", "AAPL", "APP", "ARM", "CRWD",
     "WDC", "MSFT", "LRCX", "JPM", "FCX", "OXY", "LLY", "CLF", "HIMS", "TEM",
 ]
+# Low-priced, liquid names a small ($5K) account can actually size: ~$3-50, so
+# meaningful share counts fit the 0.5%-risk / 20%-position math (unlike $500-1000
+# core names where 1 share is already 10-20% of equity). Spans fintech / EV /
+# airlines / miners / comms / banks. Pairs with min_price=2.0.
+LOWPRICE_UNIVERSE = [
+    "SOFI", "F", "NIO", "RIVN", "LCID", "PLUG", "RIOT", "MARA", "BBAI", "SOUN",
+    "IONQ", "AAL", "CCL", "SNAP", "PINS", "HOOD", "NU", "WBD", "INTC", "T",
+    "BAC", "PARA", "RGTI", "ACHR",
+]
+UNIVERSES = {"core": CORE_UNIVERSE, "lowprice": LOWPRICE_UNIVERSE}
 
 ATR_FLOOR_PCT = 0.0035
 COST_PCT = 0.0008
@@ -84,7 +94,9 @@ def _stats(returns) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Per-symbol expectancy report (research-only)")
-    parser.add_argument("symbols", nargs="*", help="symbols (default: core universe)")
+    parser.add_argument("symbols", nargs="*", help="symbols (overrides --universe)")
+    parser.add_argument("--universe", choices=list(UNIVERSES), default="core",
+                        help="core (the curated 20) or lowprice (sub-$50, $5K-account-friendly)")
     parser.add_argument("--days", type=int, default=180, help="lookback in days (default 180)")
     parser.add_argument("--end", default=None, help="window end YYYY-MM-DD (default today; OOS)")
     parser.add_argument("--timeframe", default="5Min")
@@ -97,7 +109,7 @@ def main() -> None:
     except Exception:
         pass
 
-    symbols = [s.strip().upper() for s in args.symbols] if args.symbols else CORE_UNIVERSE
+    symbols = [s.strip().upper() for s in args.symbols] if args.symbols else UNIVERSES[args.universe]
     end = datetime.strptime(args.end, "%Y-%m-%d") if args.end else datetime.now()
     start = (end - timedelta(days=args.days)).strftime("%Y-%m-%d")
     end_s = end.strftime("%Y-%m-%d")

@@ -117,7 +117,7 @@ def main() -> None:
                 pooled[(arm, w)] += r[arm]
 
     pf_hdr = "".join(f"PF@{int(c)}".rjust(8) for c in args.costs)
-    print(f"\n  {'ARM':<15}{'WINDOW':<11}{'N':>6}{'EXP':>10}{'WIN':>7}  {pf_hdr}")
+    print(f"\n  {'VARIANT':<15}{'WINDOW':<11}{'N':>6}{'EXP':>10}{'WIN':>7}  {pf_hdr}")
     print("  " + "-" * (49 + 8 * len(args.costs)))
     for arm in ARMS:
         for w in ("in-sample", "oos"):

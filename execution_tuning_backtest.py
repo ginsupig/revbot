@@ -1,19 +1,20 @@
-"""Exit ablation: which carries the edge -- the wider target or the trailing stop?
+"""Exit stop/target grid: do wider stops/targets fix "winners choked, losers stopped"?
 
-The execution-tuning run showed tuned (stop 1.2 / target 3.0 ATR + 1.5 ATR trail)
-robustly profitable in both windows out to ~8bps, vs baseline (tp 2.0, no trail)
-at ~3.5bps. But target and trail were changed together. This isolates them on the
-realistic live-occupancy sim (one position + symbol cooldown + loss-aware re-entry
-brake), so we know what to wire:
+The trailing stop is the validated edge (sl1.2/tp3.0/trail1.5). But every exit
+backtest fixed the STOP at 1.2 and only varied target/trail. Hypothesis: a 1.2 ATR
+stop knocks reversion entries out early on noise (losers stop too soon), and a
+3.0 target still caps winners. This is a 2x2 on stop (1.2 vs 1.5) x target (3.0 vs
+3.5), all with the validated 1.5 ATR trail, on the realistic live-occupancy sim
+(one position + symbol cooldown + loss-aware re-entry brake):
 
-  baseline   : stop 1.2 / target 2.0, no trail   (the audit config)
-  tp3_only   : stop 1.2 / target 3.0, no trail   (wider target alone)
-  trail_only : stop 1.2 / target 2.0 + 1.5 trail (trailing alone)
-  tuned      : stop 1.2 / target 3.0 + 1.5 trail (both)
+  sl1.2_tp3.0 : current validated
+  sl1.5_tp3.0 : wider stop only      (fewer premature stop-outs?)
+  sl1.2_tp3.5 : wider target only    (winners run further?)
+  sl1.5_tp3.5 : both wider           (the proposed config)
 
-For each config x window it prints gross expectancy and PF at a cost sweep, so the
-component that moves breakeven is obvious. (Limit entry was dropped: it caused
-adverse selection -- filled the losers, missed the bounces.) Research-only.
+For each config x window it prints N / gross expectancy / win / PF at a cost
+sweep. A wider stop trades a higher win rate (fewer noise stop-outs) for a bigger
+average loss when it IS a knife — watch whether net EXP/PF improves. Research-only.
 
 Usage:
     python execution_tuning_backtest.py --days 180
@@ -41,12 +42,15 @@ ATR_FLOOR_PCT = 0.0035
 HOLD = 78
 COOLDOWN_BARS, LOSS_COOLDOWN_BARS = 6, 18
 
-# (stop_atr, target_atr, trail_atr or None)
+# (stop_atr, target_atr, trail_atr or None) — 2x2 on stop x target, all with the
+# validated 1.5 ATR trail. Tests the "winners choked / losers stopped early"
+# hypothesis: does a wider STOP (1.2 -> 1.5) cut premature stop-outs, and a wider
+# TARGET (3.0 -> 3.5) let winners run, vs the current validated sl1.2/tp3.0?
 CONFIGS = {
-    "baseline":   (1.20, 2.00, None),
-    "tp3_only":   (1.20, 3.00, None),
-    "trail_only": (1.20, 2.00, 1.50),
-    "tuned":      (1.20, 3.00, 1.50),
+    "sl1.2_tp3.0": (1.20, 3.00, 1.50),   # current validated
+    "sl1.5_tp3.0": (1.50, 3.00, 1.50),   # wider stop only
+    "sl1.2_tp3.5": (1.20, 3.50, 1.50),   # wider target only
+    "sl1.5_tp3.5": (1.50, 3.50, 1.50),   # proposed (both wider)
 }
 
 
@@ -136,10 +140,10 @@ def main() -> None:
                       (end - timedelta(days=args.days)).strftime(fmt)),
     }
     costs = [c / 10000.0 for c in args.costs]
-    print(f"Exit ablation (live occupancy, long) | universe={len(symbols)} | {args.timeframe}")
+    print(f"Exit stop/target grid (live occupancy, long) | universe={len(symbols)} | {args.timeframe}")
     print(f"  in-sample {windows['in-sample'][0]}->{windows['in-sample'][1]} | "
           f"oos {windows['oos'][0]}->{windows['oos'][1]}")
-    print("  baseline=tp2.0  tp3_only=tp3.0  trail_only=tp2.0+trail1.5  tuned=tp3.0+trail1.5")
+    print("  all configs use the validated 1.5 ATR trailing stop; sl/tp are ATR multiples")
 
     gross = {(c, w): [] for c in CONFIGS for w in windows}
     for sym in symbols:
@@ -159,21 +163,22 @@ def main() -> None:
                 gross[(cfg, w)] += _sim_gross(idx, high, low, close, atr_arr, sm, tm, trm)
 
     pf_hdr = "".join(f"PF@{int(c)}".rjust(8) for c in args.costs)
-    print(f"\n  {'CONFIG':<11}{'WINDOW':<11}{'N':>6}{'grossEXP':>10}{'WIN':>7}  {pf_hdr}")
+    print(f"\n  {'CONFIG':<13}{'WINDOW':<11}{'N':>6}{'grossEXP':>10}{'WIN':>7}  {pf_hdr}")
     print("  " + "-" * (45 + 8 * len(args.costs)))
     for cfg in CONFIGS:
         for w in ("in-sample", "oos"):
             arr = np.asarray(gross[(cfg, w)], dtype=float)
             if arr.size == 0:
-                print(f"  {cfg:<11}{w:<11}{0:>6}  (no trades)")
+                print(f"  {cfg:<13}{w:<11}{0:>6}  (no trades)")
                 continue
             pfs = "".join(f"{_pf(arr - c):>8.2f}" for c in costs)
-            print(f"  {cfg:<11}{w:<11}{arr.size:>6}{arr.mean()*100:>9.3f}%{(arr>0).mean()*100:>6.1f}%  {pfs}")
+            print(f"  {cfg:<13}{w:<11}{arr.size:>6}{arr.mean()*100:>9.3f}%{(arr>0).mean()*100:>6.1f}%  {pfs}")
         print()
 
-    print("  Compare tp3_only and trail_only vs baseline and tuned: if tuned ~ tp3_only,")
-    print("  the target carries it; if tuned ~ trail_only, the trail does; if both lift and")
-    print("  tuned is best, they're complementary -> wire both.")
+    print("  Read sl1.5_tp3.5 vs sl1.2_tp3.0 (current): a higher WIN rate on the wider")
+    print("  stop means fewer premature stop-outs; what matters is whether net EXP/PF")
+    print("  improves in BOTH windows. Compare the two sl rows at fixed tp to isolate the")
+    print("  stop's effect. If a config wins both windows surviving cost, we wire it.")
 
 
 if __name__ == "__main__":

@@ -56,16 +56,23 @@ UNIVERSES["watchlist"] = WATCHLIST_UNIVERSE
 
 ATR_FLOOR_PCT = 0.0035
 COST_PCT = 0.0008
-STD = dict(stop=1.20, target=2.00, hold=78)
+# The TUNED exit (validated): stop 1.2 / target 3.5 ATR + 1.5 ATR trailing stop.
+# Was the choked baseline (1.2/2.0, no trail), which understated every name — the
+# allowlist should be ranked on the exit the bot actually runs.
+STD = dict(stop=1.20, target=3.50, trail=1.50, hold=78)
 
 
 def _outcome(high, low, close, i, entry, atr, br) -> float:
-    stop = entry - atr * br["stop"]
+    init_stop = entry - atr * br["stop"]
     target = entry + atr * br["target"]
+    trail_dist = atr * br["trail"] if br.get("trail") else None
+    highest = high[i]
     end = min(i + br["hold"], len(close) - 1)
     for j in range(i + 1, end + 1):
-        if low[j] <= stop:
-            return (stop / entry - 1.0) - COST_PCT
+        highest = max(highest, high[j])
+        cur_stop = init_stop if trail_dist is None else max(init_stop, highest - trail_dist)
+        if low[j] <= cur_stop:
+            return (cur_stop / entry - 1.0) - COST_PCT
         if high[j] >= target:
             return (target / entry - 1.0) - COST_PCT
     return (close[end] / entry - 1.0) - COST_PCT
@@ -152,7 +159,7 @@ def main() -> None:
     traded = [s for _, s in rows if s["n"] > 0]
     total = _stats(all_returns)
     print(f"Per-symbol expectancy | symbols={len(symbols)} | {start}->{end_s} | {args.timeframe}")
-    print(f"  (engine LONG_REVERSION, fully filtered, standard bracket — pre market-regime gate)")
+    print(f"  (engine LONG_REVERSION, fully filtered, TUNED exit: stop1.2/target3.5/trail1.5 — pre market-regime gate)")
     print(f"\n  {'SYMBOL':<8}{'N':>6}{'NET':>10}{'EXP':>10}{'PF':>7}{'WIN':>8}  FLAG")
     print(f"  {'-'*8:<8}{'-'*5:>6}{'-'*9:>10}{'-'*9:>10}{'-'*6:>7}{'-'*7:>8}  ----")
     for sym, s in rows:

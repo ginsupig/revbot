@@ -633,7 +633,7 @@ async def main():
         min_rr=float(os.getenv("MIN_RR", 1.5)),
         # Per-style ATR stop/target multiples.
         stop_atr_multiple=float(os.getenv("STOP_ATR_MULTIPLE", 1.20)),
-        target_atr_multiple=float(os.getenv("TARGET_ATR_MULTIPLE", 3.00)),
+        target_atr_multiple=float(os.getenv("TARGET_ATR_MULTIPLE", 3.50)),
         trail_atr_multiple=float(os.getenv("TRAIL_ATR_MULTIPLE", 1.50)),
         trend_stop_atr_multiple=float(os.getenv("TREND_STOP_ATR_MULTIPLE", 1.20)),
         trend_target_atr_multiple=float(os.getenv("TREND_TARGET_ATR_MULTIPLE", 3.00)),

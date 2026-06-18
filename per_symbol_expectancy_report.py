@@ -45,6 +45,14 @@ LOWPRICE_UNIVERSE = [
     "BAC", "PARA", "RGTI", "ACHR",
 ]
 UNIVERSES = {"core": CORE_UNIVERSE, "lowprice": LOWPRICE_UNIVERSE}
+# The live TRADE_WATCHLIST (.env) — run this to pick TRADE_ALLOWLIST from names
+# with positive reversion expectancy in BOTH windows, instead of by hand.
+WATCHLIST_UNIVERSE = [
+    "ASTS", "MU", "AMD", "NVDA", "SMCI", "META", "APP", "ARM", "CRWD", "MSFT",
+    "LRCX", "FCX", "OXY", "CLF", "HIMS", "WDC", "COIN", "ADI", "AMAT", "TSLA",
+    "IONQ",
+]
+UNIVERSES["watchlist"] = WATCHLIST_UNIVERSE
 
 ATR_FLOOR_PCT = 0.0035
 COST_PCT = 0.0008

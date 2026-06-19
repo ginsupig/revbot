@@ -195,6 +195,48 @@ def run_realtime_scorer(symbol_bars, spy_bars, sector_of=None, sector_bars=None,
     return evaluate_sweep(research, holdout)
 
 
+def compare_gate(symbol_bars, spy_bars, sector_of=None, sector_bars=None,
+                 profiles=PROFILES, lookbacks=(20, 60), ks=(3, 5), rsi_max=45.0,
+                 holdout_frac=0.25) -> "tuple[PipelineResult, PipelineResult]":
+    """Run the identical sweep with the SPY regime gate ON and OFF. The pair is the
+    cheap diagnostic for whether the gate is the binding constraint (and thus whether
+    an HMM regime upgrade is worth building) — see ``gate_diagnosis``."""
+    on = run_realtime_scorer(symbol_bars, spy_bars, sector_of, sector_bars,
+                             profiles, lookbacks, ks, rsi_max, True, holdout_frac)
+    off = run_realtime_scorer(symbol_bars, spy_bars, sector_of, sector_bars,
+                              profiles, lookbacks, ks, rsi_max, False, holdout_frac)
+    return on, off
+
+
+def gate_diagnosis(on: PipelineResult, off: PipelineResult) -> str:
+    """One-line read of the gate-on vs gate-off comparison: does the regime gate
+    bind, and is an HMM upgrade justified?"""
+    on_ok = on.verdict.startswith("DEPLOY")
+    off_ok = off.verdict.startswith("DEPLOY")
+    if off_ok and not on_ok:
+        return ("DIAGNOSIS: gate-off clears but gate-on does not -> the SMA regime gate is "
+                "the weak link. An HMM (filtered, causal) regime upgrade is justified now.")
+    if on_ok and off_ok:
+        return ("DIAGNOSIS: both clear -> ship gate-on; a fancier (HMM) gate is premature "
+                "optimization. The regime input is not the bottleneck.")
+    if on_ok and not off_ok:
+        return ("DIAGNOSIS: gate-on clears, gate-off does not -> the regime gate is already "
+                "earning its keep. Keep the SMA gate; HMM is optional polish, not a blocker.")
+    return ("DIAGNOSIS: neither clears -> the edge is not in the regime input. A fancier gate "
+            "won't save it; diagnose the factors/weights (or conclude no edge) instead.")
+
+
+def format_gate_comparison(on: PipelineResult, off: PipelineResult) -> str:
+    def _line(tag, r):
+        ho = r.holdout or {}
+        return (f"  [{tag:>8}] {r.verdict}\n"
+                f"             best={r.chosen} deflated={r.deflated_sharpe:+.3f} "
+                f"breakeven={r.breakeven_bps:.1f}bps "
+                f"holdout(n={ho.get('n', 0)} mean={ho.get('mean', 0) * 100:.3f}% "
+                f"PF={ho.get('pf', 0):.2f})")
+    return "\n".join([_line("gate ON", on), _line("gate OFF", off), "", gate_diagnosis(on, off)])
+
+
 # Default S&P sector map for the live watchlist + the sector ETFs to fetch. Used
 # only by the CLI; the core takes these injected so tests need no broker.
 SECTOR_ETFS = ["XLK", "XLF", "XLE", "XLV", "XLY", "XLI", "XLC", "XLB", "XLP", "XLU"]
@@ -217,6 +259,8 @@ def main() -> None:
     p.add_argument("--lookbacks", type=int, nargs="*", default=[20, 60])
     p.add_argument("--ks", type=int, nargs="*", default=[3, 5])
     p.add_argument("--no-regime-gate", action="store_true")
+    p.add_argument("--compare-gate", action="store_true",
+                   help="run the identical sweep gate ON vs OFF and print the diagnosis")
     p.add_argument("--no-sector", action="store_true")
     p.add_argument("--holdout", type=float, default=0.25)
     args = p.parse_args()
@@ -249,14 +293,22 @@ def main() -> None:
     sector_bars = None if args.no_sector else {e: b for e in SECTOR_ETFS
                                                if (b := _fetch(e)) is not None}
     n_cfg = len(PROFILES) * len(args.lookbacks) * len(args.ks)
+    sec_of = None if args.no_sector else SECTOR_OF
     print(f"Real-time scorer | {len(symbol_bars)}/{len(symbols)} names | {start}->{end_s} | "
           f"{args.timeframe} | profiles={list(PROFILES)} lb={args.lookbacks} K={args.ks} "
-          f"({n_cfg} configs) | regime_gate={not args.no_regime_gate} | holdout={args.holdout:.0%}")
-    res = run_realtime_scorer(
-        symbol_bars, spy_bars, None if args.no_sector else SECTOR_OF, sector_bars,
-        PROFILES, args.lookbacks, args.ks, regime_gate=not args.no_regime_gate,
-        holdout_frac=args.holdout)
-    print("\n" + format_report(res))
+          f"({n_cfg} configs) | holdout={args.holdout:.0%}"
+          + (" | COMPARE gate on/off" if args.compare_gate else
+             f" | regime_gate={not args.no_regime_gate}"))
+    if args.compare_gate:
+        on, off = compare_gate(symbol_bars, spy_bars, sec_of, sector_bars,
+                               PROFILES, args.lookbacks, args.ks,
+                               holdout_frac=args.holdout)
+        print("\n" + format_gate_comparison(on, off))
+    else:
+        res = run_realtime_scorer(
+            symbol_bars, spy_bars, sec_of, sector_bars, PROFILES, args.lookbacks,
+            args.ks, regime_gate=not args.no_regime_gate, holdout_frac=args.holdout)
+        print("\n" + format_report(res))
 
 
 if __name__ == "__main__":

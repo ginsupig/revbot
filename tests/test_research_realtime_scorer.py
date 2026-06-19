@@ -7,7 +7,8 @@ import pandas as pd
 
 from research.realtime_scorer import (
     _zscore, _trailing_ret_by_ord, _trend_on_by_ord, _candidates,
-    score_sweep, run_realtime_scorer, PROFILES,
+    score_sweep, run_realtime_scorer, compare_gate, gate_diagnosis,
+    format_gate_comparison, PROFILES,
 )
 from research.pipeline import PipelineResult
 
@@ -126,3 +127,42 @@ def test_sector_factor_injected_optional():
                               profiles={"sector_rs": PROFILES["sector_rs"]},
                               lookbacks=[20], ks=[1], regime_gate=True)
     assert research.get("sector_rs_lb20_K1", np.array([])).size > 0
+
+
+# --- gate-on vs gate-off comparison (the 1-before-2 diagnostic) ----------------
+
+def _result(deploy: bool, mean=0.01, n=200) -> PipelineResult:
+    verdict = "DEPLOY-CANDIDATE: ..." if deploy else "REJECT: failed on the untouched holdout"
+    return PipelineResult(chosen="balanced_lb20_K3", n_trials=20, research_sharpe=0.3,
+                          deflated_sharpe=0.1 if deploy else -0.1, passed_gate=deploy,
+                          robust=deploy, holdout=dict(n=n, mean=mean, pf=1.4),
+                          breakeven_bps=mean * 10000, verdict=verdict)
+
+
+def test_gate_diagnosis_off_only_justifies_hmm():
+    msg = gate_diagnosis(_result(False), _result(True))
+    assert "weak link" in msg and "HMM" in msg and "justified" in msg
+
+
+def test_gate_diagnosis_both_clear_hmm_premature():
+    msg = gate_diagnosis(_result(True), _result(True))
+    assert "both clear" in msg and "premature" in msg
+
+
+def test_gate_diagnosis_on_only_keep_gate():
+    msg = gate_diagnosis(_result(True), _result(False))
+    assert "earning its keep" in msg.lower() or "keep the sma gate" in msg.lower()
+
+
+def test_gate_diagnosis_neither_clears_not_regime():
+    msg = gate_diagnosis(_result(False), _result(False))
+    assert "neither clears" in msg and "not in the regime" in msg
+
+
+def test_compare_gate_runs_both_and_formats():
+    symbol_bars, spy, _ = _panel()
+    on, off = compare_gate(symbol_bars, spy, lookbacks=[20], ks=[2],
+                           profiles={"balanced": PROFILES["balanced"]})
+    assert isinstance(on, PipelineResult) and isinstance(off, PipelineResult)
+    txt = format_gate_comparison(on, off)
+    assert "gate ON" in txt and "gate OFF" in txt and "DIAGNOSIS" in txt

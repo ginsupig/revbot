@@ -18,6 +18,7 @@ Framework-agnostic by design: VectorBT/Backtrader are swappable backends; the
 gates here are what keep the search honest (see CLAUDE.md).
 """
 from .walk_forward import holdout_split, walk_forward_windows
+from .mc_reshuffle import block_bootstrap_paths, mc_reshuffle_stats
 from .selection import (
     norm_ppf,
     expected_max_sharpe,
@@ -30,4 +31,5 @@ __all__ = [
     "holdout_split", "walk_forward_windows",
     "norm_ppf", "expected_max_sharpe", "deflated_sharpe",
     "passes_overfit_gate", "robust_across_folds",
+    "block_bootstrap_paths", "mc_reshuffle_stats",
 ]

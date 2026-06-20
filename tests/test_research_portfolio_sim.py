@@ -7,7 +7,7 @@ import pandas as pd
 
 from research.portfolio_sim import (
     Entry, build_entries, build_closes, simulate_portfolio, run_portfolio_sim, format_sim,
-    compare_sizing, format_sizing_comparison, SIZING_GRID,
+    compare_sizing, format_sizing_comparison, SIZING_GRID, grid_sweep, format_grid,
 )
 
 
@@ -163,3 +163,29 @@ def test_format_sizing_comparison_renders_frontier():
     entries = [_E(0, 1, 0.05, "AAA", 5.0, atr_pct=0.03)]
     txt = format_sizing_comparison(compare_sizing(entries, None, 4), 4)
     assert "sizing frontier" in txt and "RET/DD" in txt and "equal" in txt
+
+
+# --- 2-D cap x risk-budget grid ----------------------------------------------
+
+def test_grid_sweep_covers_the_cartesian_product():
+    entries = [_E(0, 1, 0.04, f"S{i}", float(i), atr_pct=0.03) for i in range(8)]
+    caps, rps = [2, 4], [0.005, 0.01, 0.02]
+    grid = grid_sweep(entries, None, caps, rps)
+    assert set(grid) == {(c, r) for c in caps for r in rps}
+    for s in grid.values():
+        assert "mtm_max_drawdown" in s and s["sizing"] == "risk"
+
+
+def test_grid_more_slots_take_more_trades():
+    # 8 names entering day 0; cap 4 takes more than cap 2 (occupancy, not sizing).
+    entries = [_E(0, 5, 0.02, f"S{i}", float(i)) for i in range(8)]
+    grid = grid_sweep(entries, None, [2, 4], [0.01])
+    assert grid[(4, 0.01)]["n_trades"] > grid[(2, 0.01)]["n_trades"]
+
+
+def test_format_grid_renders_three_matrices():
+    entries = [_E(0, 1, 0.04, f"S{i}", float(i), atr_pct=0.03) for i in range(6)]
+    caps, rps = [2, 4], [0.005, 0.01, 0.02]
+    txt = format_grid(grid_sweep(entries, None, caps, rps), caps, rps)
+    assert "RET/DD" in txt and "RETURN %" in txt and "MTM DRAWDOWN %" in txt
+    assert "cap\\risk" in txt

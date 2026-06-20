@@ -135,3 +135,23 @@ def test_run_daily_ranker_empty_when_no_setups():
     res = run_daily_ranker({"X": bars}, windows=[20], ks=[1], thresholds=[0.0],
                            setups_fn=_none)
     assert res.chosen is None and "empty" in res.verdict.lower()
+
+
+def test_entry_lag_removes_same_bar_bounce():
+    # Construct a single signal bar that closes at its LOW (a bid-side print), then
+    # the next bar OPENS back up. Close-entry (lag 0) books the bounce; next-bar-open
+    # entry (lag 1) pays the higher open and the artifact disappears.
+    import numpy as np
+    # bars: indices 0..3. signal at i=1 closes low (100), next bar opens at 108.
+    high  = np.array([110.0, 101.0, 109.0, 109.0])
+    low   = np.array([100.0, 100.0, 107.0, 107.0])
+    close = np.array([105.0, 100.0, 108.0, 108.0])
+    openp = np.array([105.0, 101.0, 108.0, 108.0])   # bar i=2 opens at 108
+    atr   = np.array([2.0, 2.0, 2.0, 2.0])
+    exit = dict(stop=1.2, target=3.5, trail=1.5, hold=2)
+    # lag 0: enter at close[1]=100 -> by bar 2 high 109 hits a +x move -> positive
+    r0 = setup_outcomes(high, low, close, atr, [1], exit, openp, 0)
+    # lag 1: enter at open[2]=108 (the bounce already happened) -> not the same edge
+    r1 = setup_outcomes(high, low, close, atr, [1], exit, openp, 1)
+    assert r0 and r1
+    assert r0[0][2] > r1[0][2]            # close-entry overstates vs next-bar-open

@@ -175,6 +175,46 @@ def run_portfolio_sim(symbol_bars, max_positions=4, rsi_max=45.0, sizing="equal"
                               build_closes(symbol_bars), max_positions, sizing)
 
 
+# Sizing frontier: equal-weight (the return ceiling, no vol scaling) vs ATR-risk at
+# a rising risk budget. ATR-risk sizes notional ~ 1/ATR, so it underweights the
+# high-vol deep-dip winners; raising risk_pct scales THEM up first (low-vol names
+# are already pinned at max_pos_frac), tracing return vs drawdown to find the knee.
+SIZING_GRID = [("equal", 0.0), ("risk", 0.005), ("risk", 0.0075),
+               ("risk", 0.01), ("risk", 0.015), ("risk", 0.02)]
+
+
+def compare_sizing(entries, closes_by_ord, max_positions=4, grid=SIZING_GRID,
+                   stop_atr_mult=1.2, max_pos_frac=0.20) -> list:
+    """``[(label, stats)]`` for each (mode, risk_pct) in ``grid`` at a fixed cap —
+    the return/drawdown frontier across sizing aggressiveness."""
+    rows = []
+    for mode, rp in grid:
+        stats = simulate_portfolio(entries, closes_by_ord, max_positions, mode,
+                                   rp or 0.005, stop_atr_mult, max_pos_frac)
+        label = "equal" if mode == "equal" else f"risk@{rp*100:g}%"
+        rows.append((label, stats))
+    return rows
+
+
+def _ret_dd(stats) -> float:
+    dd = stats["mtm_max_drawdown"]
+    return stats["total_return"] / abs(dd) if dd < 0 else float("inf")
+
+
+def format_sizing_comparison(rows, max_positions: int) -> str:
+    lines = [f"  sizing frontier @ max_positions={max_positions} (MTM drawdown, compounding)",
+             f"  {'SIZING':<11}{'RETURN':>9}{'MTM_DD':>9}{'SHARPE':>8}{'RET/DD':>8}{'TRADES':>8}",
+             "  " + "-" * 51]
+    for label, s in rows:
+        lines.append(f"  {label:<11}{s['total_return']*100:>8.1f}%{s['mtm_max_drawdown']*100:>8.1f}%"
+                     f"{s['sharpe']:>8.3f}{_ret_dd(s):>8.1f}{s['n_trades']:>8}")
+    lines += ["",
+              "  equal = return ceiling (no vol scaling). Rising risk@% adds budget to the",
+              "  high-vol deep-dip names ATR-risk underweights — watch where RET/DD peaks:",
+              "  that knee recovers return without paying it all back in drawdown."]
+    return "\n".join(lines)
+
+
 def format_sim(stats: dict, max_positions: int) -> str:
     return "\n".join([
         f"  max_positions  : {max_positions} (one per symbol, {stats['sizing']} sizing, compounding)",
@@ -200,6 +240,9 @@ def main() -> None:
                    help="open-position cap(s) to sweep (live default 4)")
     p.add_argument("--sizing", choices=["equal", "risk"], default="risk",
                    help="equal = equity/N; risk = live ATR-risk model (default)")
+    p.add_argument("--compare-sizing", action="store_true",
+                   help="sweep equal vs ATR-risk at rising risk_pct (the return/DD "
+                        "frontier) at the first --max-positions cap")
     p.add_argument("--risk-pct", type=float, default=0.005)
     p.add_argument("--stop-atr", type=float, default=1.2)
     p.add_argument("--max-pos-frac", type=float, default=0.20)
@@ -236,6 +279,12 @@ def main() -> None:
     entries = build_entries(symbol_bars, args.rsi_max)
     closes = build_closes(symbol_bars)
     print(f"  {len(entries)} reversion candidates across the window\n")
+    if args.compare_sizing:
+        n = args.max_positions[0]
+        rows = compare_sizing(entries, closes, n, stop_atr_mult=args.stop_atr,
+                              max_pos_frac=args.max_pos_frac)
+        print(format_sizing_comparison(rows, n))
+        return
     for n in args.max_positions:
         stats = simulate_portfolio(entries, closes, n, args.sizing,
                                    args.risk_pct, args.stop_atr, args.max_pos_frac)

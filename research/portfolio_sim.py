@@ -215,6 +215,43 @@ def format_sizing_comparison(rows, max_positions: int) -> str:
     return "\n".join(lines)
 
 
+def grid_sweep(entries, closes_by_ord, caps, risk_pcts,
+               stop_atr_mult=1.2, max_pos_frac=0.20) -> dict:
+    """``{(cap, risk_pct): stats}`` over the position-cap x risk-budget grid — the
+    two knobs interact (more slots vs more per-trade budget both add exposure, but
+    differently against the position cap), so the best risk/return point is 2-D."""
+    out = {}
+    for cap in caps:
+        for rp in risk_pcts:
+            out[(cap, rp)] = simulate_portfolio(entries, closes_by_ord, cap, "risk",
+                                                rp, stop_atr_mult, max_pos_frac)
+    return out
+
+
+def _grid_matrix(title, caps, risk_pcts, grid, cell) -> str:
+    head = "  cap\\risk" + "".join(f"{rp*100:>8g}%" for rp in risk_pcts)
+    lines = [f"  {title}", head]
+    for cap in caps:
+        lines.append(f"  {cap:>7} " + "".join(f"{cell(grid[(cap, rp)]):>9}" for rp in risk_pcts))
+    return "\n".join(lines)
+
+
+def format_grid(grid, caps, risk_pcts) -> str:
+    blocks = [
+        _grid_matrix("RET/DD  (return / MTM drawdown — the decision metric)", caps, risk_pcts,
+                     grid, lambda s: f"{_ret_dd(s):.1f}"),
+        _grid_matrix("RETURN %", caps, risk_pcts, grid,
+                     lambda s: f"{s['total_return']*100:.1f}"),
+        _grid_matrix("MTM DRAWDOWN %", caps, risk_pcts, grid,
+                     lambda s: f"{s['mtm_max_drawdown']*100:.1f}"),
+    ]
+    return ("\n\n".join(blocks) + "\n\n"
+            "  Pick the (cap, risk%) with the best RET/DD that ALSO holds on the other\n"
+            "  window — the robust cell, not either window's peak. More slots and more\n"
+            "  risk% both add exposure, but risk% pins low-vol names to the position cap\n"
+            "  first, so the two are not interchangeable.")
+
+
 def format_sim(stats: dict, max_positions: int) -> str:
     return "\n".join([
         f"  max_positions  : {max_positions} (one per symbol, {stats['sizing']} sizing, compounding)",
@@ -243,6 +280,12 @@ def main() -> None:
     p.add_argument("--compare-sizing", action="store_true",
                    help="sweep equal vs ATR-risk at rising risk_pct (the return/DD "
                         "frontier) at the first --max-positions cap")
+    p.add_argument("--grid-sweep", action="store_true",
+                   help="2-D sweep: --max-positions x --risk-grid, printing RET/DD, "
+                        "return and drawdown matrices (the cap x budget tradeoff)")
+    p.add_argument("--risk-grid", type=float, nargs="*",
+                   default=[0.005, 0.0075, 0.01, 0.015, 0.02],
+                   help="risk_pct values for --grid-sweep")
     p.add_argument("--risk-pct", type=float, default=0.005)
     p.add_argument("--stop-atr", type=float, default=1.2)
     p.add_argument("--max-pos-frac", type=float, default=0.20)
@@ -279,6 +322,11 @@ def main() -> None:
     entries = build_entries(symbol_bars, args.rsi_max)
     closes = build_closes(symbol_bars)
     print(f"  {len(entries)} reversion candidates across the window\n")
+    if args.grid_sweep:
+        grid = grid_sweep(entries, closes, args.max_positions, args.risk_grid,
+                          stop_atr_mult=args.stop_atr, max_pos_frac=args.max_pos_frac)
+        print(format_grid(grid, args.max_positions, args.risk_grid))
+        return
     if args.compare_sizing:
         n = args.max_positions[0]
         rows = compare_sizing(entries, closes, n, stop_atr_mult=args.stop_atr,

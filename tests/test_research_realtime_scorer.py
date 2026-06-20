@@ -241,6 +241,20 @@ def test_liquid_filter_screens_price_and_volume():
     assert liquid_filter(_bars(np.full(10, 100.0), dates[:10])) is False
 
 
+def test_liquid_filter_is_timeframe_invariant():
+    # same DAILY dollar volume ($100M/day) on daily vs 5Min bars must give the same
+    # verdict — the per-bar $ vol on 5Min must not be compared to a daily floor.
+    days = pd.date_range("2025-01-01", periods=40, freq="D")
+    daily = _bars(np.full(40, 100.0), days)
+    daily["volume"] = np.full(40, 1e6)                  # $100M/day
+    assert liquid_filter(daily, min_dollar_vol=20e6) is True
+    # 5Min: 78 bars/day x 40 days, each bar 1/78 of the day's volume -> same daily $vol
+    intraday_ts = pd.date_range("2025-01-02 09:30", periods=78 * 40, freq="5min")
+    intra = _bars(np.full(78 * 40, 100.0), intraday_ts)
+    intra["volume"] = np.full(78 * 40, 1e6 / 78)        # sums to 1e6/day
+    assert liquid_filter(intra, min_dollar_vol=20e6) is True   # was False before the fix
+
+
 def test_neutral_universe_is_broad_and_mapped():
     # survivorship control: many names, all 11 SPDR sectors, includes laggards
     assert len(NEUTRAL_SECTOR_OF) >= 60

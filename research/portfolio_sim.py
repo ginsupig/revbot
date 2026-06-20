@@ -108,11 +108,22 @@ def _curve_stats(realized, mtm, n_trades, n_skipped, sizing) -> dict:
 
 
 def simulate_portfolio(entries, closes_by_ord=None, max_positions=4, sizing="equal",
-                       risk_pct=0.005, stop_atr_mult=1.2, max_pos_frac=0.20) -> dict:
+                       risk_pct=0.005, stop_atr_mult=1.2, max_pos_frac=0.20,
+                       max_total_exposure=None, max_portfolio_heat=None) -> dict:
     """Walk the calendar holding <= ``max_positions`` positions, one per symbol,
     filling free slots by score (desc). ``sizing`` 'equal' = equity/N, 'risk' =
     live ATR-risk model. With ``closes_by_ord`` the open book is marked to market
-    daily so the drawdown reflects intra-hold troughs, not just realized exits."""
+    daily so the drawdown reflects intra-hold troughs, not just realized exits.
+
+    Live governor constraints, off (None) by default so unit tests are unaffected,
+    set to live values by the CLI:
+      * ``max_total_exposure`` — sum of open notionals as a fraction of equity
+        (live MAX_TOTAL_EXPOSURE_PCT=0.95). Blocks the leverage a high cap x risk%
+        cell would otherwise imply.
+      * ``max_portfolio_heat`` — sum of open risk-to-stop as a fraction of equity
+        (live MAX_PORTFOLIO_HEAT_PCT=0.02). This is why risk_pct can't be raised
+        without raising the heat cap in lockstep: 4 x 1.5% = 6% heat >> 2%.
+    """
     entries = [e if isinstance(e, Entry) else Entry(*e) for e in entries]
     if not entries:
         return dict(sizing=sizing, n_trades=0, n_skipped=0, max_drawdown=0.0,
@@ -148,13 +159,24 @@ def simulate_portfolio(entries, closes_by_ord=None, max_positions=4, sizing="equ
             if e.sym in held:
                 n_skipped += 1
                 continue
-            notional = _notional_frac(e, sizing, max_positions, risk_pct,
-                                      stop_atr_mult, max_pos_frac) * equity
+            nf = _notional_frac(e, sizing, max_positions, risk_pct, stop_atr_mult, max_pos_frac)
+            notional = nf * equity
+            pos_heat = nf * (stop_atr_mult * e.atr_pct) * equity   # dollar risk to stop
+            # live governor caps: total exposure and portfolio heat
+            if max_total_exposure is not None:
+                if sum(p["notional"] for p in open_pos) + notional > max_total_exposure * equity:
+                    n_skipped += 1
+                    continue
+            if max_portfolio_heat is not None:
+                if sum(p["heat"] for p in open_pos) + pos_heat > max_portfolio_heat * equity:
+                    n_skipped += 1
+                    continue
             if e.exit_ord <= d:                      # same-day exit: realize at once
                 equity += notional * e.ret
             else:
                 open_pos.append(dict(exit=e.exit_ord, notional=notional, ret=e.ret,
-                                     sym=e.sym, entry_price=e.entry_price, mark=0.0))
+                                     sym=e.sym, entry_price=e.entry_price, mark=0.0,
+                                     heat=pos_heat))
                 held.add(e.sym)
             n_trades += 1
         # 3) mark open book to market for the MTM curve
@@ -184,13 +206,15 @@ SIZING_GRID = [("equal", 0.0), ("risk", 0.005), ("risk", 0.0075),
 
 
 def compare_sizing(entries, closes_by_ord, max_positions=4, grid=SIZING_GRID,
-                   stop_atr_mult=1.2, max_pos_frac=0.20) -> list:
+                   stop_atr_mult=1.2, max_pos_frac=0.20,
+                   max_total_exposure=None, max_portfolio_heat=None) -> list:
     """``[(label, stats)]`` for each (mode, risk_pct) in ``grid`` at a fixed cap —
     the return/drawdown frontier across sizing aggressiveness."""
     rows = []
     for mode, rp in grid:
         stats = simulate_portfolio(entries, closes_by_ord, max_positions, mode,
-                                   rp or 0.005, stop_atr_mult, max_pos_frac)
+                                   rp or 0.005, stop_atr_mult, max_pos_frac,
+                                   max_total_exposure, max_portfolio_heat)
         label = "equal" if mode == "equal" else f"risk@{rp*100:g}%"
         rows.append((label, stats))
     return rows
@@ -215,16 +239,19 @@ def format_sizing_comparison(rows, max_positions: int) -> str:
     return "\n".join(lines)
 
 
-def grid_sweep(entries, closes_by_ord, caps, risk_pcts,
-               stop_atr_mult=1.2, max_pos_frac=0.20) -> dict:
+def grid_sweep(entries, closes_by_ord, caps, risk_pcts, stop_atr_mult=1.2,
+               max_pos_frac=0.20, max_total_exposure=None, max_portfolio_heat=None) -> dict:
     """``{(cap, risk_pct): stats}`` over the position-cap x risk-budget grid — the
     two knobs interact (more slots vs more per-trade budget both add exposure, but
-    differently against the position cap), so the best risk/return point is 2-D."""
+    differently against the position cap), so the best risk/return point is 2-D.
+    With the live exposure/heat caps passed, unreachable (leveraged/over-heat) cells
+    are throttled exactly as the governor would."""
     out = {}
     for cap in caps:
         for rp in risk_pcts:
-            out[(cap, rp)] = simulate_portfolio(entries, closes_by_ord, cap, "risk",
-                                                rp, stop_atr_mult, max_pos_frac)
+            out[(cap, rp)] = simulate_portfolio(entries, closes_by_ord, cap, "risk", rp,
+                                                stop_atr_mult, max_pos_frac,
+                                                max_total_exposure, max_portfolio_heat)
     return out
 
 
@@ -246,10 +273,11 @@ def format_grid(grid, caps, risk_pcts) -> str:
                      lambda s: f"{s['mtm_max_drawdown']*100:.1f}"),
     ]
     return ("\n\n".join(blocks) + "\n\n"
-            "  Pick the (cap, risk%) with the best RET/DD that ALSO holds on the other\n"
-            "  window — the robust cell, not either window's peak. More slots and more\n"
-            "  risk% both add exposure, but risk% pins low-vol names to the position cap\n"
-            "  first, so the two are not interchangeable.")
+            "  With the live exposure (95%) + heat (2%) caps applied, unreachable cells are\n"
+            "  throttled by the governor (heat binds first: 4 x 1.5% = 6% >> 2%, so high\n"
+            "  risk% cells quietly hold fewer names). Pick the (cap, risk%) with the best\n"
+            "  RET/DD that holds on BOTH windows — the robust, live-reachable cell. To run a\n"
+            "  cap x risk% that needs more heat, you must raise --max-heat in lockstep.")
 
 
 def format_sim(stats: dict, max_positions: int) -> str:
@@ -288,7 +316,12 @@ def main() -> None:
                    help="risk_pct values for --grid-sweep")
     p.add_argument("--risk-pct", type=float, default=0.005)
     p.add_argument("--stop-atr", type=float, default=1.2)
-    p.add_argument("--max-pos-frac", type=float, default=0.20)
+    p.add_argument("--max-pos-frac", type=float, default=0.20,
+                   help="per-position cap (live MAX_POSITION_VALUE_PCT)")
+    p.add_argument("--max-total-exposure", type=float, default=0.95,
+                   help="sum-of-notionals cap (live MAX_TOTAL_EXPOSURE_PCT); 0 = off")
+    p.add_argument("--max-heat", type=float, default=0.02,
+                   help="portfolio heat cap = sum risk-to-stop (live MAX_PORTFOLIO_HEAT_PCT); 0 = off")
     p.add_argument("--rsi-max", type=float, default=45.0)
     p.add_argument("--min-price", type=float, default=5.0)
     p.add_argument("--min-dollar-vol", type=float, default=20e6)
@@ -321,21 +354,26 @@ def main() -> None:
           f"{start}->{end_s} | {args.timeframe} | sizing={args.sizing}")
     entries = build_entries(symbol_bars, args.rsi_max)
     closes = build_closes(symbol_bars)
-    print(f"  {len(entries)} reversion candidates across the window\n")
+    mte = args.max_total_exposure or None      # 0 -> off
+    heat = args.max_heat or None
+    print(f"  {len(entries)} reversion candidates across the window | "
+          f"caps: exposure<={args.max_total_exposure:g} heat<={args.max_heat:g} (live governor)\n")
     if args.grid_sweep:
         grid = grid_sweep(entries, closes, args.max_positions, args.risk_grid,
-                          stop_atr_mult=args.stop_atr, max_pos_frac=args.max_pos_frac)
+                          stop_atr_mult=args.stop_atr, max_pos_frac=args.max_pos_frac,
+                          max_total_exposure=mte, max_portfolio_heat=heat)
         print(format_grid(grid, args.max_positions, args.risk_grid))
         return
     if args.compare_sizing:
         n = args.max_positions[0]
         rows = compare_sizing(entries, closes, n, stop_atr_mult=args.stop_atr,
-                              max_pos_frac=args.max_pos_frac)
+                              max_pos_frac=args.max_pos_frac,
+                              max_total_exposure=mte, max_portfolio_heat=heat)
         print(format_sizing_comparison(rows, n))
         return
     for n in args.max_positions:
-        stats = simulate_portfolio(entries, closes, n, args.sizing,
-                                   args.risk_pct, args.stop_atr, args.max_pos_frac)
+        stats = simulate_portfolio(entries, closes, n, args.sizing, args.risk_pct,
+                                   args.stop_atr, args.max_pos_frac, mte, heat)
         print(format_sim(stats, n))
         print()
 

@@ -189,3 +189,40 @@ def test_format_grid_renders_three_matrices():
     txt = format_grid(grid_sweep(entries, None, caps, rps), caps, rps)
     assert "RET/DD" in txt and "RETURN %" in txt and "MTM DRAWDOWN %" in txt
     assert "cap\\risk" in txt
+
+
+# --- live governor caps (exposure + heat) ------------------------------------
+
+def test_heat_cap_throttles_high_risk_pct():
+    # high-vol names (atr_pct=0.08 -> stop 9.6%) so risk@1.5% does NOT hit the 20%
+    # position cap: realized heat ~1.5% apiece. At the 2% heat cap only 1 fits
+    # (2nd would be 3% > 2%); without the cap, all 4 fit.
+    entries = [_E(0, 10, 0.03, f"S{i}", float(i), price=100.0, atr_pct=0.08) for i in range(4)]
+    capped = simulate_portfolio(entries, None, max_positions=4, sizing="risk",
+                                risk_pct=0.015, max_portfolio_heat=0.02)
+    uncapped = simulate_portfolio(entries, None, max_positions=4, sizing="risk",
+                                  risk_pct=0.015, max_portfolio_heat=None)
+    assert capped["n_trades"] == 1
+    assert uncapped["n_trades"] == 4
+
+
+def test_heat_cap_allows_more_at_lower_risk_pct():
+    # at risk@0.5% (heat ~0.5% each), the 2% cap fits 4 -> validated baseline.
+    entries = [_E(0, 10, 0.03, f"S{i}", float(i), price=100.0, atr_pct=0.02) for i in range(4)]
+    s = simulate_portfolio(entries, None, max_positions=4, sizing="risk",
+                           risk_pct=0.005, max_portfolio_heat=0.02)
+    assert s["n_trades"] == 4
+
+
+def test_total_exposure_cap_blocks_leverage():
+    # equal sizing, 8 names @ 1/8 = 12.5% each; a 0.50 exposure cap fits 4 (50%).
+    entries = [_E(0, 10, 0.02, f"S{i}", float(i)) for i in range(8)]
+    s = simulate_portfolio(entries, None, max_positions=8, sizing="equal",
+                           max_total_exposure=0.50)
+    assert s["n_trades"] == 4
+
+
+def test_caps_off_by_default_preserve_behavior():
+    entries = [_E(0, 10, 0.02, f"S{i}", float(i)) for i in range(6)]
+    s = simulate_portfolio(entries, None, max_positions=6, sizing="equal")
+    assert s["n_trades"] == 6          # no caps passed -> all six open

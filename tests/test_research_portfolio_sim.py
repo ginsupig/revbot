@@ -7,6 +7,7 @@ import pandas as pd
 
 from research.portfolio_sim import (
     Entry, build_entries, build_closes, simulate_portfolio, run_portfolio_sim, format_sim,
+    compare_sizing, format_sizing_comparison, SIZING_GRID,
 )
 
 
@@ -125,3 +126,40 @@ def test_run_and_format_end_to_end():
     assert "mtm_max_drawdown" in stats and "sharpe" in stats
     txt = format_sim(stats, 4)
     assert "mark-to-mkt" in txt and "max_positions" in txt
+
+
+# --- sizing frontier (thread 2: recover return ATR-risk sizing leaves on the table)
+
+def test_compare_sizing_returns_a_row_per_grid_config():
+    entries = [_E(0, 1, 0.05, "AAA", 5.0)]
+    rows = compare_sizing(entries, None, max_positions=4)
+    assert len(rows) == len(SIZING_GRID)
+    assert rows[0][0] == "equal" and rows[1][0] == "risk@0.5%"
+
+
+def test_more_risk_budget_scales_high_vol_winner_until_cap():
+    # a HIGH-vol winner (atr_pct=0.05) is underweighted by ATR-risk sizing; raising
+    # risk_pct must scale its notional up -> higher return, until the position cap.
+    hv = [_E(0, 1, 0.10, "AAA", 5.0, price=100.0, atr_pct=0.05)]
+    closes = {"AAA": {0: 100.0, 1: 110.0}}
+    rows = compare_sizing(hv, closes, max_positions=4)
+    by_label = dict(rows)
+    r_small = by_label["risk@0.5%"]["total_return"]
+    r_big = by_label["risk@2%"]["total_return"]
+    assert r_big > r_small > 0.0                     # more budget -> more of the winner
+    # equal weight (1/4 = 25%) is the ceiling here; ATR-risk at 0.5% is well under it
+    assert by_label["equal"]["total_return"] >= r_big
+
+
+def test_low_vol_name_is_capped_so_risk_budget_barely_moves_it():
+    # a LOW-vol name (atr_pct=0.005) is already pinned at max_pos_frac, so raising
+    # risk_pct should NOT change its return (the cap binds at every level).
+    lv = [_E(0, 1, 0.08, "AAA", 5.0, price=100.0, atr_pct=0.005)]
+    rows = dict(compare_sizing(lv, None, max_positions=4, max_pos_frac=0.20))
+    assert rows["risk@0.5%"]["total_return"] == rows["risk@2%"]["total_return"]
+
+
+def test_format_sizing_comparison_renders_frontier():
+    entries = [_E(0, 1, 0.05, "AAA", 5.0, atr_pct=0.03)]
+    txt = format_sizing_comparison(compare_sizing(entries, None, 4), 4)
+    assert "sizing frontier" in txt and "RET/DD" in txt and "equal" in txt

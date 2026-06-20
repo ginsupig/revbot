@@ -166,3 +166,14 @@ def test_compare_gate_runs_both_and_formats():
     assert isinstance(on, PipelineResult) and isinstance(off, PipelineResult)
     txt = format_gate_comparison(on, off)
     assert "gate ON" in txt and "gate OFF" in txt and "DIAGNOSIS" in txt
+
+
+def test_single_profile_is_one_trial_no_deflation_tax():
+    # isolating one profile/lookback/K -> n_trials == 1, so the deflated-Sharpe
+    # gate stops penalizing best-of-N (the pre-registered-hypothesis path).
+    symbol_bars, spy, _ = _panel()
+    res = run_realtime_scorer(symbol_bars, spy,
+                              profiles={"rs_setup": PROFILES["rs_setup"]},
+                              lookbacks=[20], ks=[5], regime_gate=False)
+    assert res.n_trials == 1
+    assert res.chosen == "rs_setup_lb20_K5"

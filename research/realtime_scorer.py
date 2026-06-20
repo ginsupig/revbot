@@ -258,6 +258,10 @@ def main() -> None:
     p.add_argument("--timeframe", default="1Day")
     p.add_argument("--lookbacks", type=int, nargs="*", default=[20, 60])
     p.add_argument("--ks", type=int, nargs="*", default=[3, 5])
+    p.add_argument("--profiles", nargs="*", choices=list(PROFILES), default=None,
+                   help="subset of weight profiles to sweep (default all 5). Isolate one "
+                        "(e.g. --profiles rs_setup --lookbacks 20 --ks 5) to pre-register a "
+                        "single hypothesis and shed the best-of-N deflation penalty.")
     p.add_argument("--no-regime-gate", action="store_true")
     p.add_argument("--compare-gate", action="store_true",
                    help="run the identical sweep gate ON vs OFF and print the diagnosis")
@@ -292,21 +296,22 @@ def main() -> None:
         return
     sector_bars = None if args.no_sector else {e: b for e in SECTOR_ETFS
                                                if (b := _fetch(e)) is not None}
-    n_cfg = len(PROFILES) * len(args.lookbacks) * len(args.ks)
+    profiles = {k: PROFILES[k] for k in args.profiles} if args.profiles else PROFILES
+    n_cfg = len(profiles) * len(args.lookbacks) * len(args.ks)
     sec_of = None if args.no_sector else SECTOR_OF
     print(f"Real-time scorer | {len(symbol_bars)}/{len(symbols)} names | {start}->{end_s} | "
-          f"{args.timeframe} | profiles={list(PROFILES)} lb={args.lookbacks} K={args.ks} "
+          f"{args.timeframe} | profiles={list(profiles)} lb={args.lookbacks} K={args.ks} "
           f"({n_cfg} configs) | holdout={args.holdout:.0%}"
           + (" | COMPARE gate on/off" if args.compare_gate else
              f" | regime_gate={not args.no_regime_gate}"))
     if args.compare_gate:
         on, off = compare_gate(symbol_bars, spy_bars, sec_of, sector_bars,
-                               PROFILES, args.lookbacks, args.ks,
+                               profiles, args.lookbacks, args.ks,
                                holdout_frac=args.holdout)
         print("\n" + format_gate_comparison(on, off))
     else:
         res = run_realtime_scorer(
-            symbol_bars, spy_bars, sec_of, sector_bars, PROFILES, args.lookbacks,
+            symbol_bars, spy_bars, sec_of, sector_bars, profiles, args.lookbacks,
             args.ks, regime_gate=not args.no_regime_gate, holdout_frac=args.holdout)
         print("\n" + format_report(res))
 

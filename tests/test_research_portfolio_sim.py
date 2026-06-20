@@ -226,3 +226,60 @@ def test_caps_off_by_default_preserve_behavior():
     entries = [_E(0, 10, 0.02, f"S{i}", float(i)) for i in range(6)]
     s = simulate_portfolio(entries, None, max_positions=6, sizing="equal")
     assert s["n_trades"] == 6          # no caps passed -> all six open
+
+
+# --- factor-ranked daily experiment ------------------------------------------
+
+def _panel(seed_base=0):
+    """Multi-symbol daily panel with periodic flushes (creates oversold candidates)
+    + an SPY and one sector ETF for the rs/sector factors."""
+    dates = pd.date_range("2024-01-01", periods=200)
+    def series(seed, drift):
+        r = np.random.default_rng(seed); c = [100.0]
+        for k in range(1, 200):
+            shock = 0.90 if k % 15 == 0 else 1.0
+            c.append(c[-1] * (1 + drift + r.normal(0, 0.008)) * shock)
+        return np.asarray(c)
+    sb = {f"N{i}": _bars(series(seed_base + i, 0.0003), dates) for i in range(6)}
+    spy = _bars(np.linspace(100, 130, 200), dates)
+    sector = {"XLK": _bars(np.linspace(100, 140, 200), dates)}
+    return sb, spy, sector
+
+
+def test_build_factor_entries_shapes_and_hold_effect():
+    from research.portfolio_sim import build_factor_entries, EXPERIMENT_PROFILES
+    sb, spy, sector = _panel()
+    sof = {f"N{i}": "XLK" for i in range(6)}
+    e1 = build_factor_entries(sb, spy, sof, sector, EXPERIMENT_PROFILES["exhaustion"], hold=1)
+    e5 = build_factor_entries(sb, spy, sof, sector, EXPERIMENT_PROFILES["exhaustion"], hold=5)
+    assert e1 and e5
+    for e in e1:
+        assert e.exit_ord >= e.entry_ord and e.entry_price > 0 and np.isfinite(e.score)
+    # a longer hold lets the bracket run further -> exits no earlier on average
+    span1 = np.mean([e.exit_ord - e.entry_ord for e in e1])
+    span5 = np.mean([e.exit_ord - e.entry_ord for e in e5])
+    assert span5 >= span1
+
+
+def test_factor_sweep_covers_grid_and_sorts_by_ret_dd():
+    from research.portfolio_sim import factor_sweep, _ret_dd, EXPERIMENT_PROFILES
+    sb, spy, sector = _panel()
+    sof = {f"N{i}": "XLK" for i in range(6)}
+    rows = factor_sweep(sb, spy, sof, sector,
+                        profiles={"exhaustion": EXPERIMENT_PROFILES["exhaustion"]},
+                        ks=[3, 5], holds=[1, 3], risks=[0.0075, 0.01], heat=0.02)
+    assert len(rows) == 1 * 2 * 2 * 2          # profile x hold x K x risk
+    rds = [_ret_dd(s) for _, s in rows]
+    assert rds == sorted(rds, reverse=True)    # best RET/DD first
+    assert all("h" in label and "_K" in label and "_r" in label for label, _ in rows)
+
+
+def test_format_factor_sweep_renders():
+    from research.portfolio_sim import factor_sweep, format_factor_sweep, EXPERIMENT_PROFILES
+    sb, spy, sector = _panel()
+    sof = {f"N{i}": "XLK" for i in range(6)}
+    rows = factor_sweep(sb, spy, sof, sector,
+                        profiles={"sector_rs": EXPERIMENT_PROFILES["sector_rs"]},
+                        ks=[3], holds=[2], risks=[0.01], heat=0.02)
+    txt = format_factor_sweep(rows)
+    assert "factor-ranked daily experiment" in txt and "RET/DD" in txt

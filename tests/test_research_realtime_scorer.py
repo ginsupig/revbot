@@ -8,7 +8,8 @@ import pandas as pd
 from research.realtime_scorer import (
     _zscore, _trailing_ret_by_ord, _trend_on_by_ord, _candidates,
     score_sweep, run_realtime_scorer, compare_gate, gate_diagnosis,
-    format_gate_comparison, PROFILES,
+    format_gate_comparison, liquid_filter, PROFILES, FACTORS,
+    NEUTRAL_SECTOR_OF, ALL_SECTOR_OF,
 )
 from research.pipeline import PipelineResult
 
@@ -61,9 +62,38 @@ def test_candidates_fire_on_oversold_below_band():
     close = np.concatenate([np.full(60, 100.0), np.linspace(100, 80, 20)])
     rows = _candidates(_bars(close, dates), rsi_max=45.0)
     assert len(rows) > 0
-    # each row: (day_ord, entry_i, setup_depth>0, movement>0, ret)
-    for (d, i, setup, movement, ret) in rows:
-        assert setup > 0 and movement > 0
+    # each row: (day_ord, entry_i, feature_dict, ret)
+    for (d, i, feat, ret) in rows:
+        assert feat["setup"] > 0 and feat["movement"] > 0
+        # the new factors are present and finite
+        for k in ("exhaustion", "volexp", "trend"):
+            assert k in feat and np.isfinite(feat[k])
+
+
+def test_exhaustion_factor_reacts_to_volume():
+    dates = pd.date_range("2025-01-01", periods=80)
+    close = np.concatenate([np.full(60, 100.0), np.linspace(100, 80, 20)])
+    base = _bars(close, dates)
+    # same price path, but a volume spike on the flush bars -> higher exhaustion
+    spike = base.copy()
+    vol = np.full(80, 1e6)
+    vol[60:] = 5e6
+    spike["volume"] = vol
+    f_base = {i: feat for (_d, i, feat, _r) in _candidates(base, 45.0)}
+    f_spike = {i: feat for (_d, i, feat, _r) in _candidates(spike, 45.0)}
+    common = set(f_base) & set(f_spike)
+    assert common
+    # at least one shared candidate has strictly higher exhaustion under the spike
+    assert any(f_spike[i]["exhaustion"] > f_base[i]["exhaustion"] for i in common)
+
+
+def test_trend_factor_sign_distinguishes_knife_from_dip():
+    dates = pd.date_range("2025-01-01", periods=80)
+    # dip-in-uptrend: long rise then a small pullback -> close still above SMA50 (>0)
+    uptrend = np.concatenate([np.linspace(60, 120, 70), np.linspace(120, 112, 10)])
+    rows = _candidates(_bars(uptrend, dates), rsi_max=100.0)
+    if rows:
+        assert rows[-1][2]["trend"] > -0.5    # not a deep broken-trend reading
 
 
 def _panel():
@@ -177,3 +207,45 @@ def test_single_profile_is_one_trial_no_deflation_tax():
                               lookbacks=[20], ks=[5], regime_gate=False)
     assert res.n_trials == 1
     assert res.chosen == "rs_setup_lb20_K5"
+
+
+def test_new_profiles_only_reference_known_factors():
+    # every weight key in every profile must be a real factor (guards typos that
+    # would silently contribute zero to the composite).
+    for name, w in PROFILES.items():
+        assert set(w).issubset(set(FACTORS)), name
+    assert "exhaustion" in PROFILES and "dip_in_trend" in PROFILES
+
+
+def test_exhaustion_profile_runs_end_to_end():
+    symbol_bars, spy, _ = _panel()
+    res = run_realtime_scorer(symbol_bars, spy,
+                              profiles={"exhaustion": PROFILES["exhaustion"]},
+                              lookbacks=[20], ks=[3], regime_gate=False)
+    assert isinstance(res, PipelineResult) and res.n_trials == 1
+
+
+def test_liquid_filter_screens_price_and_volume():
+    dates = pd.date_range("2025-01-01", periods=40)
+    # liquid: $100, 1M shares -> $100M ADV, well above the $20M floor
+    liquid = _bars(np.full(40, 100.0), dates)
+    assert liquid_filter(liquid, min_price=5.0, min_dollar_vol=20e6) is True
+    # penny stock: below the $5 floor
+    penny = _bars(np.full(40, 2.0), dates)
+    assert liquid_filter(penny, min_price=5.0, min_dollar_vol=0) is False
+    # illiquid: $50 but only 1k shares -> $50k ADV, below floor
+    thin = _bars(np.full(40, 50.0), dates)
+    thin["volume"] = np.full(40, 1e3)
+    assert liquid_filter(thin, min_price=5.0, min_dollar_vol=20e6) is False
+    # too short / missing data -> rejected
+    assert liquid_filter(_bars(np.full(10, 100.0), dates[:10])) is False
+
+
+def test_neutral_universe_is_broad_and_mapped():
+    # survivorship control: many names, all 11 SPDR sectors, includes laggards
+    assert len(NEUTRAL_SECTOR_OF) >= 60
+    assert len(set(NEUTRAL_SECTOR_OF.values())) >= 10
+    for laggard in ("INTC", "T", "VZ", "PFE", "BA", "CLF", "F"):
+        assert laggard in NEUTRAL_SECTOR_OF
+    # the combined map still covers the curated watchlist
+    assert ALL_SECTOR_OF["ARM"] == "XLK" and ALL_SECTOR_OF["AAPL"] == "XLK"

@@ -24,14 +24,19 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 import numpy as np
+import pandas as pd
 
 from .daily_ranker import setup_outcomes, day_ordinals
 from .engines.reference import EXIT
-from .realtime_scorer import _candidates, UNIVERSES, liquid_filter
+from .realtime_scorer import (
+    _candidates, UNIVERSES, liquid_filter, _trailing_ret_by_ord, _zscore,
+    FACTORS, PROFILES, ALL_SECTOR_OF, SECTOR_ETFS,
+)
 
-from reversion_bot.indicators import calculate_atr
+from reversion_bot.indicators import calculate_atr, calculate_rsi, calculate_bollinger_bands
 
 ATR_FLOOR = 0.0035          # matches RiskConfig.atr_floor_pct
 
@@ -280,6 +285,127 @@ def format_grid(grid, caps, risk_pcts) -> str:
             "  cap x risk% that needs more heat, you must raise --max-heat in lockstep.")
 
 
+# --- factor-ranked daily experiment ------------------------------------------
+# Momentum-free profiles (momentum fights a dip-buy). The question: does an
+# exhaustion / quality-filtered reversion basket survive realistic execution
+# (next-open fill + occupancy + heat + ATR-risk) on a multi-day hold?
+EXPERIMENT_PROFILES = {
+    "exhaustion": PROFILES["exhaustion"],          # exhaustion+rs+setup+volexp+sector
+    "sector_rs":  PROFILES["sector_rs"],           # rs+sector+setup
+    "rs":         dict(rs=1.0, setup=0.5),
+    "movement":   dict(movement=1.0, setup=0.5),
+}
+
+
+def build_factor_entries(symbol_bars, spy_bars, sector_of, sector_bars, profile,
+                         hold, lookback=60, rsi_max=45.0, entry_lag=1) -> list:
+    """``[Entry]`` ranked by the cross-sectional factor composite. For each oversold
+    candidate: next-open entry (``entry_lag``), bracket exit at the given ``hold``,
+    factors z-scored across that signal-day's names and weighted by ``profile``.
+    Occupancy/heat/risk are applied later by ``simulate_portfolio``."""
+    exit = dict(EXIT, hold=int(hold))
+    sector_of = sector_of or {}
+    spy_ret = _trailing_ret_by_ord(spy_bars, lookback) if spy_bars is not None else {}
+    sec_ret = {etf: _trailing_ret_by_ord(b, lookback) for etf, b in (sector_bars or {}).items()}
+
+    raw = []
+    for sym, bars in symbol_bars.items():
+        high = bars["high"].astype(float).to_numpy()
+        low = bars["low"].astype(float).to_numpy()
+        close_s = bars["close"].astype(float)
+        close = close_s.to_numpy()
+        openp = bars["open"].astype(float).to_numpy() if "open" in bars.columns else close
+        vol = bars["volume"].astype(float) if "volume" in bars.columns else pd.Series(np.ones(len(bars)))
+        atr_s = calculate_atr(bars)
+        atr = atr_s.to_numpy()
+        rsi = calculate_rsi(bars).to_numpy()
+        _, _, lower = calculate_bollinger_bands(bars)
+        lower = lower.to_numpy()
+        ords = day_ordinals(bars)
+        ret_pct = close_s.pct_change().to_numpy()
+        rel_vol = (vol / vol.rolling(20).mean()).fillna(1.0).to_numpy()
+        atr_exp = (atr_s / atr_s.rolling(50).mean()).fillna(1.0).to_numpy()
+        sma50 = close_s.rolling(50).mean().to_numpy()
+        n = len(close)
+
+        idx = [i for i in range(n)
+               if (not np.isnan(atr[i]) and atr[i] > 0 and not np.isnan(lower[i])
+                   and not np.isnan(rsi[i]) and close[i] < lower[i] and rsi[i] <= rsi_max)]
+        out_by_entry = {e: (x, r) for (e, x, r) in
+                        setup_outcomes(high, low, close, atr, idx, exit, openp, entry_lag)}
+        etf = sector_of.get(sym, "")
+        for i in idx:
+            if i not in out_by_entry:
+                continue
+            ei = i + entry_lag
+            if ei >= n:
+                continue
+            x, r = out_by_entry[i]
+            entry_price = float(openp[ei]) if entry_lag else float(close[ei])
+            a = atr[i]
+            mom = (close[i] / close[i - lookback] - 1.0) if (i >= lookback and close[i - lookback] > 0) else 0.0
+            sig_d = int(ords[i])
+            factors = dict(
+                rs=mom - spy_ret.get(sig_d, 0.0), momentum=mom,
+                setup=float((lower[i] - close[i]) / a), movement=float(a / entry_price),
+                exhaustion=float(abs(ret_pct[i] if not np.isnan(ret_pct[i]) else 0.0) * rel_vol[i]),
+                volexp=float(atr_exp[i]),
+                trend=float((close[i] / sma50[i] - 1.0) if (not np.isnan(sma50[i]) and sma50[i] > 0) else 0.0),
+                sector=sec_ret.get(etf, {}).get(sig_d, 0.0),
+            )
+            raw.append(dict(sig_d=sig_d, entry_ord=int(ords[ei]), exit_ord=int(ords[x]),
+                            ret=float(r), sym=sym, entry_price=entry_price,
+                            atr_pct=max(a / entry_price, ATR_FLOOR) if entry_price > 0 else ATR_FLOOR,
+                            f=factors))
+
+    by_day = defaultdict(list)                         # rank cross-sectionally per SIGNAL day
+    for rec in raw:
+        by_day[rec["sig_d"]].append(rec)
+    entries = []
+    for recs in by_day.values():
+        z = {fac: _zscore(np.array([r["f"][fac] for r in recs])) for fac in FACTORS}
+        comp = sum(profile.get(fac, 0.0) * z[fac] for fac in FACTORS)
+        for rec, sc in zip(recs, comp):
+            entries.append(Entry(rec["entry_ord"], rec["exit_ord"], rec["ret"], rec["sym"],
+                                 float(sc), rec["entry_price"], rec["atr_pct"]))
+    return entries
+
+
+def factor_sweep(symbol_bars, spy_bars, sector_of=None, sector_bars=None,
+                 profiles=EXPERIMENT_PROFILES, ks=(3, 5, 10), holds=(1, 2, 3, 5),
+                 risks=(0.0075, 0.01), heat=0.02, lookback=60, entry_lag=1,
+                 rsi_max=45.0) -> list:
+    """Sweep (profile, hold, K, risk) under live occupancy/heat/risk with next-open
+    fills. Returns ``[(label, stats)]`` sorted by RET/DD (best first)."""
+    closes = build_closes(symbol_bars)
+    rows = []
+    for pname, w in profiles.items():
+        for hold in holds:
+            entries = build_factor_entries(symbol_bars, spy_bars, sector_of, sector_bars,
+                                           w, hold, lookback, rsi_max, entry_lag)
+            for K in ks:
+                for risk in risks:
+                    s = simulate_portfolio(entries, closes, K, "risk", risk, 1.2, 0.20,
+                                           max_total_exposure=0.95, max_portfolio_heat=heat)
+                    rows.append((f"{pname}_h{hold}d_K{K}_r{risk*100:g}%", s))
+    rows.sort(key=lambda kv: _ret_dd(kv[1]), reverse=True)
+    return rows
+
+
+def format_factor_sweep(rows, top=20) -> str:
+    lines = [f"  factor-ranked daily experiment (next-open fill, heat 2%, ATR-risk) — top {top} by RET/DD",
+             f"  {'CONFIG':<26}{'RETURN':>9}{'MTM_DD':>9}{'RET/DD':>8}{'SHARPE':>8}{'TRADES':>8}",
+             "  " + "-" * 68]
+    for label, s in rows[:top]:
+        lines.append(f"  {label:<26}{s['total_return']*100:>8.1f}%{s['mtm_max_drawdown']*100:>8.1f}%"
+                     f"{_ret_dd(s):>8.1f}{s['sharpe']:>8.3f}{s['n_trades']:>8}")
+    lines += ["",
+              "  Returns are net of 8bps. 'Survives execution' = RET/DD and return hold up on",
+              "  BOTH windows at the top of the table; a config that only ranks high on one is",
+              "  window-luck. A genuine winner here is a real live-deployment candidate."]
+    return "\n".join(lines)
+
+
 def format_sim(stats: dict, max_positions: int) -> str:
     return "\n".join([
         f"  max_positions  : {max_positions} (one per symbol, {stats['sizing']} sizing, compounding)",
@@ -311,6 +437,13 @@ def main() -> None:
     p.add_argument("--grid-sweep", action="store_true",
                    help="2-D sweep: --max-positions x --risk-grid, printing RET/DD, "
                         "return and drawdown matrices (the cap x budget tradeoff)")
+    p.add_argument("--factor-sweep", action="store_true",
+                   help="factor-ranked daily experiment: sweep profile x hold x K x risk "
+                        "with next-open fills + occupancy/heat/risk (needs SPY + sector ETFs)")
+    p.add_argument("--holds", type=int, nargs="*", default=[1, 2, 3, 5],
+                   help="holding periods in bars/days for --factor-sweep")
+    p.add_argument("--risks", type=float, nargs="*", default=[0.0075, 0.01],
+                   help="risk_pct values for --factor-sweep")
     p.add_argument("--risk-grid", type=float, nargs="*",
                    default=[0.005, 0.0075, 0.01, 0.015, 0.02],
                    help="risk_pct values for --grid-sweep")
@@ -352,6 +485,22 @@ def main() -> None:
                    if liquid_filter(b, args.min_price, args.min_dollar_vol)}
     print(f"Portfolio sim | universe={args.universe} | {len(symbol_bars)}/{len(symbols)} names | "
           f"{start}->{end_s} | {args.timeframe} | sizing={args.sizing}")
+
+    if args.factor_sweep:
+        spy_bars = _fetch("SPY")
+        sector_bars = {e: b for e in SECTOR_ETFS if (b := _fetch(e)) is not None}
+        if spy_bars is None:
+            print("SPY fetch failed — needed for rs/sector factors.")
+            return
+        print(f"  factor sweep | profiles={list(EXPERIMENT_PROFILES)} holds={args.holds} "
+              f"K={args.max_positions} risks={args.risks} | heat<={args.max_heat:g} | "
+              f"next-open fill\n")
+        rows = factor_sweep(symbol_bars, spy_bars, ALL_SECTOR_OF, sector_bars,
+                            ks=args.max_positions, holds=args.holds, risks=args.risks,
+                            heat=(args.max_heat or None), rsi_max=args.rsi_max)
+        print(format_factor_sweep(rows))
+        return
+
     entries = build_entries(symbol_bars, args.rsi_max)
     closes = build_closes(symbol_bars)
     mte = args.max_total_exposure or None      # 0 -> off

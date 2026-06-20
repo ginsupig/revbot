@@ -67,6 +67,7 @@ def format_report(res: PipelineResult) -> str:
         f"  (gate: {'PASS' if res.passed_gate else 'fail'})",
         f"  fold robust    : {res.robust}  folds={[round(s,2) for s in res.fold_sharpes]}",
         f"  breakeven cost : {res.breakeven_bps:.1f} bps",
+        f"  cost sweep     : {_fmt_cost(res.cost)}",
         f"  holdout        : n={res.holdout.get('n',0)} mean={res.holdout.get('mean',0)*100:.3f}% "
         f"PF={res.holdout.get('pf',0):.2f}",
         f"  MC reshuffle   : prob_neg={res.mc.get('prob_negative',0):.2f} "
@@ -75,6 +76,19 @@ def format_report(res: PipelineResult) -> str:
         f"  VERDICT: {res.verdict}",
     ]
     return "\n".join(lines)
+
+
+def _fmt_cost(cost: dict) -> str:
+    """Net mean / PF at each round-trip bps — the cost-fragility read. A daily-
+    turnover basket with a thin breakeven dies here long before the regime gate
+    matters."""
+    if not cost:
+        return "(none)"
+    parts = []
+    for b in sorted(cost):
+        c = cost[b]
+        parts.append(f"@{int(b)}bps PF={c.get('pf', 0):.2f}/{c.get('mean', 0) * 100:+.3f}%")
+    return "  ".join(parts)
 
 
 def main() -> None:

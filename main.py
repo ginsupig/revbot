@@ -34,6 +34,7 @@ from reversion_bot.market_regime import (
     suppress_longs_by_sector,
 )
 from reversion_bot.sectors import sector_for, etf_for_sector
+from reversion_bot.universe import select_base_universe, broad_reversion_universe
 from reversion_bot.channel import select_breakout_exits
 from run_real_backtest import fetch_alpaca_bars
 
@@ -687,12 +688,23 @@ async def main():
     # fallback in sync with the allowlist means a scanner whiff still trades only
     # vetted symbols. Re-run autotune_run.py to refresh both this list and
     # TRADE_ALLOWLIST.
-    if not symbols:
+    scanned_symbols = list(symbols)
+    fallback_watchlist = [
+        "AMD", "NVDA", "SMCI", "META", "ARM",
+        "CRWD", "FCX", "OXY", "CLF", "HIMS",
+    ]
+    # USE_BROAD_REVERSION_UNIVERSE: trade the validated neutral large-cap basket
+    # (research/portfolio_sim.py — two-window OOS under live ATR-risk sizing,
+    # ~+20%/window at <7% MTM drawdown at the 4-cap) instead of the scanner/curated
+    # watchlist. Default OFF = today's behavior. Occupancy cap, ATR sizing and the
+    # trailing stop stay as-is; this only swaps the universe the engine scans.
+    use_broad_universe = parse_bool(os.getenv("USE_BROAD_REVERSION_UNIVERSE", "False"), default=False)
+    symbols = select_base_universe(scanned_symbols, fallback_watchlist, use_broad_universe)
+    if use_broad_universe:
+        print(f"[BROAD] USE_BROAD_REVERSION_UNIVERSE on — trading the neutral large-cap "
+              f"reversion universe ({len(symbols)} names); scanner/fallback overridden.")
+    elif not scanned_symbols:
         print("[WARN] Scanner returned no symbols. Using fallback watchlist.")
-        symbols = [
-            "AMD", "NVDA", "SMCI", "META", "ARM",
-            "CRWD", "FCX", "OXY", "CLF", "HIMS",
-        ]
 
     # 3a-bis. Force-include watchlist / force-exclude blocklist. These wrap the
     # scanner (and run before the allowlist gate) so curated names trade even if
@@ -712,8 +724,13 @@ async def main():
     # 3b. Per-symbol allowlist gate (autotune_run.py writes TRADE_ALLOWLIST with
     # only the names whose OOS profit factor cleared the threshold). Unset means
     # gating is off; explicitly empty means nothing qualified -> trade nothing.
+    # The per-symbol allowlist is the curated path's vetting gate; in broad-reversion
+    # mode the neutral universe IS the filter, so applying it would collapse the
+    # basket to a handful of names. Skip it (with a note) when broad mode is on.
     allowlist = parse_allowlist(os.getenv("TRADE_ALLOWLIST"))
-    if allowlist is not None:
+    if allowlist is not None and use_broad_universe:
+        print("[BROAD] TRADE_ALLOWLIST ignored in broad-reversion mode (the universe is the filter).")
+    elif allowlist is not None:
         symbols, dropped = filter_symbols(symbols, allowlist)
         if dropped:
             print(f"[ALLOWLIST] Skipping {len(dropped)} name(s) not in TRADE_ALLOWLIST: {', '.join(dropped)}")

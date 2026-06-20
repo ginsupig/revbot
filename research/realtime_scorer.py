@@ -46,16 +46,32 @@ from .run import format_report
 
 from reversion_bot.indicators import calculate_atr, calculate_rsi, calculate_bollinger_bands
 
-FACTORS = ("rs", "momentum", "setup", "movement", "sector")
+# Factors, all cross-sectionally z-scored each day. Lookback-independent ones
+# (setup/movement/exhaustion/volexp/trend) are computed at the entry bar in
+# _candidates; lookback-dependent ones (rs/momentum/sector) in score_sweep.
+#   setup       reversion depth (lower_band - close)/ATR — deeper oversold = bigger
+#   movement    ATR/price — room to revert
+#   exhaustion  |today's return| * relative volume — the flush intensity that
+#               flagged the MU/ASTS/WDC dislocations manually
+#   volexp      ATR / ATR.rolling(50) — volatility expansion (a real flush, not drift)
+#   trend       close/SMA50 - 1 — POSITIVE rewards a dip still inside an uptrend and
+#               penalizes one that has broken trend (the falling-knife guard)
+#   rs          relative strength vs SPY ; momentum own trailing ; sector sector-ETF
+FACTORS = ("rs", "momentum", "setup", "movement", "sector", "exhaustion", "volexp", "trend")
 
-# Weight profiles over the factors. The sweep tests which *combination* of live
-# conditions ranks names best — that combination is what the gate validates.
+# Weight profiles over the factors (missing factor -> weight 0). The sweep tests
+# which *combination* of live conditions ranks names best — that combination is
+# what the gate validates. `exhaustion` follows the reviewer's factor model
+# (hunt good companies temporarily mispriced); `dip_in_trend` is the falling-knife
+# guard (deep dip but still above the 50-day).
 PROFILES = {
-    "balanced":   dict(rs=1.0, momentum=1.0, setup=1.0, movement=0.0, sector=1.0),
-    "rs_setup":   dict(rs=1.0, momentum=0.0, setup=1.5, movement=0.0, sector=0.0),
-    "momentum":   dict(rs=0.0, momentum=1.5, setup=0.5, movement=0.0, sector=0.0),
-    "sector_rs":  dict(rs=1.0, momentum=0.0, setup=0.5, movement=0.0, sector=1.5),
-    "setup_only": dict(rs=0.0, momentum=0.0, setup=1.0, movement=0.0, sector=0.0),
+    "balanced":     dict(rs=1.0, momentum=1.0, setup=1.0, sector=1.0),
+    "rs_setup":     dict(rs=1.0, setup=1.5),
+    "momentum":     dict(momentum=1.5, setup=0.5),
+    "sector_rs":    dict(rs=1.0, setup=0.5, sector=1.5),
+    "setup_only":   dict(setup=1.0),
+    "exhaustion":   dict(exhaustion=0.30, rs=0.25, setup=0.20, volexp=0.15, sector=0.10),
+    "dip_in_trend": dict(setup=0.40, trend=0.40, rs=0.20),
 }
 
 
@@ -92,16 +108,26 @@ def _trend_on_by_ord(bars, win=50) -> dict:
 
 def _candidates(bars, rsi_max: float) -> list:
     """Per-symbol entry candidates: bars below the lower band AND oversold (the
-    reversion setup). Returns ``[(day_ord, entry_i, setup_depth, movement, ret)]``
-    with the tuned-bracket outcome — lookback-independent features + the trade."""
+    reversion setup). Returns ``[(day_ord, entry_i, features, ret)]`` where
+    ``features`` is the lookback-independent factor dict and ``ret`` the tuned-
+    bracket outcome. All features use data through bar i only (causal)."""
     high = bars["high"].astype(float).to_numpy()
     low = bars["low"].astype(float).to_numpy()
-    close = bars["close"].astype(float).to_numpy()
-    atr = calculate_atr(bars).to_numpy()
+    close_s = bars["close"].astype(float)
+    close = close_s.to_numpy()
+    vol = bars["volume"].astype(float) if "volume" in bars.columns else pd.Series(np.ones(len(bars)))
+    atr_s = calculate_atr(bars)
+    atr = atr_s.to_numpy()
     rsi = calculate_rsi(bars).to_numpy()
     _, _, lower = calculate_bollinger_bands(bars)
     lower = lower.to_numpy()
     ords = day_ordinals(bars)
+
+    # Exhaustion / volatility-expansion / trend context — all trailing, causal.
+    ret = close_s.pct_change().to_numpy()
+    rel_vol = (vol / vol.rolling(20).mean()).fillna(1.0).to_numpy()
+    atr_exp = (atr_s / atr_s.rolling(50).mean()).fillna(1.0).to_numpy()
+    sma50 = close_s.rolling(50).mean().to_numpy()
 
     idx = []
     for i in range(len(close)):
@@ -114,8 +140,15 @@ def _candidates(bars, rsi_max: float) -> list:
     rows = []
     for i in idx:
         a = atr[i]
-        rows.append((int(ords[i]), i, float((lower[i] - close[i]) / a),
-                     float(a / close[i]), outcomes[i]))
+        trend = (close[i] / sma50[i] - 1.0) if (not np.isnan(sma50[i]) and sma50[i] > 0) else 0.0
+        feat = dict(
+            setup=float((lower[i] - close[i]) / a),
+            movement=float(a / close[i]),
+            exhaustion=float(abs(ret[i] if not np.isnan(ret[i]) else 0.0) * rel_vol[i]),
+            volexp=float(atr_exp[i]),
+            trend=float(trend),
+        )
+        rows.append((int(ords[i]), i, feat, outcomes[i]))
     return rows
 
 
@@ -147,31 +180,36 @@ def score_sweep(symbol_bars, spy_bars, sector_of=None, sector_bars=None,
         close, _o = closes[sym]
         return close[i] / close[i - lb] - 1.0 if i >= lb and close[i - lb] > 0 else 0.0
 
+    # group candidates by day across the whole universe (once; lookback-independent)
+    by_day = defaultdict(list)
+    for sym, rows in cand.items():
+        for (d, i, feat, ret) in rows:
+            by_day[d].append((sym, i, feat, ret))
+
     research, holdout = defaultdict(list), defaultdict(list)
     for prof_name, lb, K in itertools.product(profiles, lookbacks, ks):
         w = profiles[prof_name]
         key = f"{prof_name}_lb{lb}_K{K}"
-        # group candidates by day across the whole universe
-        by_day = defaultdict(list)
-        for sym, rows in cand.items():
-            for (d, i, setup, movement, ret) in rows:
-                by_day[d].append((sym, i, setup, movement, ret))
         for d in sorted(by_day):
             if regime_gate and not regime.get(d, False):
                 continue                              # risk-off: no longs today
             group = by_day[d]
-            mom = np.array([_name_ret(s, i, lb) for (s, i, _se, _mv, _r) in group])
-            rs = np.array([m - spy_ret[lb].get(d, 0.0) for m in mom])
-            setup = np.array([se for (_s, _i, se, _mv, _r) in group])
-            movement = np.array([mv for (_s, _i, _se, mv, _r) in group])
-            sector = np.array([sec_ret[lb].get(sector_of.get(s, ""), {}).get(d, 0.0)
-                               for (s, _i, _se, _mv, _r) in group])
-            comp = (w["rs"] * _zscore(rs) + w["momentum"] * _zscore(mom)
-                    + w["setup"] * _zscore(setup) + w["movement"] * _zscore(movement)
-                    + w["sector"] * _zscore(sector))
+            mom = np.array([_name_ret(s, i, lb) for (s, i, _f, _r) in group])
+            cols = {
+                "rs": np.array([m - spy_ret[lb].get(d, 0.0) for m in mom]),
+                "momentum": mom,
+                "sector": np.array([sec_ret[lb].get(sector_of.get(s, ""), {}).get(d, 0.0)
+                                    for (s, _i, _f, _r) in group]),
+                "setup": np.array([f["setup"] for (_s, _i, f, _r) in group]),
+                "movement": np.array([f["movement"] for (_s, _i, f, _r) in group]),
+                "exhaustion": np.array([f["exhaustion"] for (_s, _i, f, _r) in group]),
+                "volexp": np.array([f["volexp"] for (_s, _i, f, _r) in group]),
+                "trend": np.array([f["trend"] for (_s, _i, f, _r) in group]),
+            }
+            comp = sum(w.get(f, 0.0) * _zscore(cols[f]) for f in FACTORS)
             order = np.argsort(-comp)
             for rank_pos in order[:K]:
-                ret = group[rank_pos][4]
+                ret = group[rank_pos][3]
                 bucket = (holdout if holdout_cut_ord is not None and d >= holdout_cut_ord
                           else research)
                 bucket[key].append(ret)
@@ -184,11 +222,16 @@ def run_realtime_scorer(symbol_bars, spy_bars, sector_of=None, sector_bars=None,
                         rsi_max=45.0, regime_gate=True,
                         holdout_frac=0.25) -> PipelineResult:
     """End-to-end: score the universe daily, split a date holdout, sweep, gate."""
-    all_ords = sorted(d for b in symbol_bars.values()
-                      for (d, _i, _s, _m, _r) in _candidates(b, rsi_max))
-    if not all_ords:
+    cand_ords = [d for b in symbol_bars.values()
+                 for (d, _i, _f, _r) in _candidates(b, rsi_max)]
+    if not cand_ords:
         return PipelineResult(None, 0, 0.0, 0.0, False, False, verdict="empty sweep")
-    cut = all_ords[min(int(round(len(all_ords) * (1.0 - holdout_frac))), len(all_ords) - 1)]
+    # Split by CALENDAR day, not trade count: the boundary is a fixed fraction of
+    # the unique trading days, so clustered flushes can't shrink/inflate the holdout
+    # window or straddle a regime period (review fix).
+    unique_days = sorted(set(cand_ords))
+    cut = unique_days[min(int(round(len(unique_days) * (1.0 - holdout_frac))),
+                          len(unique_days) - 1)]
     research, holdout = score_sweep(
         symbol_bars, spy_bars, sector_of, sector_bars, profiles, lookbacks, ks,
         rsi_max, regime_gate, holdout_cut_ord=cut)
@@ -247,21 +290,88 @@ SECTOR_OF = {
     "WDC": "XLK", "COIN": "XLF", "ADI": "XLK", "AMAT": "XLK", "TSLA": "XLY",
     "IONQ": "XLK",
 }
-UNIVERSE = list(SECTOR_OF)
+
+# Survivorship control (review #1): a broad, neutral large-cap universe spanning
+# all 11 sectors and deliberately including laggards (INTC/T/VZ/PFE/BA/CLF/F...),
+# not just today's momentum winners. The edge must come from RANKING, not from
+# knowing the names. Still a static membership list -> NOT point-in-time S&P 500
+# (that needs a historical-constituents feed; see PR notes); the liquidity filter
+# below is the mechanical gate that should ultimately *define* the universe.
+NEUTRAL_SECTOR_OF = {
+    # XLK information technology
+    "AAPL": "XLK", "MSFT": "XLK", "NVDA": "XLK", "AVGO": "XLK", "ORCL": "XLK",
+    "CRM": "XLK", "CSCO": "XLK", "ACN": "XLK", "ADBE": "XLK", "AMD": "XLK",
+    "INTC": "XLK", "QCOM": "XLK", "TXN": "XLK", "IBM": "XLK", "MU": "XLK",
+    "AMAT": "XLK", "LRCX": "XLK", "ADI": "XLK",
+    # XLC communication services
+    "GOOGL": "XLC", "META": "XLC", "NFLX": "XLC", "DIS": "XLC", "CMCSA": "XLC",
+    "T": "XLC", "VZ": "XLC", "TMUS": "XLC",
+    # XLY consumer discretionary
+    "AMZN": "XLY", "TSLA": "XLY", "HD": "XLY", "MCD": "XLY", "NKE": "XLY",
+    "LOW": "XLY", "SBUX": "XLY", "BKNG": "XLY", "F": "XLY",
+    # XLP consumer staples
+    "PG": "XLP", "KO": "XLP", "PEP": "XLP", "COST": "XLP", "WMT": "XLP",
+    "MO": "XLP", "CL": "XLP", "MDLZ": "XLP",
+    # XLF financials
+    "JPM": "XLF", "BAC": "XLF", "WFC": "XLF", "GS": "XLF", "MS": "XLF",
+    "C": "XLF", "AXP": "XLF", "SCHW": "XLF", "BLK": "XLF",
+    # XLV health care
+    "UNH": "XLV", "JNJ": "XLV", "LLY": "XLV", "PFE": "XLV", "MRK": "XLV",
+    "ABBV": "XLV", "TMO": "XLV", "ABT": "XLV", "BMY": "XLV", "AMGN": "XLV",
+    # XLE energy
+    "XOM": "XLE", "CVX": "XLE", "COP": "XLE", "SLB": "XLE", "EOG": "XLE",
+    "OXY": "XLE", "MPC": "XLE",
+    # XLI industrials
+    "CAT": "XLI", "BA": "XLI", "HON": "XLI", "UPS": "XLI", "GE": "XLI",
+    "RTX": "XLI", "LMT": "XLI", "DE": "XLI", "UNP": "XLI",
+    # XLB materials
+    "LIN": "XLB", "FCX": "XLB", "NEM": "XLB", "APD": "XLB", "SHW": "XLB",
+    "DOW": "XLB", "CLF": "XLB",
+    # XLU utilities
+    "NEE": "XLU", "DUK": "XLU", "SO": "XLU", "D": "XLU", "AEP": "XLU",
+}
+ALL_SECTOR_OF = {**NEUTRAL_SECTOR_OF, **SECTOR_OF}
+UNIVERSES = {"curated": list(SECTOR_OF), "neutral": list(NEUTRAL_SECTOR_OF)}
+UNIVERSE = UNIVERSES["curated"]
+
+
+def liquid_filter(bars, min_price=5.0, min_dollar_vol=20e6) -> bool:
+    """Mechanical universe gate (review #1): keep a name only if it clears a price
+    and average-dollar-volume floor over the window. A coarse liquidity screen, not
+    point-in-time membership — but it lets the universe be *defined by filters*
+    rather than handpicked. ``True`` = keep."""
+    if bars is None or len(bars) < 30 or "close" not in bars.columns:
+        return False
+    close = bars["close"].astype(float)
+    vol = bars["volume"].astype(float) if "volume" in bars.columns else pd.Series(np.zeros(len(bars)))
+    price_ok = float(close.iloc[-1]) >= min_price
+    adv = float((close * vol).mean())
+    return bool(price_ok and adv >= min_dollar_vol)
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Real-time cross-sectional scorer (gated)")
-    p.add_argument("symbols", nargs="*", help="symbols (overrides the default universe)")
+    p.add_argument("symbols", nargs="*", help="symbols (overrides --universe)")
+    p.add_argument("--universe", choices=list(UNIVERSES), default="neutral",
+                   help="curated (the 21-name watchlist) or neutral (broad large-cap "
+                        "incl. laggards — the survivorship control). Default neutral.")
     p.add_argument("--days", type=int, default=540)
     p.add_argument("--end", default=None)
     p.add_argument("--timeframe", default="1Day")
     p.add_argument("--lookbacks", type=int, nargs="*", default=[20, 60])
-    p.add_argument("--ks", type=int, nargs="*", default=[3, 5])
+    p.add_argument("--ks", type=int, nargs="*", default=[3, 5, 10, 20],
+                   help="names traded per day. Bigger Ks ask 'does the top BUCKET "
+                        "outperform?' not 'can I pick the one winner?' (review #4).")
+    p.add_argument("--profiles", nargs="*", choices=list(PROFILES), default=None,
+                   help="subset of weight profiles to sweep (default all). Isolate one "
+                        "(e.g. --profiles exhaustion --lookbacks 20 --ks 10) to pre-register a "
+                        "single hypothesis and shed the best-of-N deflation penalty.")
     p.add_argument("--no-regime-gate", action="store_true")
     p.add_argument("--compare-gate", action="store_true",
                    help="run the identical sweep gate ON vs OFF and print the diagnosis")
     p.add_argument("--no-sector", action="store_true")
+    p.add_argument("--min-price", type=float, default=5.0, help="liquidity filter floor")
+    p.add_argument("--min-dollar-vol", type=float, default=20e6, help="avg $ volume floor")
     p.add_argument("--holdout", type=float, default=0.25)
     args = p.parse_args()
 
@@ -272,7 +382,7 @@ def main() -> None:
         pass
     from run_real_backtest import fetch_alpaca_bars   # guarded: needs alpaca + creds
 
-    symbols = [s.upper() for s in args.symbols] if args.symbols else UNIVERSE
+    symbols = [s.upper() for s in args.symbols] if args.symbols else UNIVERSES[args.universe]
     end = datetime.strptime(args.end, "%Y-%m-%d") if args.end else datetime.now()
     start = (end - timedelta(days=args.days)).strftime("%Y-%m-%d")
     end_s = end.strftime("%Y-%m-%d")
@@ -285,28 +395,34 @@ def main() -> None:
             print(f"  # {sym}: {e}")
             return None
 
-    symbol_bars = {s: b for s in symbols if (b := _fetch(s)) is not None}
+    raw = {s: b for s in symbols if (b := _fetch(s)) is not None}
+    symbol_bars = {s: b for s, b in raw.items()
+                   if liquid_filter(b, args.min_price, args.min_dollar_vol)}
+    dropped = len(raw) - len(symbol_bars)
     spy_bars = _fetch("SPY")
     if spy_bars is None:
         print("SPY fetch failed — needed for regime + relative strength.")
         return
     sector_bars = None if args.no_sector else {e: b for e in SECTOR_ETFS
                                                if (b := _fetch(e)) is not None}
-    n_cfg = len(PROFILES) * len(args.lookbacks) * len(args.ks)
-    sec_of = None if args.no_sector else SECTOR_OF
-    print(f"Real-time scorer | {len(symbol_bars)}/{len(symbols)} names | {start}->{end_s} | "
-          f"{args.timeframe} | profiles={list(PROFILES)} lb={args.lookbacks} K={args.ks} "
+    profiles = {k: PROFILES[k] for k in args.profiles} if args.profiles else PROFILES
+    n_cfg = len(profiles) * len(args.lookbacks) * len(args.ks)
+    sec_of = None if args.no_sector else ALL_SECTOR_OF
+    print(f"Real-time scorer | universe={args.universe} | {len(symbol_bars)}/{len(symbols)} names "
+          f"({dropped} cut by liquidity >=${args.min_price:g}/>=${args.min_dollar_vol/1e6:g}M) "
+          f"| {start}->{end_s} | ")
+    print(f"  {args.timeframe} | profiles={list(profiles)} lb={args.lookbacks} K={args.ks} "
           f"({n_cfg} configs) | holdout={args.holdout:.0%}"
           + (" | COMPARE gate on/off" if args.compare_gate else
              f" | regime_gate={not args.no_regime_gate}"))
     if args.compare_gate:
         on, off = compare_gate(symbol_bars, spy_bars, sec_of, sector_bars,
-                               PROFILES, args.lookbacks, args.ks,
+                               profiles, args.lookbacks, args.ks,
                                holdout_frac=args.holdout)
         print("\n" + format_gate_comparison(on, off))
     else:
         res = run_realtime_scorer(
-            symbol_bars, spy_bars, sec_of, sector_bars, PROFILES, args.lookbacks,
+            symbol_bars, spy_bars, sec_of, sector_bars, profiles, args.lookbacks,
             args.ks, regime_gate=not args.no_regime_gate, holdout_frac=args.holdout)
         print("\n" + format_report(res))
 

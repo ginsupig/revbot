@@ -50,22 +50,32 @@ DEFAULT_RSI_MAX = 40.0
 DEFAULT_DROP_WINDOW = 3
 
 
-def setup_outcomes(high, low, close, atr_arr, signal_idx, exit=EXIT) -> list:
+def setup_outcomes(high, low, close, atr_arr, signal_idx, exit=EXIT,
+                   open_arr=None, entry_lag=0) -> list:
     """Per-setup ``(entry_i, exit_i, net_return)`` — each signal simulated forward
     independently (occupancy-free; this feeds the score, not the traded book) under
-    the tuned ATR bracket + trailing stop, net of round-trip cost."""
+    the tuned ATR bracket + trailing stop, net of round-trip cost.
+
+    ``entry_lag`` shifts the fill off the signal bar: 0 = enter at the signal bar's
+    close (default); 1 with ``open_arr`` = enter at the NEXT bar's open. The latter
+    removes the same-bar fill artifact that makes intraday reversion look tradeable
+    when it is really bid-ask bounce off the signal-bar close (see the 5Min PF~10
+    mirage). ATR/stops are anchored on the signal bar; only the fill price moves."""
     n = len(close)
     out = []
     for i in signal_idx:
-        entry = close[i]
+        ei = i + entry_lag
+        if ei >= n:
+            continue
+        entry = float(open_arr[ei]) if (entry_lag and open_arr is not None) else close[ei]
         a = max(float(atr_arr[i]) if not np.isnan(atr_arr[i]) else 0.0, entry * ATR_FLOOR_PCT)
         init_stop = entry - exit["stop"] * a
         target = entry + exit["target"] * a
         trail_dist = exit["trail"] * a if exit.get("trail") else None
-        highest = high[i]
-        end = min(i + exit["hold"], n - 1)
+        highest = high[ei]
+        end = min(ei + exit["hold"], n - 1)
         exit_i, ret = end, close[end] / entry - 1.0
-        for j in range(i + 1, end + 1):
+        for j in range(ei + 1, end + 1):
             highest = max(highest, high[j])
             cur_stop = init_stop if trail_dist is None else max(init_stop, highest - trail_dist)
             if low[j] <= cur_stop:

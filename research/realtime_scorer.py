@@ -106,15 +106,17 @@ def _trend_on_by_ord(bars, win=50) -> dict:
     return out
 
 
-def _candidates(bars, rsi_max: float) -> list:
+def _candidates(bars, rsi_max: float, entry_lag: int = 0) -> list:
     """Per-symbol entry candidates: bars below the lower band AND oversold (the
     reversion setup). Returns ``[(day_ord, entry_i, features, ret)]`` where
     ``features`` is the lookback-independent factor dict and ``ret`` the tuned-
-    bracket outcome. All features use data through bar i only (causal)."""
+    bracket outcome. All features use data through bar i only (causal).
+    ``entry_lag=1`` fills at the next bar's open (intraday fill-realism check)."""
     high = bars["high"].astype(float).to_numpy()
     low = bars["low"].astype(float).to_numpy()
     close_s = bars["close"].astype(float)
     close = close_s.to_numpy()
+    open_arr = bars["open"].astype(float).to_numpy() if "open" in bars.columns else close
     vol = bars["volume"].astype(float) if "volume" in bars.columns else pd.Series(np.ones(len(bars)))
     atr_s = calculate_atr(bars)
     atr = atr_s.to_numpy()
@@ -136,9 +138,12 @@ def _candidates(bars, rsi_max: float) -> list:
             continue
         if close[i] < lower[i] and rsi[i] <= rsi_max:
             idx.append(i)
-    outcomes = {e: r for (e, _x, r) in setup_outcomes(high, low, close, atr, idx, EXIT)}
+    outcomes = {e: r for (e, _x, r) in
+                setup_outcomes(high, low, close, atr, idx, EXIT, open_arr, entry_lag)}
     rows = []
     for i in idx:
+        if i not in outcomes:                       # entry_lag ran off the end of the series
+            continue
         a = atr[i]
         trend = (close[i] / sma50[i] - 1.0) if (not np.isnan(sma50[i]) and sma50[i] > 0) else 0.0
         feat = dict(
@@ -159,15 +164,16 @@ def _name_mom(bars) -> "tuple[np.ndarray, np.ndarray]":
 def score_sweep(symbol_bars, spy_bars, sector_of=None, sector_bars=None,
                 profiles=PROFILES, lookbacks=(20, 60), ks=(3, 5),
                 rsi_max=45.0, regime_gate=True, holdout_frac=0.25,
-                holdout_cut_ord=None) -> "tuple[dict, dict]":
+                holdout_cut_ord=None, entry_lag=0) -> "tuple[dict, dict]":
     """Sweep (profile, lookback, K) and return ``(research, holdout)`` per-config
     trade returns. Each day every candidate name is scored cross-sectionally on the
-    current conditions; the regime gate blanks risk-off days; the top-K trade."""
+    current conditions; the regime gate blanks risk-off days; the top-K trade.
+    ``entry_lag=1`` fills at the next bar's open (intraday fill-realism check)."""
     sector_of = sector_of or {}
     sector_bars = sector_bars or {}
 
     # Per-symbol candidate rows (lookback-independent) + close/ord for momentum.
-    cand = {s: _candidates(b, rsi_max) for s, b in symbol_bars.items()}
+    cand = {s: _candidates(b, rsi_max, entry_lag) for s, b in symbol_bars.items()}
     closes = {s: _name_mom(b) for s, b in symbol_bars.items()}
 
     # SPY + sector trailing returns / regime, precomputed per lookback / ord.
@@ -220,10 +226,11 @@ def score_sweep(symbol_bars, spy_bars, sector_of=None, sector_bars=None,
 def run_realtime_scorer(symbol_bars, spy_bars, sector_of=None, sector_bars=None,
                         profiles=PROFILES, lookbacks=(20, 60), ks=(3, 5),
                         rsi_max=45.0, regime_gate=True,
-                        holdout_frac=0.25) -> PipelineResult:
-    """End-to-end: score the universe daily, split a date holdout, sweep, gate."""
+                        holdout_frac=0.25, entry_lag=0) -> PipelineResult:
+    """End-to-end: score the universe daily, split a date holdout, sweep, gate.
+    ``entry_lag=1`` fills at the next bar's open (intraday fill-realism check)."""
     cand_ords = [d for b in symbol_bars.values()
-                 for (d, _i, _f, _r) in _candidates(b, rsi_max)]
+                 for (d, _i, _f, _r) in _candidates(b, rsi_max, entry_lag)]
     if not cand_ords:
         return PipelineResult(None, 0, 0.0, 0.0, False, False, verdict="empty sweep")
     # Split by CALENDAR day, not trade count: the boundary is a fixed fraction of
@@ -234,20 +241,20 @@ def run_realtime_scorer(symbol_bars, spy_bars, sector_of=None, sector_bars=None,
                           len(unique_days) - 1)]
     research, holdout = score_sweep(
         symbol_bars, spy_bars, sector_of, sector_bars, profiles, lookbacks, ks,
-        rsi_max, regime_gate, holdout_cut_ord=cut)
+        rsi_max, regime_gate, holdout_cut_ord=cut, entry_lag=entry_lag)
     return evaluate_sweep(research, holdout)
 
 
 def compare_gate(symbol_bars, spy_bars, sector_of=None, sector_bars=None,
                  profiles=PROFILES, lookbacks=(20, 60), ks=(3, 5), rsi_max=45.0,
-                 holdout_frac=0.25) -> "tuple[PipelineResult, PipelineResult]":
+                 holdout_frac=0.25, entry_lag=0) -> "tuple[PipelineResult, PipelineResult]":
     """Run the identical sweep with the SPY regime gate ON and OFF. The pair is the
     cheap diagnostic for whether the gate is the binding constraint (and thus whether
     an HMM regime upgrade is worth building) — see ``gate_diagnosis``."""
     on = run_realtime_scorer(symbol_bars, spy_bars, sector_of, sector_bars,
-                             profiles, lookbacks, ks, rsi_max, True, holdout_frac)
+                             profiles, lookbacks, ks, rsi_max, True, holdout_frac, entry_lag)
     off = run_realtime_scorer(symbol_bars, spy_bars, sector_of, sector_bars,
-                              profiles, lookbacks, ks, rsi_max, False, holdout_frac)
+                              profiles, lookbacks, ks, rsi_max, False, holdout_frac, entry_lag)
     return on, off
 
 
@@ -373,6 +380,10 @@ def main() -> None:
                         "(e.g. --profiles exhaustion --lookbacks 20 --ks 10) to pre-register a "
                         "single hypothesis and shed the best-of-N deflation penalty.")
     p.add_argument("--no-regime-gate", action="store_true")
+    p.add_argument("--entry-lag", type=int, default=0,
+                   help="0 = fill at the signal bar's close; 1 = fill at the NEXT bar's open "
+                        "(removes the same-bar bid-ask-bounce artifact — the intraday "
+                        "fill-realism check that exposes a 5Min PF~10 mirage)")
     p.add_argument("--compare-gate", action="store_true",
                    help="run the identical sweep gate ON vs OFF and print the diagnosis")
     p.add_argument("--no-sector", action="store_true")
@@ -418,18 +429,20 @@ def main() -> None:
           f"({dropped} cut by liquidity >=${args.min_price:g}/>=${args.min_dollar_vol/1e6:g}M) "
           f"| {start}->{end_s} | ")
     print(f"  {args.timeframe} | profiles={list(profiles)} lb={args.lookbacks} K={args.ks} "
-          f"({n_cfg} configs) | holdout={args.holdout:.0%}"
+          f"({n_cfg} configs) | holdout={args.holdout:.0%} | entry_lag={args.entry_lag}"
+          + (" (next-bar open)" if args.entry_lag else " (signal-bar close)")
           + (" | COMPARE gate on/off" if args.compare_gate else
              f" | regime_gate={not args.no_regime_gate}"))
     if args.compare_gate:
         on, off = compare_gate(symbol_bars, spy_bars, sec_of, sector_bars,
                                profiles, args.lookbacks, args.ks,
-                               holdout_frac=args.holdout)
+                               holdout_frac=args.holdout, entry_lag=args.entry_lag)
         print("\n" + format_gate_comparison(on, off))
     else:
         res = run_realtime_scorer(
             symbol_bars, spy_bars, sec_of, sector_bars, profiles, args.lookbacks,
-            args.ks, regime_gate=not args.no_regime_gate, holdout_frac=args.holdout)
+            args.ks, regime_gate=not args.no_regime_gate, holdout_frac=args.holdout,
+            entry_lag=args.entry_lag)
         print("\n" + format_report(res))
 
 

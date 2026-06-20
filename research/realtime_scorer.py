@@ -337,15 +337,21 @@ UNIVERSE = UNIVERSES["curated"]
 
 def liquid_filter(bars, min_price=5.0, min_dollar_vol=20e6) -> bool:
     """Mechanical universe gate (review #1): keep a name only if it clears a price
-    and average-dollar-volume floor over the window. A coarse liquidity screen, not
-    point-in-time membership — but it lets the universe be *defined by filters*
-    rather than handpicked. ``True`` = keep."""
+    and average *daily* dollar-volume floor over the window. A coarse liquidity
+    screen, not point-in-time membership — but it lets the universe be *defined by
+    filters* rather than handpicked. ``True`` = keep.
+
+    Daily dollar volume is summed within each calendar day before averaging, so the
+    threshold is timeframe-invariant: on 5Min bars it does NOT compare a per-bar
+    figure against a daily floor (which silently cut the whole universe)."""
     if bars is None or len(bars) < 30 or "close" not in bars.columns:
         return False
     close = bars["close"].astype(float)
     vol = bars["volume"].astype(float) if "volume" in bars.columns else pd.Series(np.zeros(len(bars)))
     price_ok = float(close.iloc[-1]) >= min_price
-    adv = float((close * vol).mean())
+    dollar = (close * vol).to_numpy()
+    daily = pd.Series(dollar).groupby(day_ordinals(bars)).sum()   # per-calendar-day $ vol
+    adv = float(daily.mean()) if len(daily) else 0.0
     return bool(price_ok and adv >= min_dollar_vol)
 
 

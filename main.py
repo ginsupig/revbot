@@ -35,6 +35,7 @@ from reversion_bot.market_regime import (
 )
 from reversion_bot.sectors import sector_for, etf_for_sector
 from reversion_bot.universe import select_base_universe, broad_reversion_universe
+from reversion_bot.swing import is_moc_entry_window, should_block_entry_now, holds_overnight
 from reversion_bot.channel import select_breakout_exits
 from run_real_backtest import fetch_alpaca_bars
 
@@ -569,6 +570,14 @@ async def main():
     # stop leg up toward high_water - TRAIL_ATR_MULTIPLE*ATR. The validated edge
     # (execution_tuning_backtest.py). Set USE_TRAILING_STOP=False to disable.
     use_trailing_stop = parse_bool(os.getenv("USE_TRAILING_STOP", "True"), default=True)
+    # Swing / overnight-hold mode (opt-in, default OFF = today's intraday flat-by-bell
+    # behavior). The validated daily broad-reversion edge enters at the CLOSE
+    # (market-on-close) and holds overnight/multi-day, the ATR trail riding winners.
+    # When ON: entries only in the MOC submission window, and EOD/session/carryover
+    # flattens are skipped so positions hold. Pair with TIF=cls, TRADE_TIMEFRAME=1Day,
+    # USE_BROAD_REVERSION_UNIVERSE=true. See reversion_bot/swing.py.
+    swing_mode = parse_bool(os.getenv("SWING_OVERNIGHT_MODE", "False"), default=False)
+    moc_window_min = int(os.getenv("MOC_ENTRY_WINDOW_MINUTES", 20))
     regime_symbol = os.getenv("MARKET_REGIME_SYMBOL", "SPY")
     regime_timeframe = os.getenv("MARKET_REGIME_TIMEFRAME", "1Day")
     regime_ema = int(os.getenv("MARKET_REGIME_EMA", 50))
@@ -791,6 +800,9 @@ async def main():
     print(f"--- REVERSION BOT STARTING ---")
     print(f"Timeframe: {timeframe} | Lookback: {lookback} | Mode: {'PAPER' if exec_config.paper else 'LIVE'}")
     print(f"Shorts: {'ENABLED' if strategy_config.enable_shorts else 'disabled'}")
+    if swing_mode:
+        print(f"SWING/OVERNIGHT mode: ON — enter in the MOC window (last {moc_window_min}m before "
+              f"2:50pm CT), hold overnight/multi-day, no EOD/carryover flatten (tif={exec_config.tif}).")
     if use_trailing_stop:
         print(f"Trailing stop: ON (stop ratchets to high_water - {risk_config.trail_atr_multiple:g}xATR; "
               f"target {risk_config.target_atr_multiple:g}xATR backstop)")
@@ -844,25 +856,31 @@ async def main():
                 # fired) and exit cleanly (code 0) so the supervisor stops until
                 # tomorrow's open trigger. Pre-open, just sleep until the bell.
                 if await asyncio.to_thread(is_session_over, executor):
-                    await liquidate_all_positions(executor)
-                    # Day is done and positions are flat — book the session's
-                    # realized outcomes so adaptation reflects what actually happened.
+                    # Swing mode holds overnight (the ATR trail manages positions);
+                    # only flatten at session end in intraday mode.
+                    if not holds_overnight(swing_mode):
+                        await liquidate_all_positions(executor)
+                    # Book the session's realized outcomes so adaptation reflects
+                    # what actually happened (closes booked even while others hold).
                     await reconcile_trade_outcomes(service, api_key, api_secret, base_url, outcome_reconcile_days)
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [SESSION] Market closed for the day. Exiting cleanly.")
+                    held = " (holding overnight)" if holds_overnight(swing_mode) else ""
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [SESSION] Market closed for the day{held}. Exiting cleanly.")
                     break
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed (pre-open). Sleeping...")
                 await asyncio.sleep(poll_interval)
                 continue
 
-            if is_eod_liquidation_window():
+            if is_eod_liquidation_window() and not holds_overnight(swing_mode):
                 await liquidate_all_positions(executor)
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] EOD liquidation done. Sleeping...")
                 await asyncio.sleep(poll_interval)
                 continue
 
             # Day's first open cycle: flatten any orphaned overnight carryover
-            # before trading (no-op after the first run each day).
-            await reconcile_carryover(executor)
+            # before trading (no-op after the first run each day). Skipped in swing
+            # mode — there, overnight positions are intended holds, not orphans.
+            if not holds_overnight(swing_mode):
+                await reconcile_carryover(executor)
 
             if is_morning_blackout():
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Morning blackout (9:30-10:00 ET). Sleeping...")
@@ -902,13 +920,21 @@ async def main():
             all_results = [r for r in raw_results if r is not None]
             candidates = [r for r in all_results if r.get("go_long") or r.get("go_short")]
 
-            # EOD entry cutoff: in the final stretch before the close, take NO new
-            # positions — only manage exits — so nothing is opened that can't be
-            # flattened before the bell (the carryover guard). Channel/EOD exits
-            # below still run.
-            if candidates and is_eod_entry_cutoff():
-                print(f"[EOD] Entry cutoff — blocking {len(candidates)} new entr(ies) near the close.")
-                candidates = []
+            # Entry timing. Swing mode INVERTS the intraday cutoff: it trades once a
+            # day at the close, so entries are taken ONLY inside the market-on-close
+            # window and blocked the rest of the day. Intraday mode keeps the EOD
+            # cutoff (no entries that can't be flattened before the bell).
+            if candidates:
+                if swing_mode:
+                    in_moc = is_moc_entry_window(
+                        datetime.now(ZoneInfo("America/Chicago")), moc_window_min)
+                    if should_block_entry_now(swing_mode, in_moc):
+                        print(f"[SWING] Outside the MOC entry window — holding {len(candidates)} "
+                              f"candidate(s) for the close.")
+                        candidates = []
+                elif is_eod_entry_cutoff():
+                    print(f"[EOD] Entry cutoff — blocking {len(candidates)} new entr(ies) near the close.")
+                    candidates = []
 
             # Regime gate: drop new longs in a risk-off tape (keep shorts). The
             # sector-aware gate supersedes the SPY-only one and, under "or",

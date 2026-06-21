@@ -294,6 +294,11 @@ EXPERIMENT_PROFILES = {
     "sector_rs":  PROFILES["sector_rs"],           # rs+sector+setup
     "rs":         dict(rs=1.0, setup=0.5),
     "movement":   dict(movement=1.0, setup=0.5),
+    "setup_only": dict(setup=1.0),                 # CONTROL: no factor tilt — the base
+                                                   # oversold-reversion. If the tilts flip
+                                                   # sign across windows but this stays
+                                                   # positive on both, the tilt is regime
+                                                   # noise and the base is the real edge.
 }
 
 

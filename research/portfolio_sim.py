@@ -449,6 +449,10 @@ def main() -> None:
                    help="holding periods in bars/days for --factor-sweep")
     p.add_argument("--risks", type=float, nargs="*", default=[0.0075, 0.01],
                    help="risk_pct values for --factor-sweep")
+    p.add_argument("--entry-lag", type=int, default=1,
+                   help="--factor-sweep fill: 1 = next-open (realistic intraday), "
+                        "0 = signal-bar close (captures the close->next-open gap; on "
+                        "DAILY bars a real, market-on-close-fillable price)")
     p.add_argument("--risk-grid", type=float, nargs="*",
                    default=[0.005, 0.0075, 0.01, 0.015, 0.02],
                    help="risk_pct values for --grid-sweep")
@@ -497,12 +501,14 @@ def main() -> None:
         if spy_bars is None:
             print("SPY fetch failed — needed for rs/sector factors.")
             return
+        fill = "next-open" if args.entry_lag else "signal-close (MOC)"
         print(f"  factor sweep | profiles={list(EXPERIMENT_PROFILES)} holds={args.holds} "
               f"K={args.max_positions} risks={args.risks} | heat<={args.max_heat:g} | "
-              f"next-open fill\n")
+              f"{fill} fill (entry_lag={args.entry_lag})\n")
         rows = factor_sweep(symbol_bars, spy_bars, ALL_SECTOR_OF, sector_bars,
                             ks=args.max_positions, holds=args.holds, risks=args.risks,
-                            heat=(args.max_heat or None), rsi_max=args.rsi_max)
+                            heat=(args.max_heat or None), entry_lag=args.entry_lag,
+                            rsi_max=args.rsi_max)
         print(format_factor_sweep(rows))
         return
 

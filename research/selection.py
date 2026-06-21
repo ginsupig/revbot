@@ -80,6 +80,56 @@ def passes_overfit_gate(observed_sharpe: float, n_trials: int, n_obs: int) -> bo
     return deflated_sharpe(observed_sharpe, n_trials, n_obs) > 0.0
 
 
+def _norm_cdf(z: float) -> float:
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _sharpe_and_moments(returns: Sequence[float]):
+    """Per-obs Sharpe + sample skewness + kurtosis (n divisor) of a return series."""
+    xs = [float(x) for x in returns]
+    n = len(xs)
+    if n < 2:
+        return 0.0, 0.0, 3.0, n
+    m = sum(xs) / n
+    var = sum((x - m) ** 2 for x in xs) / n
+    sd = var ** 0.5
+    if sd <= 0:
+        return 0.0, 0.0, 3.0, n
+    sr = m / sd
+    skew = (sum((x - m) ** 3 for x in xs) / n) / sd ** 3
+    kurt = (sum((x - m) ** 4 for x in xs) / n) / sd ** 4
+    return sr, skew, kurt, n
+
+
+def deflated_sharpe_ratio(returns: Sequence[float], n_trials: int) -> float:
+    """Full Deflated Sharpe Ratio (Bailey & Lopez de Prado, 2014) — the *probability*
+    that the observed per-obs Sharpe genuinely exceeds the expected-max bar of
+    ``n_trials`` zero-edge strategies, with the Sharpe estimator's standard error
+    ADJUSTED for the return series' skewness (γ3) and kurtosis (γ4):
+
+        SE(SR) = sqrt( (1 - γ3·SR + ((γ4-1)/4)·SR²) / (n-1) )
+        DSR    = Φ( (SR - SR*) / SE )
+
+    This is statistically superior to the plain normal-approximation deflation for
+    real trading returns, which are fat-tailed (high γ4 widens SE -> a HIGHER bar)
+    and skewed (a trailing-stop book is positively skewed -> a small offset). Returns
+    a probability in [0, 1]; the conventional pass is > 0.95. Research-gating only —
+    does NOT touch the live signal path, so it can't invalidate a backtest."""
+    sr, skew, kurt, n = _sharpe_and_moments(returns)
+    if n < 2:
+        return 0.0
+    sr_star = expected_max_sharpe(n_trials, n)
+    var = max(1.0 - skew * sr + ((kurt - 1.0) / 4.0) * sr * sr, 1e-12) / (n - 1)
+    se = math.sqrt(var)
+    return _norm_cdf((sr - sr_star) / se) if se > 0 else 0.0
+
+
+def passes_dsr_gate(returns: Sequence[float], n_trials: int, confidence: float = 0.95) -> bool:
+    """True iff the moment-adjusted Deflated Sharpe Ratio clears ``confidence``.
+    The more rigorous sibling of ``passes_overfit_gate`` for fat-tailed returns."""
+    return deflated_sharpe_ratio(returns, n_trials) > confidence
+
+
 def robust_across_folds(fold_metrics: Sequence[float], min_positive_frac: float = 0.7) -> bool:
     """True iff the metric is positive in at least ``min_positive_frac`` of folds.
 

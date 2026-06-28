@@ -29,6 +29,7 @@ class PortfolioState:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.state_dir / "portfolio_state.json"
+        self._cache: Dict[str, Any] | None = None
 
     def _default_state(self) -> Dict[str, Any]:
         return {
@@ -45,18 +46,23 @@ class PortfolioState:
         }
 
     def _load(self) -> Dict[str, Any]:
+        if self._cache is not None:
+            return self._cache
         if not self.state_path.exists():
-            return self._default_state()
+            self._cache = self._default_state()
+            return self._cache
         try:
-            return json.loads(self.state_path.read_text(encoding="utf-8"))
+            self._cache = json.loads(self.state_path.read_text(encoding="utf-8"))
         except Exception:
-            return self._default_state()
+            self._cache = self._default_state()
+        return self._cache
 
     @staticmethod
     def _session_today() -> str:
         return datetime.now(_SESSION_TZ).date().isoformat()
 
     def _save(self, data: Dict[str, Any]) -> None:
+        self._cache = data
         self.state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def update_equity(self, account_equity: float, today: str | None = None) -> Dict[str, Any]:
@@ -112,10 +118,14 @@ class PortfolioState:
             "side": side,
         }
         # Trail state: stored at entry so the trailing stop survives restarts.
-        # high_water seeds at the entry price and only ratchets up from there.
+        # Longs: high_water seeds at entry and ratchets up.
+        # Shorts: low_water seeds at entry and ratchets down.
         if entry_price is not None:
             meta["entry_price"] = float(entry_price)
-            meta["high_water"] = float(entry_price)
+            if side == "short":
+                meta["low_water"] = float(entry_price)
+            else:
+                meta["high_water"] = float(entry_price)
         if stop_distance is not None:
             meta["stop_distance"] = float(stop_distance)
         data.setdefault("position_meta", {})[symbol.upper()] = meta
@@ -137,6 +147,22 @@ class PortfolioState:
             self._save(data)
         return hw
 
+    def update_low_water(self, symbol: str, price: float) -> float | None:
+        """Ratchet the stored low-water mark for an open short down to ``price``.
+
+        Returns the new low-water mark, or None if the symbol has no short trail
+        state. Never raises the low-water mark (mirror of update_high_water).
+        """
+        data = self._load()
+        meta = data.get("position_meta", {}).get(symbol.upper())
+        if not meta or "low_water" not in meta:
+            return None
+        lw = min(float(meta["low_water"]), float(price))
+        if lw != meta["low_water"]:
+            meta["low_water"] = lw
+            self._save(data)
+        return lw
+
     def get_trail_state(self, symbol: str):
         """``(entry_price, stop_distance, high_water)`` for an open long, or None
         if the symbol lacks full trail state."""
@@ -146,6 +172,44 @@ class PortfolioState:
         if not all(k in meta for k in ("entry_price", "stop_distance", "high_water")):
             return None
         return float(meta["entry_price"]), float(meta["stop_distance"]), float(meta["high_water"])
+
+    def get_trail_state_short(self, symbol: str):
+        """``(entry_price, stop_distance, low_water)`` for an open short, or None
+        if the symbol lacks full short trail state."""
+        meta = self._load().get("position_meta", {}).get(symbol.upper())
+        if not meta:
+            return None
+        if not all(k in meta for k in ("entry_price", "stop_distance", "low_water")):
+            return None
+        return float(meta["entry_price"]), float(meta["stop_distance"]), float(meta["low_water"])
+
+    def get_all_position_metadata(self) -> Dict[str, Any]:
+        """Return a copy of the full position_meta dict."""
+        return dict(self._load().get("position_meta", {}))
+
+    def update_stop_price(self, symbol: str, new_stop: float) -> None:
+        """Persist a new stop price for *symbol* (used by PositionManager)."""
+        data = self._load()
+        meta = data.get("position_meta", {}).get(symbol.upper())
+        if meta is not None:
+            meta["stop_price"] = float(new_stop)
+            self._save(data)
+
+    def prune_closed_positions(self, open_symbols) -> int:
+        """Remove position_meta entries for symbols no longer held.
+
+        Call periodically (e.g. each cycle) with the live open-symbol set.
+        Returns the number of pruned entries.
+        """
+        data = self._load()
+        meta = data.get("position_meta", {})
+        open_set = {str(s).upper() for s in open_symbols}
+        stale = [sym for sym in meta if sym not in open_set]
+        if stale:
+            for sym in stale:
+                del meta[sym]
+            self._save(data)
+        return len(stale)
 
     def open_style_regime_counts(self, open_symbols) -> tuple[Dict[str, int], Dict[str, int]]:
         """Reconstruct per-style and per-regime counts for currently-open symbols.
@@ -185,10 +249,10 @@ class PortfolioState:
         side = "short" if candidate.get("go_short") else "long"
         ts = datetime.now(timezone.utc).isoformat()
         # Pull entry price + stop distance from the plan so the trailing stop has
-        # its anchor (longs only; the trail is a long-side feature).
+        # its anchor. Both longs AND shorts now have trailing stops.
         plan = candidate.get("position_plan") or {}
-        entry_price = plan.get("entry_price") if side == "long" else None
-        stop_distance = plan.get("risk_per_share") if side == "long" else None
+        entry_price = plan.get("entry_price")
+        stop_distance = plan.get("risk_per_share")
         self.note_new_position(symbol, entry_style, regime, ts, side=side,
                                entry_price=entry_price, stop_distance=stop_distance)
 

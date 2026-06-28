@@ -22,7 +22,6 @@ class AlpacaExecutor:
             self.client = AlpacaPyClient(api_key, secret_key, exec_config.base_url)
         else:
             self.client = REST(api_key, secret_key, exec_config.base_url)
-        self._order_ids = set()
         self._tif = getattr(exec_config, "tif", "day") or "day"
         # Marketable-limit entries cap entry slippage: the entry leg is priced a
         # few bps through the planned entry so it still crosses and fills, rather
@@ -94,7 +93,10 @@ class AlpacaExecutor:
                 logging.debug(f"Tradable, easy_to_borrow, active, major exchange, no dot, all uppercase: {len(tradable)}")
                 # Sort by market cap if available, else by symbol
                 tradable = sorted(tradable, key=lambda x: getattr(x, 'market_cap', 0), reverse=True)
-                symbols = [a.symbol for a in tradable if float(getattr(a, 'min_price', 0) or 0) >= min_price][:max_count*2]
+                # All tradable symbols are candidates — price filtering happens
+                # below via get_latest_trade (the Alpaca asset object has no
+                # min_price attribute; the old filter was always-false).
+                symbols = [a.symbol for a in tradable][:max_count*2]
                 filtered = []
                 for sym in symbols:
                     try:
@@ -149,10 +151,6 @@ class AlpacaExecutor:
         if self.has_open_order(symbol):
             raise RuntimeError(f"Working order already exists for {symbol}.")
 
-        order_key = self._order_key(symbol, plan)
-        if order_key in self._order_ids:
-            raise RuntimeError(f"Duplicate order detected for {order_key}.")
-
         order_data = {
             "symbol": symbol,
             "qty": plan.qty,
@@ -164,9 +162,7 @@ class AlpacaExecutor:
             **self._entry_order_type(plan.entry_price, "buy"),
         }
 
-        response = self.client.submit_order(**order_data)
-        self._order_ids.add(order_key)
-        return response
+        return self.client.submit_order(**order_data)
 
     def open_short_bracket(self, symbol: str, plan: PositionPlan):
         symbol = symbol.strip().upper()
@@ -182,10 +178,6 @@ class AlpacaExecutor:
         if self.has_open_order(symbol):
             raise RuntimeError(f"Working order already exists for {symbol}.")
 
-        order_key = self._order_key(symbol, plan)
-        if order_key in self._order_ids:
-            raise RuntimeError(f"Duplicate order detected for {order_key}.")
-
         order_data = {
             "symbol": symbol,
             "qty": plan.qty,
@@ -198,24 +190,22 @@ class AlpacaExecutor:
             **self._entry_order_type(plan.entry_price, "sell"),
         }
 
-        response = self.client.submit_order(**order_data)
-        self._order_ids.add(order_key)
-        return response
+        return self.client.submit_order(**order_data)
 
     def submit_order(self, candidate: dict):
         symbol = candidate["symbol"]
-        pd = candidate["position_plan"]
+        plan_data = candidate["position_plan"]
         plan = PositionPlan(
-            qty=pd["qty"],
-            entry_price=pd["entry_price"],
-            stop_price=pd["stop_price"],
-            target_price=pd["target_price"],
-            risk_per_share=pd["risk_per_share"],
-            reward_per_share=pd["reward_per_share"],
-            rr_ratio=pd["rr_ratio"],
-            position_value=pd["position_value"],
-            max_account_risk=pd["max_account_risk"],
-            side=pd.get("side", "long"),
+            qty=plan_data["qty"],
+            entry_price=plan_data["entry_price"],
+            stop_price=plan_data["stop_price"],
+            target_price=plan_data["target_price"],
+            risk_per_share=plan_data["risk_per_share"],
+            reward_per_share=plan_data["reward_per_share"],
+            rr_ratio=plan_data["rr_ratio"],
+            position_value=plan_data["position_value"],
+            max_account_risk=plan_data["max_account_risk"],
+            side=plan_data.get("side", "long"),
         )
         # Prefer the candidate's explicit go_short flag; fall back to plan side.
         if candidate.get("go_short") or plan.side == "short":
@@ -288,6 +278,29 @@ class AlpacaExecutor:
             logging.warning("update_trailing_stop failed for %s: %s", symbol, e)
             return None
 
+    def update_trailing_stop_short(self, symbol, entry_price, stop_distance,
+                                   low_water, last_price, stop_mult, trail_mult):
+        """Best-effort: lower the symbol's stop leg toward the short trailing stop.
+
+        Mirror of update_trailing_stop for shorts: ratchets the stop DOWN as
+        the short position profits (price falls). Returns the new stop price
+        if it was moved down, else None. Never raises.
+        """
+        from .trailing import trailing_stop_price_short, should_lower_stop
+        try:
+            leg = self.open_stop_leg(symbol)
+            if not leg or not leg.get("id"):
+                return None
+            desired = trailing_stop_price_short(entry_price, stop_distance,
+                                                low_water, stop_mult, trail_mult)
+            if not should_lower_stop(leg["stop_price"], desired, last_price):
+                return None
+            self.replace_stop_order(leg["id"], desired)
+            return round(float(desired), 2)
+        except Exception as e:  # noqa: BLE001 - guarded; the fixed stop remains
+            logging.warning("update_trailing_stop_short failed for %s: %s", symbol, e)
+            return None
+
     def get_positions(self):
         return self.client.list_positions()
 
@@ -308,6 +321,24 @@ class AlpacaExecutor:
         self._cancel_orders_for_symbol(symbol)
         # Cancelled qty can take a beat to free server-side, so the first close
         # may still see held shares; retry a few times before giving up.
+        last_exc: Exception | None = None
+        for _ in range(3):
+            try:
+                return self.client.close_position(symbol)
+            except Exception as e:  # noqa: BLE001 - retried/propagated below
+                last_exc = e
+                sleep(0.5)
+        raise last_exc
+
+    def close_short(self, symbol: str):
+        """Market-cover a SHORT position, cancelling ITS working orders first.
+
+        Mirror of close_long: cancel the bracket legs (which hold qty), then
+        submit a buy-to-cover via close_position. Per-symbol so other names'
+        brackets are untouched.
+        """
+        symbol = symbol.strip().upper()
+        self._cancel_orders_for_symbol(symbol)
         last_exc: Exception | None = None
         for _ in range(3):
             try:
@@ -400,13 +431,3 @@ class AlpacaExecutor:
             raise ValueError("Stop price must be above entry for short bracket.")
         if plan.target_price >= plan.entry_price:
             raise ValueError("Target price must be below entry for short bracket.")
-
-    @staticmethod
-    def _order_key(symbol: str, plan: PositionPlan) -> str:
-        return "|".join([
-            symbol,
-            f"{plan.qty}",
-            f"{plan.entry_price:.2f}",
-            f"{plan.stop_price:.2f}",
-            f"{plan.target_price:.2f}",
-        ])

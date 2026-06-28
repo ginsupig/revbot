@@ -76,7 +76,6 @@ def make_executor(positions=None, use_limit_entry=False, limit_offset_bps=8.0,
     # Bypass __init__ so we never construct a real Alpaca REST client / hit network.
     ex = AlpacaExecutor.__new__(AlpacaExecutor)
     ex.client = FakeClient(positions, open_orders=open_orders, close_fail_times=close_fail_times)
-    ex._order_ids = set()
     ex._tif = "day"
     ex._use_limit_entry = use_limit_entry
     ex._limit_offset_bps = limit_offset_bps

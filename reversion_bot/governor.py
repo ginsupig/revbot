@@ -38,10 +38,11 @@ class ExecutionGovernor:
         Falls back to negative unrealized P&L when no metadata is available
         (carryover positions opened before tracking was added).
         """
+        all_meta = self.portfolio_state.get_all_position_metadata() if self.portfolio_state else {}
         total = 0.0
         for p in positions:
             sym = str(getattr(p, "symbol", "")).upper()
-            meta = self.portfolio_state._load().get("position_meta", {}).get(sym) if self.portfolio_state else None
+            meta = all_meta.get(sym)
             if meta and "stop_distance" in meta:
                 qty = abs(float(getattr(p, "qty", 0)))
                 total += qty * float(meta["stop_distance"])

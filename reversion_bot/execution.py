@@ -359,7 +359,7 @@ class AlpacaExecutor:
         try:
             orders = self.client.list_orders(status="open", limit=500)
         except Exception as e:  # noqa: BLE001 - logged, close still attempted
-            logging.warning("close_long: order list failed for %s: %s", symbol, e)
+            logging.warning("close_position: order list failed for %s: %s", symbol, e)
             return
         for o in orders:
             if str(getattr(o, "symbol", "")).upper() != symbol:
@@ -371,7 +371,7 @@ class AlpacaExecutor:
                 self.client.cancel_order(order_id)
             except Exception as e:  # noqa: BLE001 - one leg failing must not block
                 logging.warning(
-                    "close_long: cancel order %s for %s failed: %s", order_id, symbol, e
+                    "close_position: cancel order %s for %s failed: %s", order_id, symbol, e
                 )
 
     def open_order_symbols(self) -> set:

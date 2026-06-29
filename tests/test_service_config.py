@@ -18,8 +18,11 @@ def _svc(tmp_path, **kwargs):
     )
 
 
-def test_min_trade_score_defaults_to_036(tmp_path):
-    assert _svc(tmp_path).min_trade_score == 0.36
+def test_min_trade_score_defaults_to_045(tmp_path):
+    # Routed gating: threshold is against the primary component score (not the
+    # anti-correlated blend), so 0.45 is the right default (a validated
+    # reversion signal starts at 0.45 base).
+    assert _svc(tmp_path).min_trade_score == 0.45
 
 
 def test_min_trade_score_override_is_respected(tmp_path):
@@ -109,15 +112,16 @@ def test_unfit_model_retries_fit_off_the_25_tick(tmp_path):
 
 
 def test_short_bias_threads_through_service(tmp_path):
-    # With unreachable normal short thresholds, a short only fires when the
-    # service passes short_bias=True down to the engine.
+    # With unreachable normal short thresholds (AND gate: both must hold), a
+    # short only fires when the service passes short_bias=True down to the engine
+    # AND the risk-off thresholds are reachable.
     from reversion_bot.config import ReversionConfig, RiskConfig
     from test_engine import make_overbought_df
 
     cfg = ReversionConfig(
         min_history=60, enable_shorts=True, use_trend_filter=False,  # isolate short_bias threading
-        rsi_min=99.0, ri_short_threshold=9.0,
-        risk_off_rsi_min=30.0, risk_off_ri_short_threshold=0.0,
+        rsi_min=99.0, ri_short_threshold=9.0,           # normal AND gate: unreachable
+        risk_off_rsi_min=30.0, risk_off_ri_short_threshold=0.0,  # risk-off AND gate: easy
     )
     svc = ReversionService(cfg, RiskConfig(), PerformanceConfig(state_dir=str(tmp_path)))
     df = make_overbought_df()

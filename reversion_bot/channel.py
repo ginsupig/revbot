@@ -81,3 +81,30 @@ def select_breakout_exits(
         if pos is not None and pos >= threshold:
             out.append(symbol)
     return out
+
+
+def select_breakdown_exits(
+    positions,
+    closes_by_symbol: Dict[str, Sequence[float]],
+    threshold: float = 0.20,
+    lookback: int = 80,
+    k: float = 2.0,
+) -> List[str]:
+    """Symbols of SHORT positions whose latest close has reached the lower channel.
+
+    Mirror of select_breakout_exits: when a short has ridden price down to the
+    lower regression channel band (channel position <= threshold), take profit
+    by covering. The broker-side stop + bracket target remain the safety net.
+    """
+    out: List[str] = []
+    for p in positions:
+        if _safe_float(getattr(p, "qty", 0)) >= 0:
+            continue  # shorts only (qty < 0)
+        symbol = str(getattr(p, "symbol", "")).upper()
+        closes = closes_by_symbol.get(symbol)
+        if closes is None:
+            continue
+        pos = regression_channel_position(closes, lookback, k)
+        if pos is not None and pos <= threshold:
+            out.append(symbol)
+    return out

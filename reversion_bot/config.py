@@ -21,7 +21,13 @@ class ReversionConfig:
     adx_hard_max: float = 50.0
 
     rsi_length: int = 14
-    rsi_max: float = 48.0
+    # RSI oversold gate for longs. AND gate requires BOTH RI and RSI to confirm
+    # oversold, filtering out weak dips that are trend continuations. The old OR
+    # gate with rsi_max=48 fired on ~50% of bars, making the filter near-vacuous.
+    # 40 requires genuine oversold momentum before entering.
+    rsi_max: float = 40.0
+    # "and" = both RI and RSI must confirm; "or" = either suffices (legacy).
+    oversold_gate: str = "and"
     rsi_hard_max: float = 70.0
 
     # --- Short side (mean-reversion mirror) ---------------------------------
@@ -30,19 +36,31 @@ class ReversionConfig:
     # around the neutral midpoints (RI 0, RSI 50). rsi_hard_min guards against
     # shorting into a capitulation that is *also* strongly trending (the mirror
     # of rsi_hard_max, which blocks longs into a blow-off top).
+    # Shorts OFF by default: the two-window OOS backtest (2024-2026) showed the
+    # short side bleeding on daily large-caps (8% WR, -1.9% avg trade). Every
+    # "overbought rip" in a secular bull is actually a breakout. The code is
+    # there for bearish regimes — gate with USE_MARKET_REGIME_FILTER +
+    # ENABLE_SHORTS + FAVOR_SHORTS_IN_RISK_OFF to activate only when the tape
+    # confirms a downtrend.
     enable_shorts: bool = False
     ri_short_threshold: float = 0.5
-    rsi_min: float = 52.0
+    # RSI overbought gate for shorts: genuinely overbought (was 52, too loose —
+    # RSI 53 is barely above neutral). 65 requires a real rip before shorting.
+    rsi_min: float = 65.0
     rsi_hard_min: float = 30.0
     # Relaxed short-entry thresholds used only when the market is risk-off AND
     # favor-shorts mode is on: in a confirmed downtrend, fade rips more eagerly
     # (a lower overbought bar) since bounces tend to fail. Applied via the
     # short_bias flag threaded from main.py through the engine.
-    risk_off_rsi_min: float = 45.0
-    risk_off_ri_short_threshold: float = 0.25
+    risk_off_rsi_min: float = 55.0
+    risk_off_ri_short_threshold: float = 0.30
 
     min_history: int = 160
 
+    # Confirmation filters — OFF by default. The OOS backtest showed the loose
+    # config (no reclaim/bullish requirement) producing 2.14 PF vs 1.15 with
+    # confirmations. The extra filters cut too many winners on daily bars.
+    # The improved reclaim/reject logic is still available when turned on.
     require_reclaim_lb1: bool = False
     require_bullish_close: bool = False
     require_volume_expansion: bool = False
@@ -173,5 +191,5 @@ class PortfolioConfig:
     symbol_cooldown_minutes: int = 30
     # After an entry, block re-entry in the OPPOSITE direction on the same
     # symbol for this many minutes (whipsaw guard: short->stop->long churn).
-    # 0 = off. The plain symbol cooldown still blocks all re-entry separately.
-    direction_flip_cooldown_minutes: int = 0
+    # 60 min default: prevents rapid flip-flops while allowing genuine reversals.
+    direction_flip_cooldown_minutes: int = 60

@@ -8,12 +8,19 @@ import pandas as pd
 from .sectors import sector_for, etf_for_sector
 
 
-def is_risk_off(bars: pd.DataFrame | None, ema_length: int = 50) -> bool:
-    """True when the benchmark's latest close sits below its trend EMA.
+def is_risk_off(
+    bars: pd.DataFrame | None,
+    ema_length: int = 50,
+    buffer_pct: float = 0.005,
+    confirm_bars: int = 3,
+) -> bool:
+    """True when the benchmark is convincingly below its trend EMA.
 
-    This is the bot's market-regime gate: when a broad benchmark (e.g. SPY) is
-    trending down, dip-buying every oversold name is the losing trade, so the
-    caller suppresses new longs.
+    Hysteresis prevents whipsaw when the benchmark oscillates near its EMA:
+    - ``buffer_pct``: close must be below ``EMA * (1 - buffer_pct)`` to flip
+      risk-off on a single bar (a decisive break, default 0.5%).
+    - ``confirm_bars``: OR, close has been below EMA for this many consecutive
+      bars (a slow grind, default 3). Either condition suffices.
 
     Fail-open by design: returns False (risk-on) on missing/short/NaN data so a
     benchmark fetch hiccup never halts all trading.
@@ -27,7 +34,18 @@ def is_risk_off(bars: pd.DataFrame | None, ema_length: int = 50) -> bool:
     # NaN guard (NaN != NaN).
     if last_close != last_close or last_ema != last_ema:
         return False
-    return last_close < last_ema
+
+    # Decisive break: close below EMA by more than the buffer
+    if last_close < last_ema * (1.0 - buffer_pct):
+        return True
+
+    # Slow grind: N consecutive bars below EMA (no buffer required)
+    if confirm_bars > 0 and len(close) >= confirm_bars:
+        below = close.iloc[-confirm_bars:] < ema.iloc[-confirm_bars:]
+        if below.all():
+            return True
+
+    return False
 
 
 def classify_regime_series(

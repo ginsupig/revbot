@@ -165,7 +165,11 @@ async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int) -
         start = (now_utc - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         end = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
         bars = await asyncio.to_thread(fetch_alpaca_bars, symbol, start, end, timeframe)
-        return is_risk_off(bars, ema_length)
+        return is_risk_off(
+            bars, ema_length,
+            buffer_pct=float(os.getenv("REGIME_BUFFER_PCT", 0.005)),
+            confirm_bars=int(os.getenv("REGIME_CONFIRM_BARS", 3)),
+        )
     except Exception as e:
         print(f"[REGIME] benchmark fetch failed ({e}); treating as risk-on.")
         return False
@@ -214,7 +218,7 @@ async def evaluate_sector_regime(active_sectors, timeframe: str, ema_length: int
             regime[sector] = fresh[etf]
     return regime
 
-async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor, short_bias=False):
+async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor, short_bias=False, account_equity=None):
     try:
         if await asyncio.to_thread(executor.has_open_position, symbol):
             return None
@@ -224,7 +228,8 @@ async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor, s
             return None
 
         bars = bars.tail(lookback)
-        account_equity = await asyncio.to_thread(get_account_equity, executor)
+        if account_equity is None:
+            account_equity = await asyncio.to_thread(get_account_equity, executor)
         result = await asyncio.to_thread(service.evaluate_symbol, symbol, bars, account_equity, short_bias)
         result["_account_equity"] = account_equity
         return result
@@ -661,7 +666,8 @@ async def main():
         trend_ema_length=int(os.getenv("TREND_EMA_LENGTH", 50)),
         # Long oversold gates.
         ri_threshold=float(os.getenv("RI_THRESHOLD", -0.5)),
-        rsi_max=float(os.getenv("RSI_MAX", 48.0)),
+        rsi_max=float(os.getenv("RSI_MAX", 40.0)),
+        oversold_gate=os.getenv("OVERSOLD_GATE", "and"),
         adx_max=float(os.getenv("ADX_MAX", 40.0)),
         adx_hard_max=float(os.getenv("ADX_HARD_MAX", 50.0)),
         rsi_hard_max=float(os.getenv("RSI_HARD_MAX", 70.0)),
@@ -966,8 +972,14 @@ async def main():
                 if off:
                     print(f"[REGIME] sector risk-off (EMA{regime_ema}): {', '.join(off)}")
 
+            # Fetch equity once per cycle — not per symbol (saves ~20 API calls).
+            try:
+                cycle_equity = await asyncio.to_thread(get_account_equity, executor)
+            except Exception:
+                cycle_equity = None
+
             eval_tasks = [
-                evaluate_symbol_only(s, lookback, timeframe, service, executor, short_bias)
+                evaluate_symbol_only(s, lookback, timeframe, service, executor, short_bias, account_equity=cycle_equity)
                 for s in symbols
             ]
             raw_results = await asyncio.gather(*eval_tasks)

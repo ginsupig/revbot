@@ -29,7 +29,7 @@ def gate_decision(
     decision_signal: str,
     router_reason: str,
     threshold: float,
-    mode: str = "blended",
+    mode: str = "routed",
     short_bias: bool = False,
 ) -> Tuple[bool, bool]:
     """Return (go_long, go_short) for the given gate ``mode``.
@@ -40,10 +40,11 @@ def gate_decision(
     """
     is_short = decision_signal == "SHORT_REVERSION"
 
-    if mode == "routed":
-        gate_score = float(component_scores.get(entry_style, weighted_score))
-    else:
+    # Default is "routed": gate on the primary component, not the blend.
+    if mode == "blended":
         gate_score = float(weighted_score)
+    else:
+        gate_score = float(component_scores.get(entry_style, weighted_score))
 
     passes = gate_score >= threshold and router_reason != "score_below_threshold"
 

@@ -173,6 +173,68 @@ class TestAtrGuard:
         assert decision.reason == "ATR_Invalid"
 
 
+# ── 3b. ADX trend filter + AND oversold gate ────────────────────────────
+
+class TestAdxAndOversoldGate:
+    def _make_df_with_values(self, engine, adx, rsi, ri, close_val=95.0, lb1_val=96.0):
+        """Build indicators df then override key values on the last row."""
+        n = 160
+        idx = pd.date_range("2026-01-01", periods=n, freq="min")
+        base = np.linspace(100, 101, n)
+        noise = np.random.default_rng(7).normal(0, 0.15, n)
+        close = base + noise
+        open_ = close + np.random.default_rng(8).normal(0, 0.05, n)
+        high = np.maximum(open_, close) + 0.10
+        low = np.minimum(open_, close) - 0.10
+        raw = pd.DataFrame({"open": open_, "high": high, "low": low,
+                            "close": close, "volume": np.full(n, 50000)}, index=idx)
+        df = engine.calculate_indicators(raw)
+        # Force last row values to test specific conditions
+        df.iloc[-1, df.columns.get_loc("adx")] = adx
+        df.iloc[-1, df.columns.get_loc("rsi")] = rsi
+        df.iloc[-1, df.columns.get_loc("ri")] = ri
+        df.iloc[-1, df.columns.get_loc("close")] = close_val
+        df.iloc[-1, df.columns.get_loc("lb1")] = lb1_val
+        return df
+
+    def test_adx_too_strong_blocks_entry(self):
+        engine = _engine(adx_max=40.0, oversold_gate="or", rsi_max=48.0, use_trend_filter=False)
+        df = self._make_df_with_values(engine, adx=45.0, rsi=30.0, ri=-0.8)
+        decision = engine.get_decision(df, symbol="TEST")
+        assert decision.signal == "WAIT"
+        assert decision.reason == "ADX_Trend_Too_Strong"
+
+    def test_adx_below_max_allows_entry(self):
+        engine = _engine(adx_max=40.0, oversold_gate="or", rsi_max=48.0, use_trend_filter=False)
+        df = self._make_df_with_values(engine, adx=35.0, rsi=30.0, ri=-0.8)
+        decision = engine.get_decision(df, symbol="TEST")
+        # Should not be blocked by ADX (may still be WAIT for other reasons)
+        assert decision.reason != "ADX_Trend_Too_Strong"
+
+    def test_and_gate_requires_both(self):
+        engine = _engine(oversold_gate="and", rsi_max=40.0, ri_threshold=-0.5,
+                         adx_max=50.0, use_trend_filter=False)
+        # RI oversold but RSI NOT oversold -> should fail AND gate
+        df = self._make_df_with_values(engine, adx=25.0, rsi=45.0, ri=-0.8)
+        decision = engine.get_decision(df, symbol="TEST")
+        assert decision.reason == "RI_Not_Oversold"  # AND gate failed
+
+    def test_and_gate_passes_when_both_oversold(self):
+        engine = _engine(oversold_gate="and", rsi_max=40.0, ri_threshold=-0.5,
+                         adx_max=50.0, use_trend_filter=False)
+        df = self._make_df_with_values(engine, adx=25.0, rsi=30.0, ri=-0.8)
+        decision = engine.get_decision(df, symbol="TEST")
+        assert decision.reason != "RI_Not_Oversold"
+
+    def test_or_gate_passes_with_rsi_only(self):
+        engine = _engine(oversold_gate="or", rsi_max=48.0, ri_threshold=-0.5,
+                         adx_max=50.0, use_trend_filter=False)
+        # RI NOT oversold but RSI IS -> OR gate passes
+        df = self._make_df_with_values(engine, adx=25.0, rsi=40.0, ri=-0.2)
+        decision = engine.get_decision(df, symbol="TEST")
+        assert decision.reason != "RI_Not_Oversold"
+
+
 # ── 4. Short trailing stop ──────────────────────────────────────────────
 
 class TestTrailingStopShort:

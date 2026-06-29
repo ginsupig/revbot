@@ -78,7 +78,12 @@ class ReversionService:
             "trendfail": 0.15,
             "trend_following": 0.30,
         }
-        self.min_trade_score = 0.36 if min_trade_score is None else float(min_trade_score)
+        # Routed gating: the entry threshold is checked against the PRIMARY
+        # component score (e.g. mean_reversion for MR entries), not the blend.
+        # 0.45 = a validated reversion signal (base 0.15 + 0.20 for validated
+        # = 0.35) must earn at least 0.10 from depth/stretch/RSI/ADX bonuses
+        # to pass, ensuring some genuine conviction beyond the bare signal.
+        self.min_trade_score = 0.45 if min_trade_score is None else float(min_trade_score)
 
         self.logger = logging.getLogger("ReversionService")
         self.logger.setLevel(logging.INFO)
@@ -158,13 +163,16 @@ class ReversionService:
             return payload
 
         is_short_signal = decision.signal == "SHORT_REVERSION"
-        passes_score = weighted_score >= threshold and router_reason != "score_below_threshold"
+
+        # ROUTED GATING: gate on the PRIMARY component score for the routed
+        # entry style, not the blended score. This prevents anti-correlated
+        # components (trend-following when reversion fires, or vice versa) from
+        # diluting the gate and producing mushy entries.
+        gate_score = float(component_scores.get(entry_style, weighted_score))
+        passes_score = gate_score >= threshold and router_reason != "score_below_threshold"
 
         go_long = passes_score and not is_short_signal
-        # Shorts are mean-reversion only and require conviction in that component,
-        # so an overbought rip routed to any other style never opens a short.
-        # In risk-off favor-shorts mode the conviction floor is relaxed slightly
-        # so the loosened engine trigger actually produces trades.
+        # Shorts are mean-reversion only and require conviction in that component.
         mr_floor = 0.40 if short_bias else 0.45
         go_short = (
             passes_score
@@ -208,11 +216,13 @@ class ReversionService:
 
         if go_long or go_short:
             side = "short" if go_short else "long"
+            # Use the routed component score for conviction sizing — the primary
+            # signal's own strength, not the diluted blend.
             plan = self.risk.build_plan_for_style(
                 entry_style=entry_style,
                 account_equity=account_equity,
                 decision=decision,
-                conviction_score=weighted_score,
+                conviction_score=gate_score,
                 side=side,
             )
             if plan is None:
@@ -227,7 +237,7 @@ class ReversionService:
                 payload["go_long"] = True
             payload["portfolio_heat"] = float(plan.qty) * float(plan.risk_per_share)
 
-            hour = datetime.utcnow().hour
+            hour = datetime.now(timezone.utc).hour
             time_bucket = time_bucket_from_hour(hour)
             self.perf.log_trade(
                 TradeRecord(
@@ -282,7 +292,7 @@ class ReversionService:
         )
 
     def _persist_eval(self, symbol, regime, entry_style, decision, router_reason, weighted_score, threshold, row, go_long: bool = False):
-        hour = datetime.utcnow().hour
+        hour = datetime.now(timezone.utc).hour
         time_bucket = time_bucket_from_hour(hour)
         self.perf.log_evaluation(
             EvalRecord(
@@ -351,9 +361,9 @@ class ReversionService:
     def _score_mean_reversion(self, decision, enriched: pd.DataFrame, engine: ReversionEngine | None = None) -> float:
         engine = engine or self.engine
         is_short = decision.signal == "SHORT_REVERSION"
-        score = 0.20
+        score = 0.15
         if decision.signal in ("LONG_REVERSION", "SHORT_REVERSION"):
-            score += 0.25
+            score += 0.20
         # Band depth: how far past the entry band the price has stretched.
         # Long measures depth below lb1 (toward lb2); short mirrors it above ub1.
         if is_short:

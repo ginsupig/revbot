@@ -5,6 +5,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from dotenv import load_dotenv
 from reversion_bot.walkforward import run_walkforward_backtest
+from reversion_bot.bar_batch import split_bars_by_symbol
 
 
 def _parse_timeframe(timeframe) -> TimeFrame:
@@ -91,6 +92,48 @@ def fetch_alpaca_bars(symbol, start, end, timeframe='1Day'):
     bars = bars.reset_index()
     bars = bars.rename(columns={'timestamp': 'date'})
     return bars
+
+
+def fetch_alpaca_bars_batch(symbols, start, end, timeframe='1Day'):
+    """Fetch bars for MANY symbols in a single Alpaca request.
+
+    Alpaca's StockBarsRequest accepts a list of symbols and returns them all in
+    one HTTP call, so a 90-name universe costs one connection instead of 90. The
+    live trap this fixes: per-symbol fetches fan out ~30 concurrent TLS handshakes
+    to data.alpaca.markets, and on a slow link enough of them time out that the
+    bot goes blind (couldn't compute candidates in the MOC window). Returns
+    ``{symbol: DataFrame}`` shaped exactly like ``fetch_alpaca_bars`` (a ``date``
+    column, one frame per symbol). Symbols the feed returns no rows for are simply
+    absent from the dict — the caller can fall back to a per-symbol fetch."""
+    load_dotenv()
+    api_key = os.getenv('APCA_API_KEY_ID')
+    api_secret = os.getenv('APCA_API_SECRET_KEY')
+    base_url = os.getenv('APCA_API_BASE_URL')
+
+    if not api_key or not api_secret:
+        raise ValueError("Missing Alpaca API credentials. Check your .env file.")
+
+    syms = [symbols] if isinstance(symbols, str) else list(symbols)
+    if not syms:
+        return {}
+
+    if base_url and base_url.startswith("https://data"):
+        client = StockHistoricalDataClient(api_key, api_secret, url_override=base_url)
+    else:
+        client = StockHistoricalDataClient(api_key, api_secret)
+
+    _apply_http_timeout(client, float(os.getenv("ALPACA_HTTP_TIMEOUT", "15")))
+
+    tf = _parse_timeframe(timeframe)
+    req_kwargs = {'symbol_or_symbols': syms, 'timeframe': tf}
+    if start is not None:
+        req_kwargs['start'] = start
+    if end is not None:
+        req_kwargs['end'] = end
+    req = StockBarsRequest(**req_kwargs, feed='iex')
+
+    df = client.get_stock_bars(req).df
+    return split_bars_by_symbol(df, single_symbol=syms[0] if len(syms) == 1 else None)
 
 
 def main():

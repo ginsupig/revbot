@@ -634,6 +634,12 @@ async def main():
     # USE_BROAD_REVERSION_UNIVERSE=true. See reversion_bot/swing.py.
     swing_mode = parse_bool(os.getenv("SWING_OVERNIGHT_MODE", "False"), default=False)
     moc_window_min = int(os.getenv("MOC_ENTRY_WINDOW_MINUTES", 20))
+    # Persistent daemon mode (opt-in, default OFF = today's exit-at-close behavior).
+    # When ON, the bot does NOT exit at the close — it sleeps until the next session
+    # and keeps running, so you launch it ONCE and it's always alive for the MOC
+    # window (no scheduler/relaunch needed). Recommended with SWING_OVERNIGHT_MODE.
+    run_persistent = parse_bool(os.getenv("RUN_PERSISTENT", "False"), default=False)
+    persist_sleep_s = int(os.getenv("PERSIST_CLOSED_SLEEP_SECONDS", 600))
     regime_symbol = os.getenv("MARKET_REGIME_SYMBOL", "SPY")
     regime_timeframe = os.getenv("MARKET_REGIME_TIMEFRAME", "1Day")
     regime_ema = int(os.getenv("MARKET_REGIME_EMA", 50))
@@ -893,6 +899,7 @@ async def main():
     await reconcile_trade_outcomes(service, api_key, api_secret, base_url, outcome_reconcile_days)
 
     cycle = 0
+    last_booked_date = None      # persistent mode: book outcomes once per closed session
     try:
         while True:
             market_open = await asyncio.to_thread(is_market_open, executor)
@@ -911,23 +918,31 @@ async def main():
                 pass
 
             if not market_open:
-                # End-of-day: once the session is over, flatten anything still
-                # open (covers half-days where the 14:50 CT EOD window never
-                # fired) and exit cleanly (code 0) so the supervisor stops until
-                # tomorrow's open trigger. Pre-open, just sleep until the bell.
-                if await asyncio.to_thread(is_session_over, executor):
+                # End-of-day: once the session is over, flatten anything still open
+                # (intraday mode) and book the session's realized outcomes. In
+                # non-persistent mode the bot then exits cleanly (a scheduler/
+                # supervisor relaunches it next session); in RUN_PERSISTENT mode it
+                # sleeps and stays alive so it's always up for the next MOC window.
+                # Pre-open, just sleep until the bell.
+                session_over = await asyncio.to_thread(is_session_over, executor)
+                if session_over:
                     # Swing mode holds overnight (the ATR trail manages positions);
                     # only flatten at session end in intraday mode.
                     if not holds_overnight(swing_mode):
                         await liquidate_all_positions(executor)
-                    # Book the session's realized outcomes so adaptation reflects
-                    # what actually happened (closes booked even while others hold).
-                    await reconcile_trade_outcomes(service, api_key, api_secret, base_url, outcome_reconcile_days)
+                    today_ct = _today_ct()
+                    if today_ct != last_booked_date:        # book once per closed session
+                        await reconcile_trade_outcomes(service, api_key, api_secret, base_url, outcome_reconcile_days)
+                        last_booked_date = today_ct
                     held = " (holding overnight)" if holds_overnight(swing_mode) else ""
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [SESSION] Market closed for the day{held}. Exiting cleanly.")
-                    break
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed (pre-open). Sleeping...")
-                await asyncio.sleep(poll_interval)
+                    if not run_persistent:
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [SESSION] Market closed for the day{held}. Exiting cleanly.")
+                        break
+                # Persistent (or pre-open): stay alive. Sleep longer while closed.
+                phase = "post-close" if session_over else "pre-open"
+                nap = persist_sleep_s if (session_over and run_persistent) else poll_interval
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed ({phase}). Sleeping {nap}s...")
+                await asyncio.sleep(nap)
                 continue
 
             if is_eod_liquidation_window(executor) and not holds_overnight(swing_mode):

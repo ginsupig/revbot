@@ -28,11 +28,13 @@ def _log(msg: str) -> None:
 
 
 def main() -> int:
-    fast_exit_backoff = 30      # seconds to wait after a crash (fast exit)
-    normal_relaunch = 20        # seconds to wait after a clean exit (e.g. at the close)
-    fast_exit_threshold = 60    # a run shorter than this is treated as a crash
+    crash_backoff = 60          # after a CRASH (rc != 0): relaunch soon
+    clean_backoff = 900         # after a CLEAN exit (rc == 0, e.g. market-closed): wait
+    long_run_relaunch = 20      # after a long run that then ended: relaunch promptly
 
     _log("starting. Launching main.py; will relaunch on exit. Ctrl+C to stop.")
+    _log("NOTE: prefer RUN_PERSISTENT=true — then main.py never exits and this "
+         "supervisor is just crash-insurance (no relaunch spam).")
     while True:
         started = time.monotonic()
         try:
@@ -41,19 +43,26 @@ def main() -> int:
             _log("Ctrl+C — stopping supervisor.")
             return 0
         except Exception as e:                     # never let the supervisor itself die
-            _log(f"launch error: {e!r} — retrying in {fast_exit_backoff}s")
-            time.sleep(fast_exit_backoff)
+            _log(f"launch error: {e!r} — retrying in {crash_backoff}s")
+            time.sleep(crash_backoff)
             continue
 
         ran_for = time.monotonic() - started
-        if ran_for < fast_exit_threshold:
-            _log(f"bot exited fast ({ran_for:.0f}s, rc={rc}) — likely an error. "
-                 f"Backing off {fast_exit_backoff}s.")
-            time.sleep(fast_exit_backoff)
+        if rc != 0:
+            _log(f"bot CRASHED (ran {ran_for:.0f}s, rc={rc}) — relaunching in {crash_backoff}s.")
+            time.sleep(crash_backoff)
+        elif ran_for < 60:
+            # Clean, fast exit = the bot chose to stop (e.g. market closed, non-
+            # persistent). Do NOT hot-loop — wait a long while. (Set RUN_PERSISTENT
+            # so the bot stays up instead and this branch never fires.)
+            _log(f"bot exited cleanly & fast ({ran_for:.0f}s) — it chose to stop "
+                 f"(market closed / non-persistent). Waiting {clean_backoff}s. "
+                 f"Set RUN_PERSISTENT=true to keep it alive instead.")
+            time.sleep(clean_backoff)
         else:
-            _log(f"bot exited cleanly (ran {ran_for/60:.0f}m, rc={rc}) — relaunching "
-                 f"in {normal_relaunch}s so it's alive for the next session.")
-            time.sleep(normal_relaunch)
+            _log(f"bot exited after a long run ({ran_for/60:.0f}m, rc=0) — "
+                 f"relaunching in {long_run_relaunch}s.")
+            time.sleep(long_run_relaunch)
 
 
 if __name__ == "__main__":

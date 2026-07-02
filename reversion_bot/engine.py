@@ -237,10 +237,16 @@ class ReversionEngine:
         # Price must be at or below lb1 (or inside the lb2–lb1 band).
         in_reversion_zone = close <= lb1
 
-        oversold = (
-            ri <= self.config.ri_threshold
-            or current_rsi <= self.config.rsi_max
-        )
+        # Oversold gate: configurable AND/OR. AND requires both momentum
+        # exhaustion (RI) and oscillator confirmation (RSI), filtering weak
+        # dips that are trend continuations. OR fires on ~50% of bars with
+        # rsi_max=48 and was the root cause of entries in strong trends.
+        ri_oversold = ri <= self.config.ri_threshold
+        rsi_oversold = current_rsi <= self.config.rsi_max
+        if self.config.oversold_gate == "or":
+            oversold = ri_oversold or rsi_oversold
+        else:
+            oversold = ri_oversold and rsi_oversold
 
         reclaim_lb1 = True
         bullish_close = True
@@ -251,7 +257,10 @@ class ReversionEngine:
         if prev is not None:
             prev_close = float(prev["close"])
             prev_lb1 = float(prev["lb1"]) if pd.notna(prev["lb1"]) else lb1
-            reclaim_lb1 = (prev_close < prev_lb1 and close > lb1) or close > prev_close
+            # Reclaim confirmation: either price crossed back above lb1 (full
+            # reclaim) OR price is bouncing up while still oversold (a bullish
+            # uptick from a prior bar that was also at/below lb1).
+            reclaim_lb1 = (prev_close <= prev_lb1 and close > lb1) or (close > prev_close and prev_close <= prev_lb1)
             bullish_close = close >= float(row["open"])
 
             avg_volume = float(row["avg_volume"]) if pd.notna(row["avg_volume"]) else 0.0
@@ -266,8 +275,17 @@ class ReversionEngine:
         if self.config.use_trend_filter:
             trend_ok = close >= trend_ema * (1.0 - self.config.trend_filter_band_pct)
 
+        # ADX trend-strength filter: reject long reversion entries when the
+        # trend is strong (ADX > adx_max). Mean-reversion in a strong trend is
+        # the #1 way to lose money — routine pullbacks in trends are
+        # continuations, not reversions. Configurable via ADX_MAX env var.
+        adx_val = float(row["adx"])
+        adx_too_strong = adx_val > self.config.adx_max
+
         if not in_reversion_zone:
             reason = "Not_In_Reversion_Zone"
+        elif adx_too_strong:
+            reason = "ADX_Trend_Too_Strong"
         elif not oversold:
             reason = "RI_Not_Oversold"
         elif self.config.require_reclaim_lb1 and not reclaim_lb1:
@@ -391,9 +409,11 @@ class ReversionEngine:
         ri_short_threshold = (
             self.config.risk_off_ri_short_threshold if short_bias else self.config.ri_short_threshold
         )
+        # AND gate: require BOTH momentum exhaustion (RI overbought) AND
+        # oscillator confirmation (RSI overbought) — mirrors the long side.
         overbought = (
             ri >= ri_short_threshold
-            or current_rsi >= rsi_min
+            and current_rsi >= rsi_min
         )
         if not overbought:
             return None
@@ -407,8 +427,10 @@ class ReversionEngine:
         if prev is not None:
             prev_close = float(prev["close"])
             prev_ub1 = float(prev["ub1"]) if pd.notna(prev["ub1"]) else ub1
-            # Mirror of reclaim_lb1: a rejection back below ub1, or any down-tick.
-            reject_ub1 = (prev_close > prev_ub1 and close < ub1) or close < prev_close
+            # Rejection confirmation: either price fell back below ub1 (full
+            # rejection) OR price is turning down while still extended (a
+            # bearish downtick from a prior bar that was also overbought).
+            reject_ub1 = (prev_close >= prev_ub1 and close < ub1) or (close < prev_close and prev_close >= prev_ub1)
             bearish_close = close <= float(row["open"])
 
             avg_volume = float(row["avg_volume"]) if pd.notna(row["avg_volume"]) else 0.0

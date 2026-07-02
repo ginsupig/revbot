@@ -36,7 +36,7 @@ from reversion_bot.market_regime import (
 from reversion_bot.sectors import sector_for, etf_for_sector
 from reversion_bot.universe import select_base_universe, broad_reversion_universe
 from reversion_bot.swing import is_moc_entry_window, should_block_entry_now, holds_overnight
-from reversion_bot.channel import select_breakout_exits
+from reversion_bot.channel import select_breakout_exits, select_breakdown_exits
 from run_real_backtest import fetch_alpaca_bars, fetch_alpaca_bars_batch
 
 # Lock scoped to this checkout (not cwd), so a separate deployment can still
@@ -194,7 +194,11 @@ async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int) -
         start = (now_utc - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         end = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
         bars = await asyncio.to_thread(fetch_alpaca_bars, symbol, start, end, timeframe)
-        return is_risk_off(bars, ema_length)
+        return is_risk_off(
+            bars, ema_length,
+            buffer_pct=float(os.getenv("REGIME_BUFFER_PCT", 0.005)),
+            confirm_bars=int(os.getenv("REGIME_CONFIRM_BARS", 3)),
+        )
     except Exception as e:
         print(f"[REGIME] benchmark fetch failed ({e}); treating as risk-on.")
         return False
@@ -244,7 +248,7 @@ async def evaluate_sector_regime(active_sectors, timeframe: str, ema_length: int
     return regime
 
 async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor,
-                               short_bias=False, prefetched_bars=None):
+                               short_bias=False, account_equity=None, prefetched_bars=None):
     try:
         if await asyncio.to_thread(executor.has_open_position, symbol):
             return None
@@ -258,12 +262,14 @@ async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor,
             return None
 
         bars = bars.tail(lookback)
-        account_equity = await asyncio.to_thread(get_account_equity, executor)
+        if account_equity is None:
+            account_equity = await asyncio.to_thread(get_account_equity, executor)
         result = await asyncio.to_thread(service.evaluate_symbol, symbol, bars, account_equity, short_bias)
         result["_account_equity"] = account_equity
         return result
     except Exception as e:
-        print(f"[ERROR] {symbol}: {e}")
+        import traceback
+        print(f"[ERROR] {symbol}: {e}\n{traceback.format_exc()}")
         return None
 
 async def execute_candidates(governor, executor, portfolio_state, candidates):
@@ -286,31 +292,46 @@ async def execute_candidates(governor, executor, portfolio_state, candidates):
 
 # --- EOD Liquidation ---
 
-def is_eod_liquidation_window() -> bool:
-    """True during the final stretch before the regular close (3:00 PM CT / 4:00 PM ET).
+def _get_close_ct(executor) -> datetime:
+    """Get today's close time from the broker clock (handles half-days).
 
-    Window length is configurable via EOD_LIQUIDATION_MINUTES (minutes before close
-    to start flattening; default 10). Note: assumes the regular 3:00 PM CT close and
-    does not adjust for half-day early closes.
+    Falls back to the standard 15:00 CT if the API call fails.
+    """
+    ct = ZoneInfo("America/Chicago")
+    now_ct = datetime.now(ct)
+    try:
+        clock = executor.client.get_clock()
+        return clock.next_close.astimezone(ct)
+    except Exception:
+        return now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+
+
+def is_eod_liquidation_window(executor) -> bool:
+    """True during the final stretch before the close.
+
+    Uses the broker clock so it fires correctly on half-day early closes
+    (e.g. day before July 4th, day after Thanksgiving).
     """
     lead_minutes = int(os.getenv("EOD_LIQUIDATION_MINUTES", 10))
     now_ct = datetime.now(ZoneInfo("America/Chicago"))
-    close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+    close_ct = _get_close_ct(executor)
     start_ct = close_ct - timedelta(minutes=lead_minutes)
     return start_ct <= now_ct < close_ct
 
 
-def is_eod_entry_cutoff() -> bool:
+def is_eod_entry_cutoff(executor) -> bool:
     """True in the final stretch before the close where NEW entries are blocked.
 
-    Wider than the EOD liquidation window so nothing is opened that can't be
-    flattened before the bell. This is the carryover guard: live, the bot opened
-    shorts ~2 min before the close and its flatten then missed the bell (orders
-    submitted after 15:00 are rejected), so the positions orphaned overnight.
+    Uses the broker clock so it fires correctly on half-day early closes.
     Set EOD_ENTRY_CUTOFF_MINUTES=0 to disable.
     """
     minutes = int(os.getenv("EOD_ENTRY_CUTOFF_MINUTES", 20))
-    return within_minutes_before_close(datetime.now(ZoneInfo("America/Chicago")), minutes)
+    if minutes <= 0:
+        return False
+    now_ct = datetime.now(ZoneInfo("America/Chicago"))
+    close_ct = _get_close_ct(executor)
+    start_ct = close_ct - timedelta(minutes=minutes)
+    return start_ct <= now_ct < close_ct
 
 
 # Once-per-day stamp so the carryover flatten runs on the day's FIRST open cycle
@@ -412,10 +433,9 @@ async def liquidate_all_positions(executor):
 
 
 async def manage_channel_exits(executor, exec_config, lookback, timeframe):
-    """Breakout exit: market-close any LONG that has reached the upper regression
-    channel, capturing the run before the (wide) bracket target. Longs only; the
-    broker-side stop + bracket target remain the safety net. Best-effort — any
-    fetch/close error is logged and skipped so a hiccup never disrupts the loop.
+    """Channel exit: market-close positions that have reached the regression
+    channel extremes — longs at the upper band, shorts at the lower band.
+    The broker-side stop + bracket target remain the safety net. Best-effort.
     """
     try:
         positions = await asyncio.to_thread(executor.get_positions)
@@ -424,42 +444,59 @@ async def manage_channel_exits(executor, exec_config, lookback, timeframe):
         return
 
     longs = [p for p in positions if _safe_qty(p) > 0]
-    if not longs:
+    shorts = [p for p in positions if _safe_qty(p) < 0]
+    if not longs and not shorts:
         return
 
     look = int(getattr(exec_config, "channel_lookback", 80))
     k = float(getattr(exec_config, "channel_k", 2.0))
     threshold = float(getattr(exec_config, "channel_exit_threshold", 0.80))
+    # Short exit threshold: mirror at the lower band (1.0 - threshold).
+    short_threshold = 1.0 - threshold
 
-    # Fetch each held long's recent closes (held names are skipped by the entry
-    # scan, so they aren't fetched there).
+    # Channel was validated on daily bars — use daily regardless of the bot's
+    # intraday timeframe, so an 80-bar lookback covers 80 trading days (not
+    # ~6.5 hours of 5-min bars which would be far too noisy).
+    channel_tf = os.getenv("CHANNEL_EXIT_TIMEFRAME", "1Day")
+
+    # Fetch recent closes for all held positions.
+    all_held = longs + shorts
     closes_by_symbol = {}
-    for p in longs:
+    for p in all_held:
         symbol = str(p.symbol).upper()
+        if symbol in closes_by_symbol:
+            continue
         try:
-            bars = await fetch_bars_for_symbol(symbol, timeframe, max(lookback, look))
+            bars = await fetch_bars_for_symbol(symbol, channel_tf, max(lookback, look))
             if bars is not None and len(bars) >= look:
                 closes_by_symbol[symbol] = bars["close"].to_numpy()
         except Exception as e:
             print(f"[CHANNEL-EXIT] {symbol} bar fetch failed ({e}); skipping.")
 
+    # Long breakout exits (upper channel)
     for symbol in select_breakout_exits(longs, closes_by_symbol, threshold, look, k):
         try:
             await asyncio.to_thread(executor.close_long, symbol)
-            print(f"[CHANNEL-EXIT] {symbol} reached the upper channel — taking the breakout, exiting.")
+            print(f"[CHANNEL-EXIT] {symbol} reached the upper channel — exiting long.")
         except Exception as e:
-            print(f"[CHANNEL-EXIT] {symbol} close failed: {e}")
+            print(f"[CHANNEL-EXIT] {symbol} long close failed: {e}")
+
+    # Short breakdown exits (lower channel)
+    for symbol in select_breakdown_exits(shorts, closes_by_symbol, short_threshold, look, k):
+        try:
+            await asyncio.to_thread(executor.close_short, symbol)
+            print(f"[CHANNEL-EXIT] {symbol} reached the lower channel — covering short.")
+        except Exception as e:
+            print(f"[CHANNEL-EXIT] {symbol} short cover failed: {e}")
 
 
 async def manage_trailing_stops(executor, portfolio_state, risk_config):
-    """Ratchet each open long's stop leg up toward the trailing stop.
+    """Ratchet each open position's stop leg toward the trailing stop.
 
-    Per cycle: update the stored high-water mark from the position's current
-    price, then raise the broker stop toward ``high_water - trail*ATR`` (never
-    down, never above market). Best-effort and per-symbol — a hiccup on one name
-    can't block the loop, and the fixed bracket stop remains the backstop.
-    Uses current_price (not intrabar highs) for the high-water mark, so the live
-    trail is marginally laggier than the backtest — conservative by design.
+    Longs: high-water ratchets UP, stop raised toward high_water - trail*ATR.
+    Shorts: low-water ratchets DOWN, stop lowered toward low_water + trail*ATR.
+    Best-effort and per-symbol — a hiccup on one name can't block the loop, and
+    the fixed bracket stop remains the backstop.
     """
     try:
         positions = await asyncio.to_thread(executor.get_positions)
@@ -467,28 +504,47 @@ async def manage_trailing_stops(executor, portfolio_state, risk_config):
         print(f"[TRAIL] position fetch failed ({e}); skipping.")
         return
     for p in positions:
-        if _safe_qty(p) <= 0:                       # longs only
+        qty = _safe_qty(p)
+        if qty == 0:
             continue
         symbol = str(getattr(p, "symbol", "")).upper()
-        state = portfolio_state.get_trail_state(symbol)
-        if state is None:                           # carryover / pre-trail position
-            continue
-        entry_price, stop_distance, _ = state
         try:
             last_price = float(getattr(p, "current_price", 0) or 0)
         except (TypeError, ValueError):
             continue
         if last_price <= 0:
             continue
-        hw = portfolio_state.update_high_water(symbol, last_price)
-        if hw is None:
-            continue
-        new_stop = await asyncio.to_thread(
-            executor.update_trailing_stop, symbol, entry_price, stop_distance, hw,
-            last_price, risk_config.stop_atr_multiple, risk_config.trail_atr_multiple,
-        )
-        if new_stop is not None:
-            print(f"[TRAIL] {symbol} stop -> {new_stop:.2f} (high-water {hw:.2f})")
+
+        if qty > 0:
+            # Long trailing stop: ratchet UP
+            state = portfolio_state.get_trail_state(symbol)
+            if state is None:
+                continue
+            entry_price, stop_distance, _ = state
+            hw = portfolio_state.update_high_water(symbol, last_price)
+            if hw is None:
+                continue
+            new_stop = await asyncio.to_thread(
+                executor.update_trailing_stop, symbol, entry_price, stop_distance, hw,
+                last_price, risk_config.stop_atr_multiple, risk_config.trail_atr_multiple,
+            )
+            if new_stop is not None:
+                print(f"[TRAIL] {symbol} long stop -> {new_stop:.2f} (high-water {hw:.2f})")
+        else:
+            # Short trailing stop: ratchet DOWN
+            state = portfolio_state.get_trail_state_short(symbol)
+            if state is None:
+                continue
+            entry_price, stop_distance, _ = state
+            lw = portfolio_state.update_low_water(symbol, last_price)
+            if lw is None:
+                continue
+            new_stop = await asyncio.to_thread(
+                executor.update_trailing_stop_short, symbol, entry_price, stop_distance,
+                lw, last_price, risk_config.stop_atr_multiple, risk_config.trail_atr_multiple,
+            )
+            if new_stop is not None:
+                print(f"[TRAIL] {symbol} short stop -> {new_stop:.2f} (low-water {lw:.2f})")
 
 
 def _safe_qty(position) -> float:
@@ -631,6 +687,8 @@ async def main():
     regime_ema = int(os.getenv("MARKET_REGIME_EMA", 50))
     # Favor-shorts mode (opt-in): when risk-off, also relax the short trigger so
     # the bot leans short into the downtrend instead of only sitting in cash.
+    # Lean short in risk-off tapes when shorts are enabled. Off by default
+    # (shorts are off); turn on with ENABLE_SHORTS + this flag.
     favor_shorts_risk_off = parse_bool(os.getenv("FAVOR_SHORTS_IN_RISK_OFF", "False"))
     # Sector-aware regime gate (opt-in): judge each long against ITS sector ETF's
     # trend (SMH/XLK/XLE/...), not just SPY — so a semis selloff suppresses semis
@@ -656,7 +714,8 @@ async def main():
         trend_ema_length=int(os.getenv("TREND_EMA_LENGTH", 50)),
         # Long oversold gates.
         ri_threshold=float(os.getenv("RI_THRESHOLD", -0.5)),
-        rsi_max=float(os.getenv("RSI_MAX", 48.0)),
+        rsi_max=float(os.getenv("RSI_MAX", 40.0)),
+        oversold_gate=os.getenv("OVERSOLD_GATE", "and"),
         adx_max=float(os.getenv("ADX_MAX", 40.0)),
         adx_hard_max=float(os.getenv("ADX_HARD_MAX", 50.0)),
         rsi_hard_max=float(os.getenv("RSI_HARD_MAX", 70.0)),
@@ -674,15 +733,16 @@ async def main():
         # Trend-fail strategy.
         trendfail_window=int(os.getenv("TRENDFAIL_WINDOW", 20)),
         trendfail_threshold=float(os.getenv("TRENDFAIL_THRESHOLD", 0.005)),
-        # Short side (mirror) gates. Default OFF: shorts were never validated —
-        # every backtest this cycle ran long-only, and live shorts lost. Opt back
-        # in with ENABLE_SHORTS=True once the short side is separately backtested.
+        # Short side (mirror) gates. Off by default: OOS backtest showed shorts
+        # bleeding on daily large-caps (8% WR). Enable with ENABLE_SHORTS=True
+        # paired with USE_MARKET_REGIME_FILTER + FAVOR_SHORTS_IN_RISK_OFF to
+        # only short in confirmed downtrends.
         enable_shorts=parse_bool(os.getenv("ENABLE_SHORTS", "False"), default=False),
         ri_short_threshold=float(os.getenv("RI_SHORT_THRESHOLD", 0.5)),
-        rsi_min=float(os.getenv("RSI_MIN", 52.0)),
+        rsi_min=float(os.getenv("RSI_MIN", 65.0)),
         rsi_hard_min=float(os.getenv("RSI_HARD_MIN", 30.0)),
-        risk_off_rsi_min=float(os.getenv("RISK_OFF_RSI_MIN", 45.0)),
-        risk_off_ri_short_threshold=float(os.getenv("RISK_OFF_RI_SHORT_THRESHOLD", 0.25)),
+        risk_off_rsi_min=float(os.getenv("RISK_OFF_RSI_MIN", 55.0)),
+        risk_off_ri_short_threshold=float(os.getenv("RISK_OFF_RI_SHORT_THRESHOLD", 0.30)),
     )
 
     risk_config = RiskConfig(
@@ -819,7 +879,7 @@ async def main():
         reduce_size_after_drawdown_pct=float(os.getenv("REDUCE_SIZE_AFTER_DRAWDOWN_PCT", 0.01)),
         reduced_risk_multiplier=float(os.getenv("REDUCED_RISK_MULTIPLIER", 0.60)),
         symbol_cooldown_minutes=int(os.getenv("SYMBOL_COOLDOWN_MINUTES", 30)),
-        direction_flip_cooldown_minutes=int(os.getenv("DIRECTION_FLIP_COOLDOWN_MINUTES", 60)),
+        direction_flip_cooldown_minutes=int(os.getenv("DIRECTION_FLIP_COOLDOWN_MINUTES", 60)),  # whipsaw guard
     )
     
     # Per-symbol params: each allowlisted name trades with its OWN tuned config
@@ -840,7 +900,7 @@ async def main():
         risk_config,
         perf_config,
         symbol_configs=symbol_configs,
-        min_trade_score=float(os.getenv("MIN_TRADE_SCORE", 0.36)),
+        min_trade_score=float(os.getenv("MIN_TRADE_SCORE", 0.45)),
     )
     portfolio_state = PortfolioState()
     governor = ExecutionGovernor(config=portfolio_config, portfolio_state=portfolio_state)
@@ -930,7 +990,7 @@ async def main():
                 await asyncio.sleep(nap)
                 continue
 
-            if is_eod_liquidation_window() and not holds_overnight(swing_mode):
+            if is_eod_liquidation_window(executor) and not holds_overnight(swing_mode):
                 await liquidate_all_positions(executor)
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] EOD liquidation done. Sleeping...")
                 await asyncio.sleep(poll_interval)
@@ -983,9 +1043,16 @@ async def main():
                 print(f"[BATCH] pre-fetched bars for {len(prefetched)}/{len(symbols)} "
                       f"symbols in one pass.")
 
+            # Fetch equity once per cycle — not per symbol (saves ~20 API calls).
+            try:
+                cycle_equity = await asyncio.to_thread(get_account_equity, executor)
+            except Exception:
+                cycle_equity = None
+
             eval_tasks = [
                 evaluate_symbol_only(s, lookback, timeframe, service, executor,
-                                     short_bias, prefetched_bars=prefetched.get(s))
+                                     short_bias, account_equity=cycle_equity,
+                                     prefetched_bars=prefetched.get(s))
                 for s in symbols
             ]
             raw_results = await asyncio.gather(*eval_tasks)
@@ -1004,7 +1071,7 @@ async def main():
                         print(f"[SWING] Outside the MOC entry window — holding {len(candidates)} "
                               f"candidate(s) for the close.")
                         candidates = []
-                elif is_eod_entry_cutoff():
+                elif is_eod_entry_cutoff(executor):
                     print(f"[EOD] Entry cutoff — blocking {len(candidates)} new entr(ies) near the close.")
                     candidates = []
 
@@ -1032,6 +1099,14 @@ async def main():
                     portfolio_state.update_equity(eq)
                 except Exception:
                     pass
+
+            # Prune stale position_meta for symbols no longer held
+            try:
+                positions = await asyncio.to_thread(executor.client.list_positions)
+                open_syms = [str(p.symbol).upper() for p in positions]
+                portfolio_state.prune_closed_positions(open_syms)
+            except Exception:
+                pass
 
             await execute_candidates(governor, executor, portfolio_state, candidates)
 

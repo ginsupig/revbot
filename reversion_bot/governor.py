@@ -26,16 +26,29 @@ class ExecutionGovernor:
         self.buckets = buckets or DEFAULT_BUCKETS
         self.portfolio_state = portfolio_state or PortfolioState()
 
-    @staticmethod
-    def total_drawdown_heat(positions: Iterable) -> float:
-        """Capital currently at risk = sum of open *drawdown* only.
+    def total_risk_heat(self, positions: Iterable) -> float:
+        """Capital at risk = sum of (qty * stop_distance) for each open position.
 
-        Counts underwater positions (negative unrealized P&L) as positive heat;
-        winners contribute 0, so a profitable book doesn't block new entries.
+        Uses the stored stop_distance from position metadata (the distance from
+        entry to stop, set at entry time). This measures the *theoretical* max
+        loss per position, not just current drawdown — so a fresh-at-entry
+        position correctly contributes its full risk, preventing the heat gate
+        from allowing too many simultaneous positions.
+
+        Falls back to negative unrealized P&L when no metadata is available
+        (carryover positions opened before tracking was added).
         """
-        return sum(
-            max(0.0, -float(getattr(p, "unrealized_pl", 0.0))) for p in positions
-        )
+        all_meta = self.portfolio_state.get_all_position_metadata() if self.portfolio_state else {}
+        total = 0.0
+        for p in positions:
+            sym = str(getattr(p, "symbol", "")).upper()
+            meta = all_meta.get(sym)
+            if meta and "stop_distance" in meta:
+                qty = abs(float(getattr(p, "qty", 0)))
+                total += qty * float(meta["stop_distance"])
+            else:
+                total += max(0.0, -float(getattr(p, "unrealized_pl", 0.0)))
+        return total
 
     def symbol_buckets(self, symbol: str) -> List[str]:
         symbol = symbol.upper()
@@ -54,7 +67,8 @@ class ExecutionGovernor:
             decision = p.get("decision", {}) or {}
             style = p.get("entry_style", "")
             regime = p.get("regime", "")
-            validated = 1 if decision.get("signal") == "LONG_REVERSION" else 0
+            # Validated = both LONG and SHORT reversion signals (not just longs).
+            validated = 1 if decision.get("signal") in ("LONG_REVERSION", "SHORT_REVERSION") else 0
             style_bonus = 1 if style in {"trend_following", "mean_reversion", "trendfail"} else 0
             regime_bonus = 1 if regime in {"trend", "reversion", "range"} else 0
             return (trade_score, validated, style_bonus, regime_bonus)
@@ -140,7 +154,8 @@ class ExecutionGovernor:
             return False, "style_limit:trendfail"
 
         drawdown_pct = self.portfolio_state.get_drawdown_pct(account_equity)
-        if drawdown_pct >= self.config.drawdown_pause_pct:
+        risk_mult = self.effective_risk_multiplier(drawdown_pct)
+        if risk_mult <= 0.0:
             return False, "drawdown_pause"
 
         return True, "ok"
@@ -214,7 +229,7 @@ class ExecutionGovernor:
         # caps actually bind instead of comparing against empty dicts.
         open_styles, open_regimes = self.portfolio_state.open_style_regime_counts(open_symbols)
         current_total_exposure = sum(abs(float(p.market_value)) for p in positions)
-        current_total_heat = self.total_drawdown_heat(positions)
+        current_total_heat = self.total_risk_heat(positions)
 
         self.portfolio_state.update_equity(account_equity)
 
@@ -236,4 +251,22 @@ class ExecutionGovernor:
         )
         if not ok:
             print(f"[GOVERNOR] {symbol} rejected: {reason}")
-        return ok
+            return False
+
+        # Apply drawdown-scaled risk multiplier: reduce position size when
+        # drawdown exceeds reduce_size_after_drawdown_pct (was dead code before).
+        drawdown_pct = self.portfolio_state.get_drawdown_pct(account_equity)
+        risk_mult = self.effective_risk_multiplier(drawdown_pct)
+        if risk_mult < 1.0 and risk_mult > 0.0:
+            plan = candidate.get("position_plan")
+            if plan and "qty" in plan:
+                from math import floor
+                original_qty = int(plan["qty"])
+                scaled_qty = max(1, floor(original_qty * risk_mult))
+                if scaled_qty < original_qty:
+                    plan["qty"] = scaled_qty
+                    plan["position_value"] = round(scaled_qty * float(plan.get("entry_price", 0)), 2)
+                    print(f"[GOVERNOR] {symbol} drawdown scaling: qty {original_qty} -> {scaled_qty} "
+                          f"(risk_mult={risk_mult:.2f}, drawdown={drawdown_pct:.3f})")
+
+        return True

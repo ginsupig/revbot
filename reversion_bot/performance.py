@@ -13,10 +13,17 @@ def utc_now_iso() -> str:
 
 def time_bucket_from_hour(hour_utc: int) -> str:
     """Map a UTC hour to an ET trading-session bucket.
-    Market hours in UTC: 14:30–21:00 (9:30–16:00 ET, UTC-5 / UTC-4 DST).
-    We use UTC-5 offset as a conservative approximation.
+
+    Uses the actual US/Eastern offset (DST-aware) instead of hardcoded UTC-5,
+    so the bucket is correct year-round.
     """
-    hour_et = (hour_utc - 5) % 24
+    try:
+        from zoneinfo import ZoneInfo
+        now_utc = datetime.now(timezone.utc).replace(hour=hour_utc)
+        hour_et = now_utc.astimezone(ZoneInfo("America/New_York")).hour
+    except Exception:
+        # Fallback to EST (UTC-5) if zoneinfo fails
+        hour_et = (hour_utc - 5) % 24
     if hour_et < 10:
         return "early_session"   # 9:30–10:00 ET
     if hour_et < 12:
@@ -89,6 +96,9 @@ class PerformanceTracker:
         # outcome) so repeated reconciles over an overlapping fill window never
         # double-log the same closed trade.
         self.outcomes_cursor_path = self.state_dir / "outcomes_cursor.txt"
+        # In-memory outcomes cache: avoids full-file reads on every symbol eval.
+        # Invalidated when new outcomes are logged.
+        self._outcomes_cache: List[Dict[str, Any]] | None = None
 
     def _append_jsonl(self, path: Path, obj: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,10 +126,20 @@ class PerformanceTracker:
     def log_trade(self, record: TradeRecord) -> None:
         self._append_jsonl(self.trades_path, asdict(record))
 
+    def _get_outcomes(self) -> List[Dict[str, Any]]:
+        if self._outcomes_cache is None:
+            self._outcomes_cache = self._read_jsonl(self.outcomes_path)
+        return self._outcomes_cache
+
     def log_outcome(self, record: OutcomeRecord) -> None:
         """Call when a position CLOSES (fill reconciliation in main.py is the
         natural place). Without outcomes, threshold adaptation stays inert."""
-        self._append_jsonl(self.outcomes_path, asdict(record))
+        d = asdict(record)
+        self._append_jsonl(self.outcomes_path, d)
+        if self._outcomes_cache is not None:
+            self._outcomes_cache.append(d)
+        else:
+            self._outcomes_cache = None  # force reload on next access
 
     def recent_loss_exit(self, symbol: str, now: datetime, within_minutes: int) -> bool:
         """True if this symbol's most recent CLOSED trade was a loss within
@@ -139,7 +159,7 @@ class PerformanceTracker:
         sym = str(symbol).upper()
         latest = None
         latest_ts = ""
-        for r in self._read_jsonl(self.outcomes_path):
+        for r in self._get_outcomes():
             if str(r.get("symbol", "")).upper() != sym:
                 continue
             ts = str(r.get("timestamp") or "")
@@ -276,7 +296,7 @@ class PerformanceTracker:
         # system's own opinion (high scores "earned" a lower bar regardless of
         # whether those trades made money). Adaptation now requires REALIZED
         # OUTCOMES; with no outcome evidence it is a strict no-op.
-        outcomes = self._read_jsonl(self.outcomes_path)
+        outcomes = self._get_outcomes()
         matching = [
             o for o in outcomes
             if o.get("entry_style") == entry_style and o.get("regime") == regime

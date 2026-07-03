@@ -16,10 +16,18 @@ Kept free of pandas / engine imports so they unit-test in isolation.
 from __future__ import annotations
 
 
-def reward_pct(entry_price: float, target_price: float) -> float:
-    """Fractional reward from entry to target, e.g. 0.012 == +1.2%."""
+def reward_pct(entry_price: float, target_price: float, is_short: bool = False) -> float:
+    """Fractional reward from entry to target, e.g. 0.012 == +1.2%.
+
+    Direction-aware: for a SHORT the target is BELOW entry, so the reward is
+    ``(entry - target) / entry``. Defaulting ``is_short=False`` keeps the long
+    behaviour for existing callers; passing a short target without the flag would
+    otherwise yield a negative reward and silently block every short at the gate.
+    """
     if entry_price <= 0:
         return 0.0
+    if is_short:
+        return 1.0 - target_price / entry_price
     return target_price / entry_price - 1.0
 
 
@@ -28,16 +36,18 @@ def passes_cost_gate(
     target_price: float,
     cost_pct: float,
     min_reward_cost_ratio: float,
+    is_short: bool = False,
 ) -> bool:
     """True if the trade's reward clears cost by the required multiple.
 
     ``min_reward_cost_ratio <= 0`` disables the gate (always True). Otherwise
     the bracket reward must be at least ``cost_pct * min_reward_cost_ratio``;
     e.g. ratio=3 with an 8 bps cost requires a target at least +0.24% away.
+    Pass ``is_short=True`` for short brackets so the reward sign is correct.
     """
     if min_reward_cost_ratio <= 0:
         return True
-    return reward_pct(entry_price, target_price) >= cost_pct * min_reward_cost_ratio
+    return reward_pct(entry_price, target_price, is_short) >= cost_pct * min_reward_cost_ratio
 
 
 def in_cooldown(bar_idx: int, last_exit_idx: int | None, cooldown_bars: int) -> bool:

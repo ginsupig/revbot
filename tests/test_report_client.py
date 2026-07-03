@@ -46,6 +46,10 @@ def _set_creds(monkeypatch, url="https://api.alpaca.markets"):
 
 
 def test_missing_creds_exits(monkeypatch):
+    # make_client() calls load_dotenv(), which would repopulate the creds from the
+    # on-disk .env and defeat the delenv below. Stub it so this test hermetically
+    # exercises the genuine "no credentials present" safety exit.
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: None)
     monkeypatch.delenv("APCA_API_KEY_ID", raising=False)
     monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
     with pytest.raises(SystemExit):

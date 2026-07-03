@@ -239,22 +239,27 @@ async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor, s
         return None
 
 async def execute_candidates(governor, executor, portfolio_state, candidates):
-    try:
-        if not candidates:
-            print("[INFO] No candidates to execute.")
-            return
+    if not candidates:
+        print("[INFO] No candidates to execute.")
+        return
 
-        trades_this_cycle = 0
-        for candidate in candidates:
+    trades_this_cycle = 0
+    for candidate in candidates:
+        # Isolate each candidate: a broker rejection on one (e.g. a short blocked
+        # by shorting_enabled, a wash-trade error, or a transient 4xx) must NOT
+        # abort the remaining approved candidates or skip their portfolio_state
+        # update. Previously one exception unwound the whole loop.
+        symbol = candidate.get("symbol", "?")
+        try:
             if governor.approve(candidate, executor=executor, trades_executed_this_cycle=trades_this_cycle):
-                print(f"[INFO] Executing trade for {candidate['symbol']}.")
+                print(f"[INFO] Executing trade for {symbol}.")
                 await asyncio.to_thread(executor.submit_order, candidate)
                 portfolio_state.update(candidate)
                 trades_this_cycle += 1
             else:
-                print(f"[INFO] Candidate {candidate['symbol']} not approved by governor.")
-    except Exception as e:
-        print(f"[ERROR] Failed to execute candidates: {e}")
+                print(f"[INFO] Candidate {symbol} not approved by governor.")
+        except Exception as e:
+            print(f"[ERROR] Failed to execute candidate {symbol}: {e}")
 
 # --- EOD Liquidation ---
 
@@ -380,22 +385,31 @@ async def liquidate_all_positions(executor):
     for pos in positions:
         symbol = str(pos.symbol).upper()
         signed_qty = int(float(pos.qty))
-        qty = abs(signed_qty)
-        if qty == 0:
+        if signed_qty == 0:
             continue
-        # Flatten in the closing direction: sell to exit a long, buy to cover a short.
-        side = "sell" if signed_qty > 0 else "buy"
+        # The global cancel_all_orders above frees each position's bracket legs,
+        # but that qty releases server-side ASYNCHRONOUSLY: an immediate market
+        # order hits "insufficient qty available (available: 0)" and — with no
+        # retry — the position is left open OVERNIGHT (the live 7/3 flatten
+        # failure). Also cancel the symbol's own working orders and retry the
+        # broker-atomic close a few times, mirroring execution.close_long, so the
+        # flatten actually completes before the bell.
         try:
-            executor.client.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side=side,
-                type="market",
-                time_in_force="day",
-            )
-            print(f"[EOD] Market {side} submitted: {symbol} x{qty}")
+            executor._cancel_orders_for_symbol(symbol)
         except Exception as e:
-            print(f"[EOD] Failed to submit {side} for {symbol}: {e}")
+            print(f"[EOD] Per-symbol cancel failed for {symbol}: {e}")
+        last_exc = None
+        for _ in range(4):
+            try:
+                await asyncio.to_thread(executor.client.close_position, symbol)
+                print(f"[EOD] Close submitted: {symbol} (was {signed_qty:+d})")
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                await asyncio.sleep(0.5)
+        if last_exc is not None:
+            print(f"[EOD] Failed to close {symbol} after retries: {last_exc}")
 
 
 async def manage_channel_exits(executor, exec_config, lookback, timeframe):

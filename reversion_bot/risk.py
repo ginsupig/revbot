@@ -115,7 +115,17 @@ class RiskManager:
         risk_budget = account_equity * self.config.risk_per_trade_pct * (1.0 + conviction_boost)
 
         raw_qty = floor(risk_budget / max(risk_per_share, 1e-9))
-        qty = max(self.config.min_qty, raw_qty)
+        # Never floor UP to min_qty: if the risk budget can't afford even min_qty
+        # shares at this stop distance, forcing min_qty would risk MORE than
+        # risk_per_trade_pct on the trade (a wide-stop / high-priced name). Reject
+        # instead so no position ever exceeds the per-trade risk budget.
+        if raw_qty < self.config.min_qty:
+            raise ValueError(
+                f"Risk budget {risk_budget:.2f} affords {raw_qty} < min_qty "
+                f"{self.config.min_qty} at {risk_per_share:.4f}/share risk; "
+                f"min_qty would exceed the per-trade risk cap."
+            )
+        qty = raw_qty
 
         max_position_value = account_equity * self.config.max_position_value_pct
         qty_cap_by_value = floor(max_position_value / entry)

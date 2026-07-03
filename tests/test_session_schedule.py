@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reversion_bot.schedule import session_done, within_minutes_before_close
+from main import is_before_session_start
 
 CT = ZoneInfo("America/Chicago")
 
@@ -64,3 +65,28 @@ def test_half_day_after_early_close_is_done():
     now = datetime(2026, 11, 27, 12, 30, tzinfo=CT)
     nxt = datetime(2026, 11, 30, 8, 30, tzinfo=CT)
     assert session_done(False, nxt, now) is True
+
+
+# --- is_before_session_start (configurable launch time) --------------------
+
+def test_session_start_unset_disables_gate(monkeypatch):
+    monkeypatch.delenv("SESSION_START", raising=False)
+    # Even at the open, an unset SESSION_START never blocks.
+    assert is_before_session_start(datetime(2026, 6, 11, 8, 30, tzinfo=CT)) is False
+
+
+def test_session_start_blocks_before_launch(monkeypatch):
+    monkeypatch.setenv("SESSION_START", "09:30")
+    # 09:00 CT is before the 09:30 launch -> sit out.
+    assert is_before_session_start(datetime(2026, 6, 11, 9, 0, tzinfo=CT)) is True
+
+
+def test_session_start_allows_at_and_after_launch(monkeypatch):
+    monkeypatch.setenv("SESSION_START", "09:30")
+    assert is_before_session_start(datetime(2026, 6, 11, 9, 30, tzinfo=CT)) is False
+    assert is_before_session_start(datetime(2026, 6, 11, 10, 0, tzinfo=CT)) is False
+
+
+def test_session_start_malformed_is_ignored(monkeypatch):
+    monkeypatch.setenv("SESSION_START", "not-a-time")
+    assert is_before_session_start(datetime(2026, 6, 11, 8, 45, tzinfo=CT)) is False

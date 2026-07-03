@@ -58,6 +58,35 @@ def is_morning_blackout() -> bool:
     now_ct = datetime.now(ZoneInfo("America/Chicago"))
     return now_ct.hour < 9
 
+
+def is_before_session_start(now_ct: datetime | None = None) -> bool:
+    """True while the optional configured launch time hasn't been reached.
+
+    ``SESSION_START`` is an optional ``HH:MM`` wall-clock time in CT
+    (America/Chicago) that delays the start of the trading day past the regular
+    open — e.g. set ``09:30`` to sit out the volatile first hour, or ``10:00`` to
+    trade only the afternoon. Unset/empty (the default) disables the gate, so the
+    existing behavior is unchanged. A malformed value is ignored (gate disabled)
+    with a one-line warning rather than crashing the loop.
+
+    ``now_ct`` is injectable for testing; it defaults to the current CT time.
+    """
+    raw = os.getenv("SESSION_START", "").strip()
+    if not raw:
+        return False
+    try:
+        hh, mm = raw.split(":")
+        start_h, start_m = int(hh), int(mm)
+        if not (0 <= start_h <= 23 and 0 <= start_m <= 59):
+            raise ValueError("out of range")
+    except (ValueError, TypeError):
+        print(f"[SCHEDULE] Ignoring malformed SESSION_START={raw!r} (want HH:MM in CT).")
+        return False
+    if now_ct is None:
+        now_ct = datetime.now(ZoneInfo("America/Chicago"))
+    start_ct = now_ct.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+    return now_ct < start_ct
+
 def is_session_over(executor) -> bool:
     """True once today's session has ended (drives the clean end-of-day exit).
 
@@ -970,6 +999,14 @@ async def main():
             # mode — there, overnight positions are intended holds, not orphans.
             if not holds_overnight(swing_mode):
                 await reconcile_carryover(executor)
+
+            # Optional configurable launch time: sit out until SESSION_START (CT)
+            # even if the market is already open. Disabled when SESSION_START is unset.
+            if is_before_session_start():
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Pre-launch "
+                      f"(< SESSION_START {os.getenv('SESSION_START')} CT). Sleeping...")
+                await asyncio.sleep(poll_interval)
+                continue
 
             if is_morning_blackout():
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Morning blackout (9:30-10:00 ET). Sleeping...")

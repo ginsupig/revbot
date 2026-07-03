@@ -1,0 +1,10 @@
+# Normalize text files to LF in the repo AND force LF on checkout on every
+# platform. `eol=lf` is required because core.eol defaults to "native" (CRLF on
+# Windows), which would otherwise re-introduce CRLF even with core.autocrlf=false.
+* text=auto eol=lf
+
+# Windows-native launchers / Task Scheduler config: keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.xml text eol=crlf

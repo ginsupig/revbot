@@ -71,7 +71,9 @@ class ExecutionGovernor:
             validated = 1 if decision.get("signal") in ("LONG_REVERSION", "SHORT_REVERSION") else 0
             style_bonus = 1 if style in {"trend_following", "mean_reversion", "trendfail"} else 0
             regime_bonus = 1 if regime in {"trend", "reversion", "range"} else 0
-            return (trade_score, validated, style_bonus, regime_bonus)
+            # Tie-breaker: symbol name ensures deterministic ordering when scores match.
+            symbol = str(p.get("symbol", "")).upper()
+            return (trade_score, validated, style_bonus, regime_bonus, symbol)
         return sorted(candidate_payloads, key=priority_key, reverse=True)
 
     def effective_risk_multiplier(self, drawdown_pct: float) -> float:

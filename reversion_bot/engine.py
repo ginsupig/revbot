@@ -177,6 +177,65 @@ class ReversionEngine:
             dollar_volume=dollar_volume,
         )
 
+    def _check_confirmations(
+        self,
+        *,
+        close: float,
+        prev,
+        row,
+        config,
+        direction: str = "long"
+    ) -> tuple[bool, bool, bool, bool]:
+        """Check reclaim, volume, vwap, trend confirmations for entry direction.
+
+        Args:
+            direction: "long" or "short" — determines which confirmations apply
+
+        Returns:
+            (reclaim_ok, volume_ok, vwap_ok, trend_ok)
+        """
+        reclaim_ok = True
+        volume_ok = True
+        vwap_ok = True
+        trend_ok = True
+
+        if prev is not None:
+            avg_volume = float(row["avg_volume"]) if pd.notna(row["avg_volume"]) else 0.0
+            volume_ok = (
+                avg_volume <= 0
+                or float(row["volume"]) >= avg_volume * config.volume_multiplier_min
+            )
+
+            if direction == "long":
+                prev_close = float(prev["close"])
+                prev_lb1 = float(prev["lb1"]) if pd.notna(prev["lb1"]) else float(row["lb1"])
+                lb1 = float(row["lb1"])
+                reclaim_ok = (prev_close <= prev_lb1 and close > lb1) or (
+                    close > prev_close and prev_close <= prev_lb1
+                )
+            else:  # short
+                prev_close = float(prev["close"])
+                prev_ub1 = float(prev["ub1"]) if pd.notna(prev["ub1"]) else float(row["ub1"])
+                ub1 = float(row["ub1"])
+                reclaim_ok = (prev_close >= prev_ub1 and close < ub1) or (
+                    close < prev_close and prev_close >= prev_ub1
+                )
+
+        # VWAP filter (same for both directions)
+        vwap = float(row["vwap"]) if pd.notna(row["vwap"]) else None
+        if config.use_vwap_filter and vwap and vwap > 0:
+            vwap_ok = abs((close - vwap) / vwap) <= config.max_vwap_extension_pct
+
+        # Trend filter (mirrored for direction)
+        if config.use_trend_filter:
+            trend_ema = float(row["trend_ema"]) if pd.notna(row["trend_ema"]) else close
+            if direction == "long":
+                trend_ok = close >= trend_ema * (1.0 - config.trend_filter_band_pct)
+            else:  # short
+                trend_ok = close <= trend_ema * (1.0 + config.trend_filter_band_pct)
+
+        return reclaim_ok, volume_ok, vwap_ok, trend_ok
+
     def get_decision(self, df: pd.DataFrame, symbol: str | None = None, short_bias: bool = False) -> ReversionDecision:
         row = df.iloc[-1]
         prev = df.iloc[-2] if len(df) >= 2 else None
@@ -248,32 +307,18 @@ class ReversionEngine:
         else:
             oversold = ri_oversold and rsi_oversold
 
-        reclaim_lb1 = True
         bullish_close = True
-        volume_ok = True
-        vwap_ok = True
-        trend_ok = True
-
         if prev is not None:
-            prev_close = float(prev["close"])
-            prev_lb1 = float(prev["lb1"]) if pd.notna(prev["lb1"]) else lb1
-            # Reclaim confirmation: either price crossed back above lb1 (full
-            # reclaim) OR price is bouncing up while still oversold (a bullish
-            # uptick from a prior bar that was also at/below lb1).
-            reclaim_lb1 = (prev_close <= prev_lb1 and close > lb1) or (close > prev_close and prev_close <= prev_lb1)
             bullish_close = close >= float(row["open"])
 
-            avg_volume = float(row["avg_volume"]) if pd.notna(row["avg_volume"]) else 0.0
-            volume_ok = (
-                avg_volume <= 0
-                or float(row["volume"]) >= avg_volume * self.config.volume_multiplier_min
-            )
-
-        if self.config.use_vwap_filter and vwap > 0:
-            vwap_ok = abs((close - vwap) / vwap) <= self.config.max_vwap_extension_pct
-
-        if self.config.use_trend_filter:
-            trend_ok = close >= trend_ema * (1.0 - self.config.trend_filter_band_pct)
+        # Use shared confirmation logic for reclaim, volume, vwap, trend.
+        reclaim_lb1, volume_ok, vwap_ok, trend_ok = self._check_confirmations(
+            close=close,
+            prev=prev,
+            row=row,
+            config=self.config,
+            direction="long"
+        )
 
         # ADX trend-strength filter: reject long reversion entries when the
         # trend is strong (ADX > adx_max). Mean-reversion in a strong trend is
@@ -418,34 +463,18 @@ class ReversionEngine:
         if not overbought:
             return None
 
-        reject_ub1 = True
         bearish_close = True
-        volume_ok = True
-        vwap_ok = True
-        trend_ok = True
-
         if prev is not None:
-            prev_close = float(prev["close"])
-            prev_ub1 = float(prev["ub1"]) if pd.notna(prev["ub1"]) else ub1
-            # Rejection confirmation: either price fell back below ub1 (full
-            # rejection) OR price is turning down while still extended (a
-            # bearish downtick from a prior bar that was also overbought).
-            reject_ub1 = (prev_close >= prev_ub1 and close < ub1) or (close < prev_close and prev_close >= prev_ub1)
             bearish_close = close <= float(row["open"])
 
-            avg_volume = float(row["avg_volume"]) if pd.notna(row["avg_volume"]) else 0.0
-            volume_ok = (
-                avg_volume <= 0
-                or float(row["volume"]) >= avg_volume * self.config.volume_multiplier_min
-            )
-
-        if self.config.use_vwap_filter and vwap > 0:
-            vwap_ok = abs((close - vwap) / vwap) <= self.config.max_vwap_extension_pct
-
-        if self.config.use_trend_filter:
-            # Mirror of the long trend filter: only short when not far *above* the
-            # higher-timeframe trend (i.e. price is not in a strong uptrend).
-            trend_ok = close <= trend_ema * (1.0 + self.config.trend_filter_band_pct)
+        # Use shared confirmation logic for reclaim, volume, vwap, trend (short version).
+        reject_ub1, volume_ok, vwap_ok, trend_ok = self._check_confirmations(
+            close=close,
+            prev=prev,
+            row=row,
+            config=self.config,
+            direction="short"
+        )
 
         if self.config.require_reclaim_lb1 and not reject_ub1:
             return None

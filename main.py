@@ -37,7 +37,7 @@ from reversion_bot.sectors import sector_for, etf_for_sector
 from reversion_bot.universe import select_base_universe, broad_reversion_universe
 from reversion_bot.swing import is_moc_entry_window, should_block_entry_now, holds_overnight
 from reversion_bot.channel import select_breakout_exits, select_breakdown_exits
-from run_real_backtest import fetch_alpaca_bars
+from run_real_backtest import fetch_alpaca_bars, fetch_alpaca_bars_batch
 
 # Lock scoped to this checkout (not cwd), so a separate deployment can still
 # run its own bot — only a duplicate of *this* one is refused.
@@ -180,6 +180,35 @@ async def fetch_bars_for_symbol(symbol: str, timeframe: str, lookback: int):
     return await asyncio.to_thread(fetch_alpaca_bars, symbol, start, end, timeframe)
 
 
+async def fetch_bars_for_symbols(symbols, timeframe: str, lookback: int,
+                                 chunk_size: int = 50, retries: int = 2) -> dict:
+    """Pre-fetch bars for many symbols in a few batched requests (not one per name).
+
+    Collapses ~N concurrent single-symbol TLS handshakes into ceil(N/chunk_size)
+    requests, each retried with backoff. Returns ``{symbol: DataFrame}``; symbols
+    the feed omits (or a chunk that fails every retry) are simply absent, so the
+    caller falls back to an individual fetch for just those — never the whole
+    universe. Chunked so one giant request can't time the whole cycle out.
+    """
+    start, end = build_fetch_window(timeframe, lookback)
+    out: dict = {}
+    for i in range(0, len(symbols), max(chunk_size, 1)):
+        chunk = list(symbols[i:i + chunk_size])
+        for attempt in range(retries + 1):
+            try:
+                got = await asyncio.to_thread(
+                    fetch_alpaca_bars_batch, chunk, start, end, timeframe)
+                out.update(got)
+                break
+            except Exception as e:
+                if attempt >= retries:
+                    print(f"[BATCH] chunk of {len(chunk)} failed after "
+                          f"{retries + 1} tries ({e}); falling back per-symbol.")
+                else:
+                    await asyncio.sleep(2 ** attempt)
+    return out
+
+
 async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int) -> bool:
     """Fetch the benchmark and decide if the market is risk-off (below trend).
 
@@ -247,12 +276,17 @@ async def evaluate_sector_regime(active_sectors, timeframe: str, ema_length: int
             regime[sector] = fresh[etf]
     return regime
 
-async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor, short_bias=False, account_equity=None):
+async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor,
+                               short_bias=False, account_equity=None, prefetched_bars=None):
     try:
         if await asyncio.to_thread(executor.has_open_position, symbol):
             return None
 
-        bars = await fetch_bars_for_symbol(symbol, timeframe, lookback)
+        # Use the batched pre-fetch when present; otherwise fetch this one symbol
+        # (also the fallback path for a name the batch didn't return).
+        bars = prefetched_bars
+        if bars is None:
+            bars = await fetch_bars_for_symbol(symbol, timeframe, lookback)
         if bars is None or len(bars) < lookback:
             return None
 
@@ -677,6 +711,14 @@ async def main():
     # USE_BROAD_REVERSION_UNIVERSE=true. See reversion_bot/swing.py.
     swing_mode = parse_bool(os.getenv("SWING_OVERNIGHT_MODE", "False"), default=False)
     moc_window_min = int(os.getenv("MOC_ENTRY_WINDOW_MINUTES", 20))
+    # Batched bar fetch (opt-in, default OFF = today's per-symbol fetch). When ON,
+    # each cycle pre-fetches all symbols' bars in a few multi-symbol requests
+    # instead of one HTTP call per name. Essential for the 90-name broad universe
+    # on a slow link, where ~30 concurrent single-symbol TLS handshakes time out
+    # and the bot goes blind. Falls back to a per-symbol fetch for any name a batch
+    # omits, so it's strictly safer than the per-symbol path. See fetch_bars_for_symbols.
+    batch_bar_fetch = parse_bool(os.getenv("BATCH_BAR_FETCH", "False"), default=False)
+    batch_fetch_chunk = int(os.getenv("BATCH_FETCH_CHUNK", 50))
     # Persistent daemon mode (opt-in, default OFF = today's exit-at-close behavior).
     # When ON, the bot does NOT exit at the close — it sleeps until the next session
     # and keeps running, so you launch it ONCE and it's always alive for the MOC
@@ -912,6 +954,9 @@ async def main():
     if swing_mode:
         print(f"SWING/OVERNIGHT mode: ON — enter in the MOC window (last {moc_window_min}m before "
               f"2:50pm CT), hold overnight/multi-day, no EOD/carryover flatten (tif={exec_config.tif}).")
+    if batch_bar_fetch:
+        print(f"Batched bar fetch: ON (all {len(symbols)} symbols in chunks of "
+              f"{batch_fetch_chunk}/request; per-symbol fallback for omissions).")
     if use_trailing_stop:
         print(f"Trailing stop: ON (stop ratchets to high_water - {risk_config.trail_atr_multiple:g}xATR; "
               f"target {risk_config.target_atr_multiple:g}xATR backstop)")
@@ -1038,6 +1083,17 @@ async def main():
                 if off:
                     print(f"[REGIME] sector risk-off (EMA{regime_ema}): {', '.join(off)}")
 
+            # Batch-fetch all symbols' bars up front (one request per chunk) when
+            # enabled, so the 90-name universe doesn't fan out ~30 fragile
+            # single-symbol connections. Any name the batch omits is fetched
+            # individually inside evaluate_symbol_only (prefetched_bars=None).
+            prefetched = {}
+            if batch_bar_fetch:
+                prefetched = await fetch_bars_for_symbols(
+                    symbols, timeframe, lookback, chunk_size=batch_fetch_chunk)
+                print(f"[BATCH] pre-fetched bars for {len(prefetched)}/{len(symbols)} "
+                      f"symbols in one pass.")
+
             # Fetch equity once per cycle — not per symbol (saves ~20 API calls).
             try:
                 cycle_equity = await asyncio.to_thread(get_account_equity, executor)
@@ -1045,7 +1101,9 @@ async def main():
                 cycle_equity = None
 
             eval_tasks = [
-                evaluate_symbol_only(s, lookback, timeframe, service, executor, short_bias, account_equity=cycle_equity)
+                evaluate_symbol_only(s, lookback, timeframe, service, executor,
+                                     short_bias, account_equity=cycle_equity,
+                                     prefetched_bars=prefetched.get(s))
                 for s in symbols
             ]
             raw_results = await asyncio.gather(*eval_tasks)

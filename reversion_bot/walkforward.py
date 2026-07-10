@@ -55,17 +55,19 @@ def mean_reversion_strategy(df, **kwargs):
         band_length=20,
         band_std_1=1.0,
         band_std_2=2.0,
-        min_history=2,
+        min_history=160,  # Match live config (4 weeks of daily bars)
         ri_threshold=-0.5,
-        rsi_max=48.0,
+        rsi_max=40.0,  # Match live config (tightened from 48 to filter weak dips)
+        oversold_gate="and",  # Match live config (requires BOTH RI and RSI confirmation)
         adx_max=40.0,
-        min_price=0.0,
-        min_dollar_volume=0.0,
+        min_price=0.0,  # Backtests can test any price; live uses min_price=2.0
+        min_dollar_volume=0.0,  # Backtests can test any liquidity; live uses 750k
         require_reclaim_lb1=False,
         require_bullish_close=False,
         require_volume_expansion=False,
         use_vwap_filter=False,
-        use_trend_filter=False,
+        use_trend_filter=True,  # Match live config (enabled by default)
+        trend_filter_band_pct=0.02,  # Match live config
     )
     config_defaults.update(kwargs)
     engine = ReversionEngine(ReversionConfig(**config_defaults))

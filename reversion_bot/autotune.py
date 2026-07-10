@@ -17,8 +17,10 @@ class AutoTuner:
             print(f"Tuning {idx+1}/{total}: {params}")
             scores = []
             for train_idx, test_idx in tscv.split(self.data):
-                train = self.data.iloc[train_idx]
-                results = self.strategy_func(train, **params)
+                # Evaluate strategy on OUT-OF-SAMPLE test data, not training data.
+                # This ensures we pick parameters based on generalization, not overfitting.
+                test = self.data.iloc[test_idx]
+                results = self.strategy_func(test, **params)
                 score = score_func(results)
                 scores.append(score)
             mean_score = np.mean(scores)

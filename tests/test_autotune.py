@@ -29,8 +29,11 @@ def test_autotuner_tune():
     param_grid = {'fast': [3, 5], 'slow': [8, 10]}
     tuner = AutoTuner(dummy_strategy, df, param_grid)
     best_params, best_score = tuner.tune(profit_factor, n_splits=3)
+    # After fixing AutoTuner to score on test (OOS) data instead of train (in-sample),
+    # we can no longer assume positive scores. The test data may not be profitable.
+    # We verify that best_params is a dict and best_score is finite (not inf or -inf).
     assert isinstance(best_params, dict)
-    assert best_score > 0
+    assert isinstance(best_score, (int, float)) and np.isfinite(best_score)
 
 
 # --- aggregate_best_params: VWAP-extension dilution fix ---------------------

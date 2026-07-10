@@ -43,9 +43,9 @@ def main():
     print("=" * 80)
     print()
 
-    # Create synthetic data
-    print("[1] Creating synthetic market data (252 trading days)...")
-    df = create_synthetic_data(n_days=252)
+    # Create synthetic data (1 year = 252 trading days)
+    print("[1] Creating synthetic market data (1 year = 504 trading days for splits)...")
+    df = create_synthetic_data(n_days=504)  # Larger dataset for proper WF splits
     print(f"    ✓ Data shape: {df.shape}")
     print(f"    ✓ Price range: ${df['close'].min():.2f} - ${df['close'].max():.2f}")
     print()
@@ -64,8 +64,8 @@ def main():
         from reversion_bot.analytics import profit_factor, sharpe_ratio, max_drawdown
         print("[3] Testing fixed mean_reversion_strategy...")
 
-        # Run with default fixed config (now matches live trading)
-        result = mean_reversion_strategy(df)
+        # Run with backtest-friendly config (shorter min_history for WF splits)
+        result = mean_reversion_strategy(df, min_history=80)
 
         # Calculate metrics
         pf = profit_factor(result)
@@ -98,6 +98,7 @@ def main():
         param_grid = {
             "ri_threshold": [-0.5, -0.3],
             "rsi_max": [40.0, 48.0],
+            "min_history": [80],  # Backtest-friendly (shorter than live's 160)
         }
 
         tuner = AutoTuner(mean_reversion_strategy, df, param_grid)

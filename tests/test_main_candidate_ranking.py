@@ -1,13 +1,9 @@
 import asyncio
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from main import execute_candidates
 
 
-class _Gov:
+class _FakeGovernor:
     def __init__(self):
         self.approve_order = []
 
@@ -19,7 +15,7 @@ class _Gov:
         return True
 
 
-class _Exec:
+class _FakeExecutor:
     def __init__(self):
         self.submitted = []
 
@@ -27,7 +23,7 @@ class _Exec:
         self.submitted.append(candidate["symbol"])
 
 
-class _State:
+class _FakePortfolioState:
     def __init__(self):
         self.updated = []
 
@@ -36,9 +32,9 @@ class _State:
 
 
 def test_execute_candidates_runs_in_ranked_order():
-    gov = _Gov()
-    ex = _Exec()
-    st = _State()
+    gov = _FakeGovernor()
+    ex = _FakeExecutor()
+    st = _FakePortfolioState()
     candidates = [
         {"symbol": "LOW", "trade_score": 0.20, "go_long": True},
         {"symbol": "HIGH", "trade_score": 0.95, "go_long": True},

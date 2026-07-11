@@ -17,6 +17,7 @@ PERIODS_PER_YEAR_5MIN = 78 * 252  # 5-min RTH bars: correct Sharpe annualization
 MORNING_BLACKOUT_HOUR_CT = 9    # is_morning_blackout(): block entries before 9:00 CT
 EOD_LIQUIDATION_HOUR_CT = 14    # liquidate_all_positions(): force flat at 14:50 CT
 EOD_LIQUIDATION_MINUTE_CT = 50
+MIN_BARS_FOR_SIGNAL = 2         # latest bar + prior bar for reclaim/confirmation
 
 
 def _ct_hour_minute(index_like) -> tuple[pd.Series, pd.Series]:
@@ -51,12 +52,17 @@ def mean_reversion_strategy(df, **kwargs):
     min_reward_cost_ratio = float(kwargs.pop("min_reward_cost_ratio", 0.0))
     cost_pct = float(kwargs.pop("cost_pct", SLIPPAGE_PCT))
 
-    if len(df) < 2:
+    required = {"open", "high", "low", "close", "volume"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    if len(df) < MIN_BARS_FOR_SIGNAL:
         out = df.copy()
         out["signal"] = 0
         out["position"] = 0
         out["strategy_return"] = 0.0
-        out["market_return"] = out["close"].pct_change() if "close" in out.columns else 0.0
+        out["market_return"] = out["close"].pct_change().fillna(0.0)
         out["pnl"] = out["strategy_return"]
         return out
 
@@ -78,10 +84,15 @@ def mean_reversion_strategy(df, **kwargs):
         use_trend_filter=True,  # Match live config (enabled by default)
         trend_filter_band_pct=0.02,  # Match live config
     )
-    # Walk-forward OOS folds can be smaller than the live warm-up horizon; clamp
-    # min_history to the available rows so tuning/scoring remains robust.
-    config_defaults["min_history"] = max(2, min(int(config_defaults["min_history"]), len(df)))
     config_defaults.update(kwargs)
+    # Walk-forward OOS folds can be smaller than the live warm-up horizon; clamp
+    # min_history *after* kwargs so user overrides are read first, then safely
+    # capped to available history to avoid ReversionEngine validation failures.
+    # Floor at MIN_BARS_FOR_SIGNAL because get_decision uses the latest bar and
+    # may reference the prior bar for reclaim/confirmation checks.
+    config_defaults["min_history"] = max(
+        MIN_BARS_FOR_SIGNAL, min(int(config_defaults["min_history"]), len(df))
+    )
     engine = ReversionEngine(ReversionConfig(**config_defaults))
     enriched = engine.calculate_indicators(df)
 

@@ -10,7 +10,7 @@ from reversion_bot.indicators import calculate_atr
 
 # --- Live-execution constants (mirror risk.py / main.py) ---
 STOP_ATR_MULTIPLE = 1.20        # risk.py RiskConfig.stop_atr_multiple
-TARGET_ATR_MULTIPLE = 2.00      # risk.py RiskConfig.target_atr_multiple
+TARGET_ATR_MULTIPLE = 3.50      # risk.py RiskConfig.target_atr_multiple
 ATR_FLOOR_PCT = 0.0035          # risk.py RiskConfig.atr_floor_pct
 SLIPPAGE_PCT = 0.0008           # 8 bps round-trip friction on leveraged ETFs
 PERIODS_PER_YEAR_5MIN = 78 * 252  # 5-min RTH bars: correct Sharpe annualization
@@ -51,6 +51,15 @@ def mean_reversion_strategy(df, **kwargs):
     min_reward_cost_ratio = float(kwargs.pop("min_reward_cost_ratio", 0.0))
     cost_pct = float(kwargs.pop("cost_pct", SLIPPAGE_PCT))
 
+    if len(df) < 2:
+        out = df.copy()
+        out["signal"] = 0
+        out["position"] = 0
+        out["strategy_return"] = 0.0
+        out["market_return"] = out["close"].pct_change() if "close" in out.columns else 0.0
+        out["pnl"] = out["strategy_return"]
+        return out
+
     config_defaults = dict(
         band_length=20,
         band_std_1=1.0,
@@ -69,6 +78,9 @@ def mean_reversion_strategy(df, **kwargs):
         use_trend_filter=True,  # Match live config (enabled by default)
         trend_filter_band_pct=0.02,  # Match live config
     )
+    # Walk-forward OOS folds can be smaller than the live warm-up horizon; clamp
+    # min_history to the available rows so tuning/scoring remains robust.
+    config_defaults["min_history"] = max(2, min(int(config_defaults["min_history"]), len(df)))
     config_defaults.update(kwargs)
     engine = ReversionEngine(ReversionConfig(**config_defaults))
     enriched = engine.calculate_indicators(df)

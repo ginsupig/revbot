@@ -306,8 +306,13 @@ async def execute_candidates(governor, executor, portfolio_state, candidates):
         print("[INFO] No candidates to execute.")
         return
 
+    ranked = (
+        governor.rank_candidates(list(candidates))
+        if hasattr(governor, "rank_candidates")
+        else list(candidates)
+    )
     trades_this_cycle = 0
-    for candidate in candidates:
+    for candidate in ranked:
         # Isolate each candidate: a broker rejection on one (e.g. a short blocked
         # by shorting_enabled, a wash-trade error, or a transient 4xx) must NOT
         # abort the remaining approved candidates or skip their portfolio_state

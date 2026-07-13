@@ -275,8 +275,9 @@ class ReversionService:
         return self.perf.reconcile_outcomes(fills)
 
     def _log_eval(self, symbol, regime, decision, router_reason, component_scores, weighted_score, threshold, row):
+        dollar_volume = decision.dollar_volume if hasattr(decision, 'dollar_volume') and decision.dollar_volume is not None else 0.0
         self.logger.info(
-            "symbol=%s regime=%s decision=%s reason=%s router_reason=%s component_scores=%s trade_score=%.4f threshold=%.4f close=%.2f ri=%.4f rsi=%.4f adx=%.4f",
+            "symbol=%s regime=%s decision=%s reason=%s router_reason=%s component_scores=%s trade_score=%.4f threshold=%.4f close=%.2f ri=%.4f rsi=%.4f adx=%.4f dollar_volume=%.0f",
             symbol,
             regime,
             decision.signal,
@@ -289,6 +290,7 @@ class ReversionService:
             float(row["ri"]) if pd.notna(row["ri"]) else 0.0,
             float(row["rsi"]) if pd.notna(row["rsi"]) else 0.0,
             float(row["adx"]) if pd.notna(row["adx"]) else 0.0,
+            dollar_volume,
         )
 
     def _persist_eval(self, symbol, regime, entry_style, decision, router_reason, weighted_score, threshold, row, go_long: bool = False):

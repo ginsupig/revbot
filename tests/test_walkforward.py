@@ -9,7 +9,7 @@ from reversion_bot.walkforward import TARGET_ATR_MULTIPLE
 from reversion_bot.config import RiskConfig
 
 def test_run_walkforward_backtest():
-    n = 120
+    n = 500
     np.random.seed(42)
     close = np.cumsum(np.random.randn(n)) + 100
     volume = np.random.randint(1000, 2000, n)

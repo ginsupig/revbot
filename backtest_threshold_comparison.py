@@ -24,17 +24,18 @@ def run_backtest(min_dollar_volume: float, label: str):
     print('='*80)
 
     try:
-        from run_real_backtest import backtest_reversion
-        from reversion_bot.config import ReversionConfig, RiskConfig, PerformanceConfig, PortfolioConfig
-        from reversion_bot.universe import select_base_universe
+        from reversion_bot.config import ReversionConfig, RiskConfig, PerformanceConfig
+        from reversion_bot.service import ReversionService
+        from run_real_backtest import fetch_alpaca_bars
         import pandas as pd
 
-        # Get universe
+        # Get universe - fallback to test symbols
         try:
+            from reversion_bot.universe import select_base_universe
             symbols = select_base_universe()
         except:
             symbols = ["QBTS", "BSBR", "ITGR", "BITX", "ARX", "TPG", "CUBE", "MTUM",
-                      "RELX", "RCL", "CPAY", "NTST", "STLD", "LH", "ITW"]
+                      "RELX", "RCL", "CPAY", "NTST", "STLD", "LH", "ITW", "AAPL", "MSFT"]
 
         if not symbols:
             print(f"Could not get universe")
@@ -49,23 +50,10 @@ def run_backtest(min_dollar_volume: float, label: str):
         )
         risk_config = RiskConfig()
         perf_config = PerformanceConfig()
-        portfolio_config = PortfolioConfig()
 
-        # Run backtest
-        print(f"\nRunning backtest for last 60 days...")
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=60)
+        print(f"\nFetching latest daily bars for {len(symbols)} symbols...")
 
         try:
-            from reversion_bot.service import ReversionService
-            from run_real_backtest import fetch_alpaca_bars
-
-            service = ReversionService(
-                strategy_config=strategy_config,
-                risk_config=risk_config,
-                performance_config=perf_config,
-            )
-
             # Fetch data for all symbols
             df_dict = fetch_alpaca_bars(
                 symbols,
@@ -73,7 +61,15 @@ def run_backtest(min_dollar_volume: float, label: str):
                 160,
             )
 
+            # Create service
+            service = ReversionService(
+                strategy_config=strategy_config,
+                risk_config=risk_config,
+                performance_config=perf_config,
+            )
+
             trades = []
+            rejections_by_reason = {}
             evals = 0
 
             # Evaluate each symbol
@@ -93,6 +89,10 @@ def run_backtest(min_dollar_volume: float, label: str):
                             "entry_style": result.get("entry_style"),
                             "trade_score": result.get("trade_score"),
                         })
+                    else:
+                        # Track rejection reasons
+                        reason = result.get("router_reason", "unknown")
+                        rejections_by_reason[reason] = rejections_by_reason.get(reason, 0) + 1
                 except Exception as e:
                     pass
 
@@ -100,16 +100,18 @@ def run_backtest(min_dollar_volume: float, label: str):
             print(f"Candidates that passed entry gates: {len(trades)}")
 
             if trades:
-                print(f"\nSample trade candidates:")
-                for t in trades[:5]:
+                print(f"\nTrade candidates:")
+                for t in sorted(trades, key=lambda x: x['trade_score'], reverse=True)[:10]:
                     print(f"  {t['symbol']:6} {t['side']:6} regime={t['regime']:10} "
                           f"style={t['entry_style']:15} score={t['trade_score']:.4f}")
-
-                # Calculate pass rate
                 pass_rate = 100.0 * len(trades) / max(evals, 1)
                 print(f"\nSignal pass rate: {pass_rate:.1f}% of evaluated symbols generated trade signals")
             else:
                 print(f"\nNo trade candidates generated (100% rejection by gates)")
+                print(f"\nRejection reasons:")
+                for reason, count in sorted(rejections_by_reason.items(), key=lambda x: -x[1])[:5]:
+                    pct = 100.0 * count / evals if evals > 0 else 0
+                    print(f"  {reason:40} : {count:3} ({pct:5.1f}%)")
 
             return {
                 "threshold": min_dollar_volume,
@@ -118,11 +120,12 @@ def run_backtest(min_dollar_volume: float, label: str):
                 "trades": len(trades),
                 "pass_rate": 100.0 * len(trades) / max(evals, 1) if evals > 0 else 0,
                 "trade_list": trades,
+                "rejections": rejections_by_reason,
             }
 
         except ImportError as e:
             print(f"Module error: {e}")
-            print("Ensure pandas, alpaca-trade-api, and scikit-learn are installed")
+            print("Ensure pandas and alpaca-py are installed")
             return None
 
     except Exception as e:

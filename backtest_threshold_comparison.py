@@ -26,7 +26,7 @@ def run_backtest(min_dollar_volume: float, label: str):
     try:
         from reversion_bot.config import ReversionConfig, RiskConfig, PerformanceConfig
         from reversion_bot.service import ReversionService
-        from run_real_backtest import fetch_alpaca_bars
+        from run_real_backtest import fetch_alpaca_bars_batch
         import pandas as pd
 
         # Get universe - fallback to test symbols
@@ -54,11 +54,15 @@ def run_backtest(min_dollar_volume: float, label: str):
         print(f"\nFetching latest daily bars for {len(symbols)} symbols...")
 
         try:
-            # Fetch data for all symbols
-            df_dict = fetch_alpaca_bars(
+            # Fetch data for all symbols (last 180 days of data)
+            end_date = datetime.now().date()
+            start_date = end_date - timedelta(days=180)
+
+            df_dict = fetch_alpaca_bars_batch(
                 symbols,
-                "1Day",
-                160,
+                start=start_date,
+                end=end_date,
+                timeframe="1Day",
             )
 
             # Create service

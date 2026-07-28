@@ -174,9 +174,26 @@ class AlpacaPyClient:
         # Market-closes the position and cancels its related open orders.
         return self._trading.close_position(symbol)
 
-    def replace_order(self, order_id: str, limit_price: float):
+    def replace_order(self, order_id: str, limit_price: float = None,
+                      stop_price: float = None):
+        """Replace a working order's limit and/or stop price.
+
+        Mirrors the legacy REST signature: callers pass keyword prices. The
+        old version accepted ONLY limit_price, so the trailing stop's
+        replace_order(order_id=..., stop_price=...) raised TypeError on every
+        trail update under USE_ALPACA_PY — silently swallowed upstream, which
+        left every position riding its fixed bracket with the validated
+        trailing edge disabled.
+        """
+        if limit_price is None and stop_price is None:
+            raise ValueError("replace_order requires limit_price and/or stop_price")
+        fields = {}
+        if limit_price is not None:
+            fields["limit_price"] = limit_price
+        if stop_price is not None:
+            fields["stop_price"] = stop_price
         return self._trading.replace_order_by_id(
-            order_id, ReplaceOrderRequest(limit_price=limit_price)
+            order_id, ReplaceOrderRequest(**fields)
         )
 
     # --- universe / market data --------------------------------------------

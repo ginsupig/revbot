@@ -253,3 +253,38 @@ def test_executor_default_is_legacy_rest(monkeypatch):
     ex = execmod.AlpacaExecutor("k", "s", cfg)
     assert built["args"] == ("k", "s", "https://paper-api.alpaca.markets")
     assert not isinstance(ex.client, AlpacaPyClient)
+
+
+# --- replace_order stop_price (audit H7) --------------------------------------
+# The old signature accepted ONLY limit_price, so the trailing stop's
+# replace_order(order_id=..., stop_price=...) raised TypeError on every trail
+# update under USE_ALPACA_PY — swallowed upstream, trailing stop silently dead.
+
+def test_replace_order_accepts_stop_price():
+    a = make_adapter()
+    a.replace_order(order_id="oid-2", stop_price=88.25)
+    name, oid, order_data = a._trading.calls[-1]
+    assert name == "replace_order_by_id"
+    assert oid == "oid-2"
+    assert order_data.stop_price == 88.25
+    assert order_data.limit_price is None
+
+
+def test_replace_order_requires_a_price():
+    import pytest
+    a = make_adapter()
+    with pytest.raises(ValueError):
+        a.replace_order("oid-3")
+
+
+def test_executor_replace_stop_order_works_through_alpaca_py():
+    # The exact live call path that was dead: AlpacaExecutor.replace_stop_order
+    # -> client.replace_order(order_id=..., stop_price=...).
+    from reversion_bot.execution import AlpacaExecutor
+    ex = AlpacaExecutor.__new__(AlpacaExecutor)
+    ex.client = make_adapter()
+    ex.replace_stop_order("oid-4", 101.239)
+    name, oid, order_data = ex.client._trading.calls[-1]
+    assert name == "replace_order_by_id"
+    assert oid == "oid-4"
+    assert order_data.stop_price == 101.24     # rounded to cents

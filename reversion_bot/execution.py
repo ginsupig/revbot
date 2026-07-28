@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from alpaca_trade_api.rest import REST
 from time import sleep
 import logging
@@ -29,6 +31,43 @@ class AlpacaExecutor:
         self._use_limit_entry = bool(getattr(exec_config, "use_limit_entry", False))
         self._limit_offset_bps = float(getattr(exec_config, "limit_entry_offset_bps", 8.0))
         self._tune_connection_pool(int(getattr(exec_config, "conn_pool_maxsize", 32)))
+        try:
+            http_timeout = float(os.getenv("ALPACA_HTTP_TIMEOUT", "15"))
+        except (TypeError, ValueError):
+            http_timeout = 15.0
+        self._apply_http_timeout(http_timeout)
+
+    def _apply_http_timeout(self, timeout: float) -> None:
+        """Bound every trading-API HTTP call with a default timeout.
+
+        Neither SDK sets one, so a hung get_clock / list_positions /
+        submit_order blocks its worker thread FOREVER — freezing the whole
+        poll loop (no EOD flatten, no trailing-stop management) with a stale
+        heartbeat as the only symptom. ALPACA_HTTP_TIMEOUT already bounded the
+        market-data fetchers; this applies the same guard to the trading
+        client. Wraps the underlying requests.Session so a timeout is supplied
+        only when the caller didn't pass one. Best-effort: if the SDK's
+        session internals change this logs and degrades to prior behavior.
+        """
+        if timeout is None or timeout <= 0:
+            return
+        # Legacy REST keeps a requests.Session at _session; the alpaca-py
+        # wrapper nests its TradingClient at _trading (same _session attr).
+        session = getattr(self.client, "_session", None)
+        if session is None:
+            inner = getattr(self.client, "_trading", None)
+            session = getattr(inner, "_session", None)
+        if session is None or not callable(getattr(session, "request", None)):
+            logging.warning("Trading-API HTTP timeout not applied (no session found).")
+            return
+        original = session.request
+
+        def _request_with_timeout(method, url, **kwargs):
+            if kwargs.get("timeout") is None:
+                kwargs["timeout"] = timeout
+            return original(method, url, **kwargs)
+
+        session.request = _request_with_timeout
 
     def _entry_order_type(self, entry_price: float, side: str) -> dict:
         """Entry-leg order fields: a marketable limit when enabled, else market.
@@ -91,13 +130,17 @@ class AlpacaExecutor:
                     and a.exchange in major_exchanges
                 ]
                 logging.debug(f"Tradable, easy_to_borrow, active, major exchange, no dot, all uppercase: {len(tradable)}")
-                # Sort by market cap if available, else by symbol
-                tradable = sorted(tradable, key=lambda x: getattr(x, 'market_cap', 0), reverse=True)
-                # All tradable symbols are candidates — price filtering happens
-                # below via get_latest_trade (the Alpaca asset object has no
-                # min_price attribute; the old filter was always-false).
-                symbols = [a.symbol for a in tradable][:max_count*2]
-                filtered = []
+                # Alpaca Asset objects carry NO market_cap attribute, so the
+                # old "sort by market cap" was a silent no-op (every key 0):
+                # the universe was whatever the API returned first — roughly
+                # the first N alphabetical liquid names, and the first match
+                # won regardless of how liquid it was. Rank by MEASURED
+                # liquidity instead: scan a wider (deterministic) candidate
+                # pool and keep the max_count highest average-dollar-volume
+                # names. The pool slice is still alphabetical — for a curated
+                # universe use TRADE_WATCHLIST / TRADE_ALLOWLIST.
+                symbols = sorted(a.symbol for a in tradable)[:max_count * 4]
+                scored = []
                 for sym in symbols:
                     try:
                         trade = self.client.get_latest_trade(sym)
@@ -114,14 +157,17 @@ class AlpacaExecutor:
                             (bars['close'] * bars['volume']).mean()
                         )
                         if avg_dollar_vol >= min_dollar_volume:
-                            filtered.append(sym)
+                            scored.append((sym, avg_dollar_vol))
                     except Exception as e:
                         logging.warning(f"Quote/bar fetch failed for {sym}: {e}")
                         continue
-                    if len(filtered) >= max_count:
-                        break
-                logging.info(f"Alpaca US Stocks & ETFs universe: {filtered[:max_count]}")
-                return filtered[:max_count]
+                scored.sort(key=lambda t: (-t[1], t[0]))
+                universe = [s for s, _ in scored[:max_count]]
+                logging.info(
+                    f"Alpaca universe (top {len(universe)} of {len(scored)} "
+                    f"candidates by avg dollar volume): {universe}"
+                )
+                return universe
             except HTTPError as e:
                 if 'rate limit exceeded' in str(e):
                     logging.error("Rate limit exceeded. Retrying in %d seconds...", retry_interval)
@@ -417,6 +463,11 @@ class AlpacaExecutor:
                     "close_position: cancel order %s for %s failed: %s", order_id, symbol, e
                 )
 
+    def list_open_orders(self):
+        """All WORKING (unfilled/active) orders. Raises on API error so callers
+        fail CLOSED rather than act on unknown state."""
+        return self.client.list_orders(status="open", limit=500)
+
     def open_order_symbols(self) -> set:
         """Symbols with a WORKING (unfilled/active) order right now.
 
@@ -426,8 +477,8 @@ class AlpacaExecutor:
         sit unfilled). Raises on API error so callers fail CLOSED (skip the
         entry) rather than risk a duplicate.
         """
-        orders = self.client.list_orders(status="open", limit=500)
-        return {str(o.symbol).upper() for o in orders if getattr(o, "symbol", None)}
+        return {str(o.symbol).upper() for o in self.list_open_orders()
+                if getattr(o, "symbol", None)}
 
     def has_open_order(self, symbol: str) -> bool:
         return symbol.strip().upper() in self.open_order_symbols()

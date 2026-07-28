@@ -50,6 +50,42 @@ class ExecutionGovernor:
                 total += max(0.0, -float(getattr(p, "unrealized_pl", 0.0)))
         return total
 
+    @staticmethod
+    def pending_entry_orders(orders, open_symbols) -> Dict[str, Dict[str, float]]:
+        """Working ENTRY orders: open orders on symbols with NO position.
+
+        These are invisible to list_positions but are committed capital — a
+        resting marketable-limit bracket WILL become a position. Without
+        counting them, max_open_positions/exposure/heat can all be overshot
+        (3 positions + 2 approvals in one cycle -> 5 positions once they fill).
+
+        Bracket legs of LIVE positions share the position's symbol and are
+        excluded by the open_symbols check; multiple working orders on one
+        pending symbol (parent + held legs) count once, at the largest
+        notional. Notional uses the order's limit/stop price — 0 for a plain
+        market parent (no price on the order), which under-counts exposure but
+        still counts the SLOT toward max_open_positions.
+        """
+        open_set = {str(s).upper() for s in open_symbols}
+        pending: Dict[str, Dict[str, float]] = {}
+        for o in orders:
+            sym = str(getattr(o, "symbol", "") or "").upper()
+            if not sym or sym in open_set:
+                continue
+            try:
+                qty = abs(float(getattr(o, "qty", 0) or 0))
+            except (TypeError, ValueError):
+                qty = 0.0
+            px = getattr(o, "limit_price", None) or getattr(o, "stop_price", None)
+            try:
+                notional = qty * float(px) if px else 0.0
+            except (TypeError, ValueError):
+                notional = 0.0
+            prev = pending.get(sym)
+            if prev is None or notional > prev["notional"]:
+                pending[sym] = {"qty": qty, "notional": notional}
+        return pending
+
     def symbol_buckets(self, symbol: str) -> List[str]:
         symbol = symbol.upper()
         return [name for name, members in self.buckets.items() if symbol in members]
@@ -112,10 +148,16 @@ class ExecutionGovernor:
 
         # A working (unfilled) order on this symbol — invisible to list_positions
         # — would otherwise let a second bracket stack on the same name.
-        if symbol in {s.upper() for s in open_order_symbols}:
+        open_order_set = {s.upper() for s in open_order_symbols}
+        if symbol in open_order_set:
             return False, "open_order_exists"
 
-        if len(open_symbols) >= self.config.max_open_positions:
+        # Pending entries (working orders on symbols with no position) occupy a
+        # position slot the moment they're submitted — counting only filled
+        # positions let the cap be overshot by however many brackets were
+        # resting unfilled.
+        pending_entries = open_order_set - open_symbols
+        if len(open_symbols) + len(pending_entries) >= self.config.max_open_positions:
             return False, "max_open_positions_reached"
 
         if trades_executed_this_cycle >= self.config.max_trades_per_cycle:
@@ -192,7 +234,15 @@ class ExecutionGovernor:
             positions = executor.client.list_positions()
             # Working (unfilled) orders — fetched in the same guarded block so an
             # error fails CLOSED (skip the entry) rather than risk a double-submit.
-            open_order_syms = executor.open_order_symbols()
+            if hasattr(executor, "list_open_orders"):
+                open_orders = list(executor.list_open_orders())
+                open_order_syms = {str(getattr(o, "symbol", "") or "").upper()
+                                   for o in open_orders} - {""}
+            else:
+                # Legacy executor API: symbols only — dup/slot checks still
+                # work; pending notional/heat accounting is unavailable.
+                open_orders = []
+                open_order_syms = {s.upper() for s in executor.open_order_symbols()}
         except Exception as e:
             print(f"[GOVERNOR] account/order fetch failed: {e}")
             return False
@@ -232,6 +282,18 @@ class ExecutionGovernor:
         open_styles, open_regimes = self.portfolio_state.open_style_regime_counts(open_symbols)
         current_total_exposure = sum(abs(float(p.market_value)) for p in positions)
         current_total_heat = self.total_risk_heat(positions)
+
+        # Committed-but-unfilled entries count toward exposure and heat too:
+        # a resting bracket's notional (qty x limit price) and its planned risk
+        # (qty x stop_distance from the metadata recorded at submit time).
+        pending = self.pending_entry_orders(open_orders, open_symbols)
+        if pending:
+            all_meta = self.portfolio_state.get_all_position_metadata() if self.portfolio_state else {}
+            for sym, info in pending.items():
+                current_total_exposure += info["notional"]
+                meta = all_meta.get(sym)
+                if meta and meta.get("stop_distance") is not None:
+                    current_total_heat += info["qty"] * float(meta["stop_distance"])
 
         self.portfolio_state.update_equity(account_equity)
 

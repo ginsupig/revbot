@@ -116,7 +116,6 @@ def mean_reversion_strategy(df, **kwargs):
 
     in_trade = False
     entry_price = stop_price = target_price = 0.0
-    prev_close = None
     last_exit_idx = None
 
     for i in range(len(enriched)):
@@ -149,7 +148,13 @@ def mean_reversion_strategy(df, **kwargs):
                 last_exit_idx = i
                 enriched.at[enriched.index[i], "position"] = 0
             else:
-                bar_return = (close / prev_close - 1.0) if prev_close else 0.0
+                # Held bar: NO realized return. The trade books once, at exit.
+                # The old mark-to-market line here (close/prev_close - 1)
+                # double-counted every multi-bar trade: held bars booked MTM
+                # legs AND the exit bar re-booked the full entry->exit return,
+                # inflating PF/Sharpe/DD in both directions — and each nonzero
+                # MTM bar was counted as a "trade" by analytics._trade_count.
+                bar_return = 0.0
                 enriched.at[enriched.index[i], "position"] = 1
         else:
             # --- ENTRY LOGIC: engine signal + morning blackout (Task 2) ---
@@ -181,7 +186,6 @@ def mean_reversion_strategy(df, **kwargs):
                         enriched.at[enriched.index[i], "position"] = 1
 
         enriched.at[enriched.index[i], "strategy_return"] = bar_return
-        prev_close = close
 
     enriched["market_return"] = enriched["close"].pct_change()
     enriched["pnl"] = enriched["strategy_return"]
@@ -271,7 +275,6 @@ def short_exhaustion_strategy(df, **kwargs):
 
     in_trade = False
     entry_price = stop_price = target_price = 0.0
-    prev_close = None
     last_exit_idx = None
     # Confirmation: a candidate at bar i waits for bar i+1 to confirm the
     # rollover. pending_idx holds the unconfirmed candidate bar.
@@ -318,8 +321,10 @@ def short_exhaustion_strategy(df, **kwargs):
                 last_exit_idx = i
                 enriched.at[enriched.index[i], "position"] = 0
             else:
-                # Held: short gains when price falls bar-over-bar.
-                bar_return = (prev_close / close - 1.0) if prev_close else 0.0
+                # Held bar: no realized return — the trade books once at exit
+                # (the old MTM line double-counted multi-bar shorts, mirror of
+                # the long-side fix above).
+                bar_return = 0.0
                 enriched.at[enriched.index[i], "position"] = -1
         else:
             morning_blackout = h < MORNING_BLACKOUT_HOUR_CT
@@ -360,7 +365,6 @@ def short_exhaustion_strategy(df, **kwargs):
                     enriched.at[enriched.index[i], "position"] = -1
 
         enriched.at[enriched.index[i], "strategy_return"] = bar_return
-        prev_close = close
 
     enriched["market_return"] = enriched["close"].pct_change()
     enriched["pnl"] = enriched["strategy_return"]
@@ -391,6 +395,16 @@ def evaluate_fixed_params(df, params, n_splits=3):
 
 
 def run_walkforward_backtest(df, param_grid=None, n_splits=5):
+    """TRUE walkforward: per fold, tune ONLY on the train window (data strictly
+    before the test window), then score the selected params on the unseen test
+    window. The old protocol tuned on the same test folds it then reported as
+    "OOS" — the reported numbers were the grid maximum over the evaluation set
+    (lookahead by construction).
+
+    Returns (results, oos_metrics, best_params) where best_params is the
+    DEPLOYMENT selection re-tuned on the full series — a selection artifact,
+    not the source of the OOS metrics.
+    """
     # Task 4: focus the grid on deep-oversold RI + VWAP extension, the dimensions
     # that matter for fast 3x leveraged assets (Bollinger width is too lagging).
     if param_grid is None:
@@ -401,27 +415,31 @@ def run_walkforward_backtest(df, param_grid=None, n_splits=5):
             "rsi_max": [40.0, 48.0, 55.0],
             "band_length": [20],
         }
-    tuner = AutoTuner(mean_reversion_strategy, df, param_grid)
-    best_params, best_score = tuner.tune(profit_factor, n_splits=n_splits)
-    print(f"Best Params: {best_params}, Best Profit Factor: {best_score:.2f}")
     from sklearn.model_selection import TimeSeriesSplit
     tscv = TimeSeriesSplit(n_splits=n_splits)
     results = []
     oos_metrics = []
     for fold, (train_idx, test_idx) in enumerate(tscv.split(df)):
-        test = df.iloc[test_idx]
-        res = mean_reversion_strategy(test, **best_params)
+        train = df.iloc[train_idx]
+        tuner = AutoTuner(mean_reversion_strategy, train, param_grid)
+        fold_params, _ = tuner.tune(profit_factor, n_splits=3, verbose=False)
+        res = mean_reversion_strategy(df.iloc[test_idx], **fold_params)
         results.append(res)
         pf = profit_factor(res)
         sr = sharpe_ratio(res, periods_per_year=PERIODS_PER_YEAR_5MIN)
         dd = max_drawdown(res)
         oos_metrics.append({"fold": fold + 1, "profit_factor": pf, "sharpe": sr, "max_drawdown": dd})
-        print(f"Fold {fold + 1}: PF={pf:.2f}, Sharpe={sr:.2f}, MaxDD={dd:.4f}")
+        print(f"Fold {fold + 1}: params={fold_params} PF={pf:.2f}, Sharpe={sr:.2f}, MaxDD={dd:.4f}")
     if oos_metrics:
         avg_pf = np.mean([m["profit_factor"] for m in oos_metrics])
         avg_sr = np.mean([m["sharpe"] for m in oos_metrics])
         avg_dd = np.mean([m["max_drawdown"] for m in oos_metrics])
         print(f"\nOut-of-sample summary: Avg PF={avg_pf:.2f}, Avg Sharpe={avg_sr:.2f}, Avg MaxDD={avg_dd:.4f}")
+    # Deployment params: selected on the FULL series. In-sample by definition —
+    # the honest estimate of this protocol's edge is oos_metrics above.
+    tuner = AutoTuner(mean_reversion_strategy, df, param_grid)
+    best_params, best_score = tuner.tune(profit_factor, n_splits=n_splits, verbose=False)
+    print(f"Deployment params (in-sample selection): {best_params}, selection PF: {best_score:.2f}")
     return results, oos_metrics, best_params
 
 
@@ -447,25 +465,32 @@ def run_exhaustion_walkforward(df, param_grid=None, n_splits=5, verbose=True, fi
         }
     if fixed_kwargs:
         param_grid = {**param_grid, **{k: [v] for k, v in fixed_kwargs.items()}}
-    tuner = AutoTuner(short_exhaustion_strategy, df, param_grid)
-    best_params, best_score = tuner.tune(profit_factor, n_splits=n_splits)
-    if verbose:
-        print(f"Best Params: {best_params}, Best Profit Factor: {best_score:.2f}")
 
+    # TRUE walkforward (same protocol as run_walkforward_backtest): tune on
+    # each fold's train window only, score on its unseen test window.
     tscv = TimeSeriesSplit(n_splits=n_splits)
     results, oos_metrics = [], []
-    for fold, (_train_idx, test_idx) in enumerate(tscv.split(df)):
-        res = short_exhaustion_strategy(df.iloc[test_idx], **best_params)
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(df)):
+        train = df.iloc[train_idx]
+        tuner = AutoTuner(short_exhaustion_strategy, train, param_grid)
+        fold_params, _ = tuner.tune(profit_factor, n_splits=3, verbose=False)
+        res = short_exhaustion_strategy(df.iloc[test_idx], **fold_params)
         results.append(res)
         pf = profit_factor(res)
         sr = sharpe_ratio(res, periods_per_year=PERIODS_PER_YEAR_5MIN)
         dd = max_drawdown(res)
         oos_metrics.append({"fold": fold + 1, "profit_factor": pf, "sharpe": sr, "max_drawdown": dd})
         if verbose:
-            print(f"Fold {fold + 1}: PF={pf:.2f}, Sharpe={sr:.2f}, MaxDD={dd:.4f}")
+            print(f"Fold {fold + 1}: params={fold_params} PF={pf:.2f}, Sharpe={sr:.2f}, MaxDD={dd:.4f}")
     if verbose and oos_metrics:
         avg_pf = np.mean([m["profit_factor"] for m in oos_metrics])
         avg_sr = np.mean([m["sharpe"] for m in oos_metrics])
         avg_dd = np.mean([m["max_drawdown"] for m in oos_metrics])
         print(f"\nOut-of-sample summary: Avg PF={avg_pf:.2f}, Avg Sharpe={avg_sr:.2f}, Avg MaxDD={avg_dd:.4f}")
+    # Deployment params: selected on the FULL series (in-sample selection; the
+    # honest edge estimate is oos_metrics above).
+    tuner = AutoTuner(short_exhaustion_strategy, df, param_grid)
+    best_params, best_score = tuner.tune(profit_factor, n_splits=n_splits, verbose=False)
+    if verbose:
+        print(f"Deployment params (in-sample selection): {best_params}, selection PF: {best_score:.2f}")
     return results, oos_metrics, best_params

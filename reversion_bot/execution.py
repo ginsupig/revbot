@@ -130,13 +130,17 @@ class AlpacaExecutor:
                     and a.exchange in major_exchanges
                 ]
                 logging.debug(f"Tradable, easy_to_borrow, active, major exchange, no dot, all uppercase: {len(tradable)}")
-                # Sort by market cap if available, else by symbol
-                tradable = sorted(tradable, key=lambda x: getattr(x, 'market_cap', 0), reverse=True)
-                # All tradable symbols are candidates — price filtering happens
-                # below via get_latest_trade (the Alpaca asset object has no
-                # min_price attribute; the old filter was always-false).
-                symbols = [a.symbol for a in tradable][:max_count*2]
-                filtered = []
+                # Alpaca Asset objects carry NO market_cap attribute, so the
+                # old "sort by market cap" was a silent no-op (every key 0):
+                # the universe was whatever the API returned first — roughly
+                # the first N alphabetical liquid names, and the first match
+                # won regardless of how liquid it was. Rank by MEASURED
+                # liquidity instead: scan a wider (deterministic) candidate
+                # pool and keep the max_count highest average-dollar-volume
+                # names. The pool slice is still alphabetical — for a curated
+                # universe use TRADE_WATCHLIST / TRADE_ALLOWLIST.
+                symbols = sorted(a.symbol for a in tradable)[:max_count * 4]
+                scored = []
                 for sym in symbols:
                     try:
                         trade = self.client.get_latest_trade(sym)
@@ -153,14 +157,17 @@ class AlpacaExecutor:
                             (bars['close'] * bars['volume']).mean()
                         )
                         if avg_dollar_vol >= min_dollar_volume:
-                            filtered.append(sym)
+                            scored.append((sym, avg_dollar_vol))
                     except Exception as e:
                         logging.warning(f"Quote/bar fetch failed for {sym}: {e}")
                         continue
-                    if len(filtered) >= max_count:
-                        break
-                logging.info(f"Alpaca US Stocks & ETFs universe: {filtered[:max_count]}")
-                return filtered[:max_count]
+                scored.sort(key=lambda t: (-t[1], t[0]))
+                universe = [s for s, _ in scored[:max_count]]
+                logging.info(
+                    f"Alpaca universe (top {len(universe)} of {len(scored)} "
+                    f"candidates by avg dollar volume): {universe}"
+                )
+                return universe
             except HTTPError as e:
                 if 'rate limit exceeded' in str(e):
                     logging.error("Rate limit exceeded. Retrying in %d seconds...", retry_interval)

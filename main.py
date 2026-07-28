@@ -424,36 +424,59 @@ async def reconcile_carryover(executor) -> None:
         return
     print(f"[STARTUP] Flattening {len(positions)} overnight carryover position(s) "
           f"before trading: {names}")
-    await liquidate_all_positions(executor)
-    _mark_reconciled_today()
+    if await liquidate_all_positions(executor):
+        _mark_reconciled_today()
+    else:
+        # Do NOT stamp: a carryover whose close failed (after its bracket legs
+        # were already cancelled) must be retried next cycle, not abandoned
+        # until tomorrow with no stop attached.
+        print("[STARTUP] Carryover flatten incomplete — will retry next cycle.")
 
 
-async def liquidate_all_positions(executor):
-    """Cancel all open orders then market-sell every open position."""
+async def liquidate_all_positions(executor) -> bool:
+    """Cancel all open orders then market-close every open position.
+
+    Returns True only when nothing is left open (or there was nothing to do).
+    Returns False when any close failed — callers must not treat the session
+    as reconciled and should retry. A position whose close failed after its
+    bracket legs were cancelled gets an emergency GTC stop re-armed so it is
+    never carried with zero protection; the next attempt's per-symbol cancel
+    clears that stop before retrying the close.
+    """
     print("[EOD] Starting end-of-day liquidation...")
 
     # Cancel all open orders first so stops/limits don't interfere
     try:
-        executor.client.cancel_all_orders()
+        await asyncio.to_thread(executor.client.cancel_all_orders)
         print("[EOD] All open orders cancelled.")
     except Exception as e:
         print(f"[EOD] Failed to cancel orders: {e}")
 
-    # Market-sell every open position
+    # Market-close every open position
     try:
-        positions = executor.client.list_positions()
+        positions = await asyncio.to_thread(executor.client.list_positions)
     except Exception as e:
+        # Unknown state: never report success on a blind read.
         print(f"[EOD] Failed to fetch positions: {e}")
-        return
+        return False
 
     if not positions:
         print("[EOD] No open positions to liquidate.")
-        return
+        return True
 
+    try:
+        failsafe_pct = float(os.getenv("FAILSAFE_STOP_PCT", "0.02"))
+    except (TypeError, ValueError):
+        failsafe_pct = 0.02
+
+    failed = []
     for pos in positions:
         symbol = str(pos.symbol).upper()
-        signed_qty = int(float(pos.qty))
-        if signed_qty == 0:
+        signed_qty = float(pos.qty)
+        # Fractional positions must still be flattened: close_position closes
+        # whatever qty is held, so only a true zero is skippable (int() here
+        # used to truncate 0.5 shares to 0 and orphan them nightly).
+        if abs(signed_qty) < 1e-9:
             continue
         # The global cancel_all_orders above frees each position's bracket legs,
         # but that qty releases server-side ASYNCHRONOUSLY: an immediate market
@@ -470,14 +493,35 @@ async def liquidate_all_positions(executor):
         for _ in range(4):
             try:
                 await asyncio.to_thread(executor.client.close_position, symbol)
-                print(f"[EOD] Close submitted: {symbol} (was {signed_qty:+d})")
+                print(f"[EOD] Close submitted: {symbol} (was {signed_qty:+g})")
                 last_exc = None
                 break
             except Exception as e:
                 last_exc = e
                 await asyncio.sleep(0.5)
         if last_exc is not None:
+            failed.append(symbol)
             print(f"[EOD] Failed to close {symbol} after retries: {last_exc}")
+            # Its bracket legs are already cancelled — re-arm an emergency
+            # stop so the position is not carried naked while we wait for
+            # the next retry (or overnight if the bot dies here).
+            ref_px = getattr(pos, "current_price", None) or getattr(pos, "avg_entry_price", 0)
+            try:
+                await asyncio.to_thread(
+                    executor.rearm_protective_stop,
+                    symbol,
+                    signed_qty,
+                    "long" if signed_qty > 0 else "short",
+                    float(ref_px or 0),
+                    failsafe_pct,
+                )
+            except Exception as e:
+                print(f"[EOD] Emergency stop re-arm failed for {symbol}: {e}")
+
+    if failed:
+        print(f"[EOD] WARNING: {len(failed)} position(s) could not be closed: "
+              f"{', '.join(failed)} — emergency stops re-armed where possible.")
+    return not failed
 
 
 async def manage_channel_exits(executor, exec_config, lookback, timeframe):

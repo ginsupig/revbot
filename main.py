@@ -157,9 +157,23 @@ def preflight_check(executor, paper: bool) -> bool:
     return True
 
 def parse_bool(value: str, default: bool = False) -> bool:
+    """Parse an env-style boolean, falling back to `default` for empty or
+    unrecognized values. The old version returned False for anything outside
+    the truthy set — so a blanked line (`USE_TRAILING_STOP=`) or a typo
+    ("Ture") silently disabled default-ON safety features (regime gate,
+    trailing stop, carryover flatten, trend filter).
+    """
     if value is None:
         return default
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+    s = str(value).strip().lower()
+    if s == "":
+        return default
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    print(f"[CONFIG] Unrecognized boolean {value!r} — using default={default}.")
+    return default
 
 def bars_per_trading_day(timeframe: str) -> int:
     """Regular-session bars per trading day for an Alpaca timeframe string.

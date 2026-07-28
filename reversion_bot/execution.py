@@ -417,6 +417,11 @@ class AlpacaExecutor:
                     "close_position: cancel order %s for %s failed: %s", order_id, symbol, e
                 )
 
+    def list_open_orders(self):
+        """All WORKING (unfilled/active) orders. Raises on API error so callers
+        fail CLOSED rather than act on unknown state."""
+        return self.client.list_orders(status="open", limit=500)
+
     def open_order_symbols(self) -> set:
         """Symbols with a WORKING (unfilled/active) order right now.
 
@@ -426,8 +431,8 @@ class AlpacaExecutor:
         sit unfilled). Raises on API error so callers fail CLOSED (skip the
         entry) rather than risk a duplicate.
         """
-        orders = self.client.list_orders(status="open", limit=500)
-        return {str(o.symbol).upper() for o in orders if getattr(o, "symbol", None)}
+        return {str(o.symbol).upper() for o in self.list_open_orders()
+                if getattr(o, "symbol", None)}
 
     def has_open_order(self, symbol: str) -> bool:
         return symbol.strip().upper() in self.open_order_symbols()

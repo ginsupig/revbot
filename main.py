@@ -1,5 +1,6 @@
 import os
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -156,15 +157,56 @@ def preflight_check(executor, paper: bool) -> bool:
     return True
 
 def parse_bool(value: str, default: bool = False) -> bool:
+    """Parse an env-style boolean, falling back to `default` for empty or
+    unrecognized values. The old version returned False for anything outside
+    the truthy set — so a blanked line (`USE_TRAILING_STOP=`) or a typo
+    ("Ture") silently disabled default-ON safety features (regime gate,
+    trailing stop, carryover flatten, trend filter).
+    """
     if value is None:
         return default
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+    s = str(value).strip().lower()
+    if s == "":
+        return default
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    print(f"[CONFIG] Unrecognized boolean {value!r} — using default={default}.")
+    return default
+
+def bars_per_trading_day(timeframe: str) -> int:
+    """Regular-session bars per trading day for an Alpaca timeframe string.
+
+    Parses '<n><unit>' forms (1Min, 5Min, 15Min, 1Hour, 1Day) and bare units
+    (Minute, Hour, Day, daily). The old heuristic ('5' in tf -> 78 else 390)
+    was wrong for every non-5-minute intraday timeframe AND for 1Day: daily
+    mode computed a 3-calendar-day window against a 160-bar lookback, so
+    swing mode (and the channel exit's daily fetch) could never see enough
+    history to trade — silently, every cycle.
+    """
+    tf = str(timeframe).strip().lower()
+    m = re.match(r"(\d*)\s*(min|hour|day|daily)", tf)
+    if not m:
+        return 78  # unknown string: keep the old 5Min-class assumption
+    n = int(m.group(1) or 1)
+    unit = m.group(2)
+    if unit == "min":
+        return max(1, 390 // n)
+    if unit == "hour":
+        return max(1, 390 // (60 * n))
+    return 1  # day / daily
+
 
 def get_fetch_days(timeframe: str, lookback: int) -> int:
-    tf = timeframe.strip().lower()
-    # Estimate days needed to cover the lookback window
-    bars_per_day = 78 if "5" in tf else 390
-    return max(3, int((lookback / bars_per_day) * 3) + 2)
+    """Calendar days of history needed so the fetch covers `lookback` bars.
+
+    trading days = ceil(lookback / bars-per-day), then scaled 7/5 for
+    weekends plus slack for holidays/half-days and the partial current day.
+    """
+    per_day = bars_per_trading_day(timeframe)
+    trading_days = -(-int(lookback) // per_day)  # ceil
+    return max(5, (trading_days * 7) // 5 + 5)
 
 def build_fetch_window(timeframe: str, lookback: int) -> tuple[str, str]:
     now_utc = datetime.now(timezone.utc)
@@ -424,36 +466,59 @@ async def reconcile_carryover(executor) -> None:
         return
     print(f"[STARTUP] Flattening {len(positions)} overnight carryover position(s) "
           f"before trading: {names}")
-    await liquidate_all_positions(executor)
-    _mark_reconciled_today()
+    if await liquidate_all_positions(executor):
+        _mark_reconciled_today()
+    else:
+        # Do NOT stamp: a carryover whose close failed (after its bracket legs
+        # were already cancelled) must be retried next cycle, not abandoned
+        # until tomorrow with no stop attached.
+        print("[STARTUP] Carryover flatten incomplete — will retry next cycle.")
 
 
-async def liquidate_all_positions(executor):
-    """Cancel all open orders then market-sell every open position."""
+async def liquidate_all_positions(executor) -> bool:
+    """Cancel all open orders then market-close every open position.
+
+    Returns True only when nothing is left open (or there was nothing to do).
+    Returns False when any close failed — callers must not treat the session
+    as reconciled and should retry. A position whose close failed after its
+    bracket legs were cancelled gets an emergency GTC stop re-armed so it is
+    never carried with zero protection; the next attempt's per-symbol cancel
+    clears that stop before retrying the close.
+    """
     print("[EOD] Starting end-of-day liquidation...")
 
     # Cancel all open orders first so stops/limits don't interfere
     try:
-        executor.client.cancel_all_orders()
+        await asyncio.to_thread(executor.client.cancel_all_orders)
         print("[EOD] All open orders cancelled.")
     except Exception as e:
         print(f"[EOD] Failed to cancel orders: {e}")
 
-    # Market-sell every open position
+    # Market-close every open position
     try:
-        positions = executor.client.list_positions()
+        positions = await asyncio.to_thread(executor.client.list_positions)
     except Exception as e:
+        # Unknown state: never report success on a blind read.
         print(f"[EOD] Failed to fetch positions: {e}")
-        return
+        return False
 
     if not positions:
         print("[EOD] No open positions to liquidate.")
-        return
+        return True
 
+    try:
+        failsafe_pct = float(os.getenv("FAILSAFE_STOP_PCT", "0.02"))
+    except (TypeError, ValueError):
+        failsafe_pct = 0.02
+
+    failed = []
     for pos in positions:
         symbol = str(pos.symbol).upper()
-        signed_qty = int(float(pos.qty))
-        if signed_qty == 0:
+        signed_qty = float(pos.qty)
+        # Fractional positions must still be flattened: close_position closes
+        # whatever qty is held, so only a true zero is skippable (int() here
+        # used to truncate 0.5 shares to 0 and orphan them nightly).
+        if abs(signed_qty) < 1e-9:
             continue
         # The global cancel_all_orders above frees each position's bracket legs,
         # but that qty releases server-side ASYNCHRONOUSLY: an immediate market
@@ -470,14 +535,35 @@ async def liquidate_all_positions(executor):
         for _ in range(4):
             try:
                 await asyncio.to_thread(executor.client.close_position, symbol)
-                print(f"[EOD] Close submitted: {symbol} (was {signed_qty:+d})")
+                print(f"[EOD] Close submitted: {symbol} (was {signed_qty:+g})")
                 last_exc = None
                 break
             except Exception as e:
                 last_exc = e
                 await asyncio.sleep(0.5)
         if last_exc is not None:
+            failed.append(symbol)
             print(f"[EOD] Failed to close {symbol} after retries: {last_exc}")
+            # Its bracket legs are already cancelled — re-arm an emergency
+            # stop so the position is not carried naked while we wait for
+            # the next retry (or overnight if the bot dies here).
+            ref_px = getattr(pos, "current_price", None) or getattr(pos, "avg_entry_price", 0)
+            try:
+                await asyncio.to_thread(
+                    executor.rearm_protective_stop,
+                    symbol,
+                    signed_qty,
+                    "long" if signed_qty > 0 else "short",
+                    float(ref_px or 0),
+                    failsafe_pct,
+                )
+            except Exception as e:
+                print(f"[EOD] Emergency stop re-arm failed for {symbol}: {e}")
+
+    if failed:
+        print(f"[EOD] WARNING: {len(failed)} position(s) could not be closed: "
+              f"{', '.join(failed)} — emergency stops re-armed where possible.")
+    return not failed
 
 
 async def manage_channel_exits(executor, exec_config, lookback, timeframe):

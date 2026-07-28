@@ -139,10 +139,20 @@ class ReversionService:
         weighted_score = self._weighted_score(component_scores)
         row = enriched.iloc[-1]
 
+        # Engine safety vetoes are absolute: they mean "do not trade this name
+        # at all", not "the reversion setup didn't validate". Without every one
+        # of them here, the component-score bonuses in _score_mean_reversion can
+        # accumulate past the entry threshold on a WAIT decision and the router
+        # will buy a name the engine refused (e.g. a falling knife the
+        # Downtrend_Too_Extended guard exists to block).
         hard_wait_reasons = {
             "Dollar_Volume_Too_Low",
             "Spread_Too_Wide",
             "Price_Too_Low",
+            "Momentum_Too_Extended",
+            "Downtrend_Too_Extended",
+            "ATR_Invalid",
+            "Indicators_Not_Ready",
         }
         if decision.reason in hard_wait_reasons:
             payload = {
@@ -163,6 +173,7 @@ class ReversionService:
             return payload
 
         is_short_signal = decision.signal == "SHORT_REVERSION"
+        is_long_signal = decision.signal == "LONG_REVERSION"
 
         # ROUTED GATING: gate on the PRIMARY component score for the routed
         # entry style, not the blended score. This prevents anti-correlated
@@ -172,6 +183,17 @@ class ReversionService:
         passes_score = gate_score >= threshold and router_reason != "score_below_threshold"
 
         go_long = passes_score and not is_short_signal
+
+        # A mean-reversion LONG must be engine-validated. The mr component
+        # score alone can clear the threshold on a WAIT decision (base 0.15 +
+        # depth 0.20 + RI stretch 0.15 + RSI softness 0.10 = 0.60) — without
+        # this check the best_style_edge_mean_reversion route buys setups the
+        # engine rejected (RI_Not_Oversold, Not_In_Reversion_Zone, ...).
+        # Trend-following / trendfail styles legitimately trade on WAIT (the
+        # engine only validates reversion setups), so they are untouched.
+        if go_long and entry_style == "mean_reversion" and not is_long_signal:
+            go_long = False
+            router_reason = "mr_requires_engine_signal"
         # Shorts are mean-reversion only and require conviction in that component.
         mr_floor = 0.40 if short_bias else 0.45
         go_short = (

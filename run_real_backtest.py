@@ -30,6 +30,22 @@ def _parse_timeframe(timeframe) -> TimeFrame:
     return tf
 
 
+def _data_feed() -> str:
+    """Market-data feed for every bar fetch (ALPACA_DATA_FEED, default 'iex').
+
+    IMPORTANT LIQUIDITY CAVEAT: the free 'iex' feed reports only IEX-executed
+    volume — roughly 2-3% of consolidated tape volume. Every volume-derived
+    signal (the engine's avg_dollar_volume gate, volume-expansion confirms,
+    the scanner's dollar-volume filter) is measured on this basis, so
+    MIN_DOLLAR_VOLUME must be calibrated to the CONFIGURED feed: a $750k
+    IEX-basis gate effectively demands ~$25-40M/day of real dollar volume.
+    Accounts with a SIP subscription should set ALPACA_DATA_FEED=sip and
+    re-calibrate MIN_DOLLAR_VOLUME to consolidated-tape levels.
+    """
+    feed = os.getenv("ALPACA_DATA_FEED", "iex").strip().lower()
+    return feed if feed in ("iex", "sip", "otc") else "iex"
+
+
 def _apply_http_timeout(client, timeout):
     """Inject a default per-request timeout into an alpaca-py client's session.
 
@@ -85,7 +101,7 @@ def fetch_alpaca_bars(symbol, start, end, timeframe='1Day'):
 
     req = StockBarsRequest(
         **req_kwargs,
-        feed='iex',
+        feed=_data_feed(),
     )
 
     bars = client.get_stock_bars(req).df
@@ -130,7 +146,7 @@ def fetch_alpaca_bars_batch(symbols, start, end, timeframe='1Day'):
         req_kwargs['start'] = start
     if end is not None:
         req_kwargs['end'] = end
-    req = StockBarsRequest(**req_kwargs, feed='iex')
+    req = StockBarsRequest(**req_kwargs, feed=_data_feed())
 
     df = client.get_stock_bars(req).df
     return split_bars_by_symbol(df, single_symbol=syms[0] if len(syms) == 1 else None)

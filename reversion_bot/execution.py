@@ -232,6 +232,49 @@ class AlpacaExecutor:
             stop_price=round(float(new_stop_price), 2),
         )
 
+    def rearm_protective_stop(self, symbol: str, qty: float, side: str,
+                              reference_price: float, stop_pct: float = 0.02):
+        """Emergency backstop for a position whose close FAILED after its
+        bracket legs were already cancelled: submit a plain GTC stop so the
+        position is never carried with zero protection. Long -> sell stop
+        below the reference price; short -> buy stop above it. GTC so it
+        survives the overnight session; the next liquidation attempt's
+        per-symbol cancel clears it before retrying the close, so it never
+        blocks a retry. Fractional tails under one share can't carry a GTC
+        stop (broker limitation) and are skipped. Never raises."""
+        try:
+            symbol = symbol.strip().upper()
+            whole_qty = int(abs(float(qty)))
+            px = float(reference_price)
+            if whole_qty < 1 or px <= 0:
+                logging.error(
+                    "Cannot re-arm stop for %s (qty=%s px=%s) — position is UNPROTECTED.",
+                    symbol, qty, reference_price,
+                )
+                return None
+            if str(side).lower() == "long":
+                order_side = "sell"
+                stop_price = px * (1.0 - float(stop_pct))
+            else:
+                order_side = "buy"
+                stop_price = px * (1.0 + float(stop_pct))
+            order = self.client.submit_order(
+                symbol=symbol,
+                qty=whole_qty,
+                side=order_side,
+                type="stop",
+                stop_price=round(stop_price, 2),
+                time_in_force="gtc",
+            )
+            logging.warning(
+                "Re-armed emergency %s stop for %s: qty=%d stop=%.2f (close failed after bracket cancel)",
+                order_side, symbol, whole_qty, stop_price,
+            )
+            return order
+        except Exception as e:  # noqa: BLE001 - best-effort; failure is logged loudly
+            logging.error("FAILED to re-arm protective stop for %s: %s — position is UNPROTECTED.", symbol, e)
+            return None
+
     def open_stop_leg(self, symbol: str):
         """The symbol's open protective STOP order (the bracket's stop leg), as
         ``{"id", "stop_price", "qty"}`` — or None. Identified by carrying a

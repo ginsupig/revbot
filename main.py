@@ -1,5 +1,6 @@
 import os
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -160,11 +161,38 @@ def parse_bool(value: str, default: bool = False) -> bool:
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+def bars_per_trading_day(timeframe: str) -> int:
+    """Regular-session bars per trading day for an Alpaca timeframe string.
+
+    Parses '<n><unit>' forms (1Min, 5Min, 15Min, 1Hour, 1Day) and bare units
+    (Minute, Hour, Day, daily). The old heuristic ('5' in tf -> 78 else 390)
+    was wrong for every non-5-minute intraday timeframe AND for 1Day: daily
+    mode computed a 3-calendar-day window against a 160-bar lookback, so
+    swing mode (and the channel exit's daily fetch) could never see enough
+    history to trade — silently, every cycle.
+    """
+    tf = str(timeframe).strip().lower()
+    m = re.match(r"(\d*)\s*(min|hour|day|daily)", tf)
+    if not m:
+        return 78  # unknown string: keep the old 5Min-class assumption
+    n = int(m.group(1) or 1)
+    unit = m.group(2)
+    if unit == "min":
+        return max(1, 390 // n)
+    if unit == "hour":
+        return max(1, 390 // (60 * n))
+    return 1  # day / daily
+
+
 def get_fetch_days(timeframe: str, lookback: int) -> int:
-    tf = timeframe.strip().lower()
-    # Estimate days needed to cover the lookback window
-    bars_per_day = 78 if "5" in tf else 390
-    return max(3, int((lookback / bars_per_day) * 3) + 2)
+    """Calendar days of history needed so the fetch covers `lookback` bars.
+
+    trading days = ceil(lookback / bars-per-day), then scaled 7/5 for
+    weekends plus slack for holidays/half-days and the partial current day.
+    """
+    per_day = bars_per_trading_day(timeframe)
+    trading_days = -(-int(lookback) // per_day)  # ceil
+    return max(5, (trading_days * 7) // 5 + 5)
 
 def build_fetch_window(timeframe: str, lookback: int) -> tuple[str, str]:
     now_utc = datetime.now(timezone.utc)

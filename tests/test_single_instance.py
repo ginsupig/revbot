@@ -12,7 +12,7 @@ def test_acquire_then_release(tmp_path):
     ok, pid = acquire_lock(lock)
     assert ok is True
     assert pid == os.getpid()
-    assert lock.read_text().strip() == str(os.getpid())
+    assert lock.read_text().splitlines()[0] == str(os.getpid())
 
     release_lock(lock)
     assert not lock.exists()
@@ -40,7 +40,7 @@ def test_stale_lock_is_reclaimed(tmp_path):
     ok, pid = acquire_lock(lock)
     assert ok is True
     assert pid == os.getpid()
-    assert lock.read_text().strip() == str(os.getpid())
+    assert lock.read_text().splitlines()[0] == str(os.getpid())
     release_lock(lock)
 
 
@@ -82,7 +82,76 @@ def test_atomic_acquire_is_exclusive(tmp_path):
 
     ok2, pid2 = acquire_lock(lock)
     assert ok2 is True and pid2 == os.getpid()
-    assert lock.read_text().strip() == str(os.getpid())
+    assert lock.read_text().splitlines()[0] == str(os.getpid())
 
     release_lock(lock)
     assert not lock.exists()
+
+
+# --- PID reuse after a reboot (audit C5) -------------------------------------
+# The lock records the holder's process START TIME; a live pid whose start
+# time doesn't match was recycled by the OS and must be treated as stale —
+# the old behavior refused forever (with exit code 0: a silent trading halt).
+
+def _spawn_sleeper():
+    import subprocess, sys as _sys
+    return subprocess.Popen([_sys.executable, "-c", "import time; time.sleep(30)"])
+
+
+def test_recycled_pid_is_treated_as_stale(tmp_path):
+    from reversion_bot.single_instance import _pid_start_time
+
+    proc = _spawn_sleeper()
+    try:
+        assert _pid_alive(proc.pid) is True
+        # Lock claims this live pid started at unix time 12345 — i.e. the
+        # recorded holder was a DIFFERENT process that happened to have the
+        # same pid. Must reclaim.
+        lock = tmp_path / "revbot.lock"
+        lock.write_text(f"{proc.pid}\n12345.0")
+        ok, pid = acquire_lock(lock)
+        assert ok is True
+        assert pid == os.getpid()
+        release_lock(lock)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_genuine_live_holder_with_matching_start_time_is_refused(tmp_path):
+    from reversion_bot.single_instance import _pid_start_time
+
+    proc = _spawn_sleeper()
+    try:
+        start = _pid_start_time(proc.pid)
+        if start is None:
+            import pytest
+            pytest.skip("process start time unavailable on this platform")
+        lock = tmp_path / "revbot.lock"
+        lock.write_text(f"{proc.pid}\n{start}")
+        ok, holder = acquire_lock(lock)
+        assert ok is False
+        assert holder == proc.pid
+        assert lock.read_text().splitlines()[0] == str(proc.pid)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_own_start_time_is_measurable_and_recorded(tmp_path):
+    from reversion_bot.single_instance import _pid_start_time
+    import time
+
+    start = _pid_start_time(os.getpid())
+    if start is None:
+        import pytest
+        pytest.skip("process start time unavailable on this platform")
+    assert 0 < start <= time.time() + 1
+
+    lock = tmp_path / "revbot.lock"
+    ok, _ = acquire_lock(lock)
+    assert ok is True
+    lines = lock.read_text().splitlines()
+    assert lines[0] == str(os.getpid())
+    assert len(lines) == 2 and abs(float(lines[1]) - start) < 3.0
+    release_lock(lock)

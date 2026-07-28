@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from alpaca_trade_api.rest import REST
 from time import sleep
 import logging
@@ -29,6 +31,43 @@ class AlpacaExecutor:
         self._use_limit_entry = bool(getattr(exec_config, "use_limit_entry", False))
         self._limit_offset_bps = float(getattr(exec_config, "limit_entry_offset_bps", 8.0))
         self._tune_connection_pool(int(getattr(exec_config, "conn_pool_maxsize", 32)))
+        try:
+            http_timeout = float(os.getenv("ALPACA_HTTP_TIMEOUT", "15"))
+        except (TypeError, ValueError):
+            http_timeout = 15.0
+        self._apply_http_timeout(http_timeout)
+
+    def _apply_http_timeout(self, timeout: float) -> None:
+        """Bound every trading-API HTTP call with a default timeout.
+
+        Neither SDK sets one, so a hung get_clock / list_positions /
+        submit_order blocks its worker thread FOREVER — freezing the whole
+        poll loop (no EOD flatten, no trailing-stop management) with a stale
+        heartbeat as the only symptom. ALPACA_HTTP_TIMEOUT already bounded the
+        market-data fetchers; this applies the same guard to the trading
+        client. Wraps the underlying requests.Session so a timeout is supplied
+        only when the caller didn't pass one. Best-effort: if the SDK's
+        session internals change this logs and degrades to prior behavior.
+        """
+        if timeout is None or timeout <= 0:
+            return
+        # Legacy REST keeps a requests.Session at _session; the alpaca-py
+        # wrapper nests its TradingClient at _trading (same _session attr).
+        session = getattr(self.client, "_session", None)
+        if session is None:
+            inner = getattr(self.client, "_trading", None)
+            session = getattr(inner, "_session", None)
+        if session is None or not callable(getattr(session, "request", None)):
+            logging.warning("Trading-API HTTP timeout not applied (no session found).")
+            return
+        original = session.request
+
+        def _request_with_timeout(method, url, **kwargs):
+            if kwargs.get("timeout") is None:
+                kwargs["timeout"] = timeout
+            return original(method, url, **kwargs)
+
+        session.request = _request_with_timeout
 
     def _entry_order_type(self, entry_price: float, side: str) -> dict:
         """Entry-leg order fields: a marketable limit when enabled, else market.

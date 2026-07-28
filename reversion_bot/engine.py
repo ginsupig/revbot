@@ -445,6 +445,14 @@ class ReversionEngine:
         if adx >= self.config.adx_hard_max and current_rsi <= self.config.rsi_hard_min:
             return None
 
+        # ADX trend-strength veto — the exact mirror of the long side's
+        # ADX_Trend_Too_Strong gate. Shorting an "overbought rip" inside a
+        # strong trend (ADX 40-50 with RSI high) is fading a breakout, the #1
+        # way the short side bleeds; the long side already refused entries at
+        # this trend strength while the short side had no equivalent check.
+        if adx > self.config.adx_max:
+            return None
+
         # Price must be at or above ub1 (or inside the ub1–ub2 band).
         in_short_zone = close >= ub1
         if not in_short_zone:

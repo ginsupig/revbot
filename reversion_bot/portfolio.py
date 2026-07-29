@@ -284,6 +284,10 @@ class PortfolioState:
         try:
             last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
         except Exception:
+            # Fail OPEN by design (a corrupt stamp must not freeze trading
+            # forever) — but say so, since it silently disables the cooldown.
+            logging.warning("in_symbol_cooldown: unparseable timestamp %r for %s "
+                            "— cooldown skipped.", last_ts, symbol)
             return False
         return now <= last_dt + timedelta(minutes=cooldown_minutes)
 
@@ -309,5 +313,9 @@ class PortfolioState:
         try:
             last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
         except Exception:
+            # Fail OPEN by design (a corrupt stamp must not freeze trading
+            # forever) — but say so, since it silently disables the cooldown.
+            logging.warning("in_symbol_cooldown: unparseable timestamp %r for %s "
+                            "— cooldown skipped.", last_ts, symbol)
             return False
         return now <= last_dt + timedelta(minutes=cooldown_minutes)

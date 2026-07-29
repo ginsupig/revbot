@@ -150,8 +150,20 @@ class PerformanceTracker:
                     continue
         return rows
 
+    _EVALS_MAX_BYTES = 50_000_000
+
     def log_evaluation(self, record: EvalRecord) -> None:
-        self._append_jsonl(self.evals_path, asdict(record))
+        # evaluations.jsonl gains ~universe-size records per cycle forever;
+        # roll it once per size cap (single .1 generation) so the disk and the
+        # summarize_recent full-file read stay bounded. Diagnostics only —
+        # trades/outcomes are never rotated (attribution reads them in full).
+        with self._lock:
+            try:
+                if self.evals_path.exists() and self.evals_path.stat().st_size > self._EVALS_MAX_BYTES:
+                    self.evals_path.replace(self.evals_path.with_suffix(".jsonl.1"))
+            except OSError:
+                pass
+            self._append_jsonl(self.evals_path, asdict(record))
 
     def log_trade(self, record: TradeRecord) -> None:
         self._append_jsonl(self.trades_path, asdict(record))

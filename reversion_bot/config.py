@@ -97,7 +97,9 @@ class ReversionConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     risk_per_trade_pct: float = 0.005
-    max_position_value_pct: float = 0.20
+    # Aligned with the live env default (main.py) so backtests and research
+    # size the way the bot actually trades.
+    max_position_value_pct: float = 0.15
 
     stop_atr_multiple: float = 1.20
     target_atr_multiple: float = 3.50
@@ -114,12 +116,11 @@ class RiskConfig:
     trendfail_stop_atr_multiple: float = 1.10
     trendfail_target_atr_multiple: float = 2.20
 
-    min_rr: float = 1.00
+    min_rr: float = 1.5
 
     atr_length: int = 14
     atr_floor_pct: float = 0.0035
 
-    round_lot: int = 1
     min_qty: int = 1
     min_position_value: float = 100.0
 
@@ -128,7 +129,8 @@ class RiskConfig:
 class ExecutionConfig:
     slippage_bps_buffer: float = 5.0
     limit_entry_offset_bps: float = 8.0
-    use_limit_entry: bool = False
+    # Aligned with the live env default (main.py): marketable-limit entries.
+    use_limit_entry: bool = True
     tif: str = "day"
     paper: bool = True
     base_url: str = ""

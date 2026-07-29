@@ -46,6 +46,26 @@ def _data_feed() -> str:
     return feed if feed in ("iex", "sip", "otc") else "iex"
 
 
+_CLIENT_CACHE: dict = {}
+
+
+def _get_data_client(api_key, api_secret, base_url):
+    """One StockHistoricalDataClient per credential set. The old code built a
+    fresh client (new TLS session) for EVERY fetch call — per symbol, per
+    cycle — recreating the exact handshake fan-out the batch fetcher was
+    added to avoid."""
+    key = (api_key, api_secret, base_url)
+    client = _CLIENT_CACHE.get(key)
+    if client is None:
+        if base_url and base_url.startswith("https://data"):
+            client = StockHistoricalDataClient(api_key, api_secret, url_override=base_url)
+        else:
+            client = StockHistoricalDataClient(api_key, api_secret)
+        _apply_http_timeout(client, float(os.getenv("ALPACA_HTTP_TIMEOUT", "15")))
+        _CLIENT_CACHE[key] = client
+    return client
+
+
 def _apply_http_timeout(client, timeout):
     """Inject a default per-request timeout into an alpaca-py client's session.
 
@@ -80,13 +100,7 @@ def fetch_alpaca_bars(symbol, start, end, timeframe='1Day'):
     if not api_key or not api_secret:
         raise ValueError("Missing Alpaca API credentials. Check your .env file.")
 
-    if base_url and base_url.startswith("https://data"):
-        client = StockHistoricalDataClient(api_key, api_secret, url_override=base_url)
-    else:
-        client = StockHistoricalDataClient(api_key, api_secret)
-
-    # Bound every HTTP call so a hung data connection can't freeze a poll cycle.
-    _apply_http_timeout(client, float(os.getenv("ALPACA_HTTP_TIMEOUT", "15")))
+    client = _get_data_client(api_key, api_secret, base_url)
 
     tf = _parse_timeframe(timeframe)
 
@@ -133,12 +147,7 @@ def fetch_alpaca_bars_batch(symbols, start, end, timeframe='1Day'):
     if not syms:
         return {}
 
-    if base_url and base_url.startswith("https://data"):
-        client = StockHistoricalDataClient(api_key, api_secret, url_override=base_url)
-    else:
-        client = StockHistoricalDataClient(api_key, api_secret)
-
-    _apply_http_timeout(client, float(os.getenv("ALPACA_HTTP_TIMEOUT", "15")))
+    client = _get_data_client(api_key, api_secret, base_url)
 
     tf = _parse_timeframe(timeframe)
     req_kwargs = {'symbol_or_symbols': syms, 'timeframe': tf}

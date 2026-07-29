@@ -27,7 +27,7 @@ from reversion_bot.allowlist import (
 )
 from reversion_bot.symbol_params import load_symbol_params, build_symbol_configs
 from reversion_bot.single_instance import acquire_lock, release_lock
-from reversion_bot.schedule import session_done, within_minutes_before_close
+from reversion_bot.schedule import session_done
 from reversion_bot.heartbeat import write_heartbeat
 from reversion_bot.market_regime import (
     is_risk_off,
@@ -35,7 +35,7 @@ from reversion_bot.market_regime import (
     suppress_longs_by_sector,
 )
 from reversion_bot.sectors import sector_for, etf_for_sector
-from reversion_bot.universe import select_base_universe, broad_reversion_universe
+from reversion_bot.universe import select_base_universe
 from reversion_bot.swing import is_moc_entry_window, should_block_entry_now, holds_overnight
 from reversion_bot.channel import select_breakout_exits, select_breakdown_exits
 from run_real_backtest import fetch_alpaca_bars, fetch_alpaca_bars_batch

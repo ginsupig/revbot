@@ -338,13 +338,22 @@ def symbol_weights(notional: Dict[str, float]) -> Dict[str, float]:
 
 
 def _fill_day(fill: dict) -> str:
-    """Trading-day key from a fill's ISO timestamp (the date portion).
+    """Trading-day key (US/Eastern date) from a fill's ISO timestamp.
 
-    US regular hours (13:30–20:00 UTC) all fall on a single UTC calendar date,
-    so the date prefix is a safe trading-day key without pulling in a timezone
-    dependency. Fills with no/short timestamp collapse into one "" bucket.
+    The old UTC date prefix booked any extended-hours fill at/after 8pm ET
+    (= 00:00 UTC in summer) to the NEXT day. Falls back to the raw date
+    prefix when the timestamp doesn't parse; no/short timestamps collapse
+    into one "" bucket.
     """
     t = str(fill.get("time") or "")
+    try:
+        from zoneinfo import ZoneInfo
+        from .performance import parse_ts
+        dt = parse_ts(t)
+        if dt is not None:
+            return dt.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        pass
     return t[:10] if len(t) >= 10 else ""
 
 

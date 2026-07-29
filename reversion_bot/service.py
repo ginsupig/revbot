@@ -88,7 +88,10 @@ class ReversionService:
         self.logger = logging.getLogger("ReversionService")
         self.logger.setLevel(logging.INFO)
         if not self.logger.handlers:
-            fh = logging.FileHandler(log_file)
+            # Size-capped rotation: the old plain FileHandler grew without
+            # bound (one line per symbol per cycle, forever).
+            from logging.handlers import RotatingFileHandler
+            fh = RotatingFileHandler(log_file, maxBytes=20_000_000, backupCount=3)
             ch = logging.StreamHandler()
             formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
             fh.setFormatter(formatter)

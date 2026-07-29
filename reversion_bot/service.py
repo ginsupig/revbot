@@ -88,7 +88,10 @@ class ReversionService:
         self.logger = logging.getLogger("ReversionService")
         self.logger.setLevel(logging.INFO)
         if not self.logger.handlers:
-            fh = logging.FileHandler(log_file)
+            # Size-capped rotation: the old plain FileHandler grew without
+            # bound (one line per symbol per cycle, forever).
+            from logging.handlers import RotatingFileHandler
+            fh = RotatingFileHandler(log_file, maxBytes=20_000_000, backupCount=3)
             ch = logging.StreamHandler()
             formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
             fh.setFormatter(formatter)
@@ -180,7 +183,14 @@ class ReversionService:
         # components (trend-following when reversion fires, or vice versa) from
         # diluting the gate and producing mushy entries.
         gate_score = float(component_scores.get(entry_style, weighted_score))
-        passes_score = gate_score >= threshold and router_reason != "score_below_threshold"
+        # The (possibly adaptive) threshold is the single authority on the
+        # score gate. The old extra condition `router_reason !=
+        # "score_below_threshold"` hard-blocked at the BASELINE even when the
+        # adaptive threshold had loosened below it — making the "allow easier
+        # entries after a winning streak" branch dead code (audit M1). At
+        # baseline the behavior is identical (the router only says
+        # score_below_threshold when gate_score < baseline).
+        passes_score = gate_score >= threshold
 
         go_long = passes_score and not is_short_signal
 
@@ -259,33 +269,46 @@ class ReversionService:
                 payload["go_long"] = True
             payload["portfolio_heat"] = float(plan.qty) * float(plan.risk_per_share)
 
-            hour = datetime.now(timezone.utc).hour
-            time_bucket = time_bucket_from_hour(hour)
-            self.perf.log_trade(
-                TradeRecord(
-                    timestamp=utc_now_iso(),
-                    symbol=symbol,
-                    regime=regime,
-                    entry_style=entry_style,
-                    trade_score=round(weighted_score, 4),
-                    threshold=round(threshold, 4),
-                    entry_price=float(plan.entry_price),
-                    stop_price=float(plan.stop_price),
-                    target_price=float(plan.target_price),
-                    qty=int(plan.qty),
-                    rr_ratio=float(plan.rr_ratio),
-                    risk_per_share=float(plan.risk_per_share),
-                    reward_per_share=float(plan.reward_per_share),
-                    position_value=float(plan.position_value),
-                    time_bucket=time_bucket,
-                )
-            )
+            # NOTE: the TradeRecord is deliberately NOT logged here. A go_long
+            # payload can still be vetoed by the governor (caps, cooldowns,
+            # buying power) or rejected by the broker; logging at decision time
+            # filled trades.jsonl with phantom entries that reconcile_outcomes
+            # then attributed real closing fills to. main.py calls
+            # record_submitted_trade() after a successful submission instead.
             self.logger.info(
                 "symbol=%s regime=%s entry_style=%s router_reason=%s position_plan=%s",
                 symbol, regime, entry_style, router_reason, plan,
             )
 
         return payload
+
+    def record_submitted_trade(self, payload: Dict[str, Any]) -> None:
+        """Book the TradeRecord for a candidate whose order was ACTUALLY
+        submitted. Called by the execution loop post-submit so trades.jsonl
+        contains only real entries (the attribution source for outcomes)."""
+        plan = payload.get("position_plan") or {}
+        if not plan:
+            return
+        hour = datetime.now(timezone.utc).hour
+        self.perf.log_trade(
+            TradeRecord(
+                timestamp=utc_now_iso(),
+                symbol=str(payload.get("symbol", "")),
+                regime=str(payload.get("regime", "unknown")),
+                entry_style=str(payload.get("entry_style", "unknown")),
+                trade_score=float(payload.get("trade_score", 0.0)),
+                threshold=float(payload.get("threshold", 0.0)),
+                entry_price=float(plan.get("entry_price", 0.0)),
+                stop_price=float(plan.get("stop_price", 0.0)),
+                target_price=float(plan.get("target_price", 0.0)),
+                qty=int(plan.get("qty", 0)),
+                rr_ratio=float(plan.get("rr_ratio", 0.0)),
+                risk_per_share=float(plan.get("risk_per_share", 0.0)),
+                reward_per_share=float(plan.get("reward_per_share", 0.0)),
+                position_value=float(plan.get("position_value", 0.0)),
+                time_bucket=time_bucket_from_hour(hour),
+            )
+        )
 
     def recent_performance_summary(self) -> Dict[str, Any]:
         return self.perf.summarize_recent(limit=500)
@@ -455,14 +478,17 @@ class ReversionService:
             self.logger.warning("ML model save failed: %s", exc)
 
     def _get_ml_probability(self, df: pd.DataFrame) -> float:
-        self.ml_eval_count += 1
         if len(df) < self.min_rows_for_ml:
             return 0.5
 
         data_hash = self._hash_frame_tail(df, rows=200)
         # Hold the lock across train+predict so a concurrent fit() can never
         # leave the forest with zero estimators mid-predict (the inf/nan source).
+        # The eval counter is incremented INSIDE the lock too: ~20 concurrent
+        # threads doing an unsynchronized read-modify-write lost increments and
+        # skipped the %25 retrain ticks nondeterministically.
         with self._ml_lock:
+            self.ml_eval_count += 1
             should_train = (
                 self.ml_last_train_data_hash != data_hash
                 and (

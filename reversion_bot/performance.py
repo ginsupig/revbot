@@ -5,10 +5,34 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 import json
+import threading
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_ts(ts: Any) -> "datetime | None":
+    """Parse a timestamp string from ANY of the formats that reach this module.
+
+    Broker fill times arrive as '...Z', our own records as '...+00:00', and
+    str(datetime) produces a space separator — lexical comparison across those
+    mis-orders badly ('Z' > '+', 'T' > ' '), which is how a 4-hour-older
+    outcome could win a "latest" comparison (audit M4). Naive timestamps are
+    assumed UTC. Returns None when unparseable.
+    """
+    if not ts:
+        return None
+    s = str(ts).strip().replace("Z", "+00:00")
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
+    try:
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def time_bucket_from_hour(hour_utc: int) -> str:
@@ -99,11 +123,17 @@ class PerformanceTracker:
         # In-memory outcomes cache: avoids full-file reads on every symbol eval.
         # Invalidated when new outcomes are logged.
         self._outcomes_cache: List[Dict[str, Any]] | None = None
+        # evaluate_symbol runs concurrently across ~90 threads sharing this
+        # tracker. Appends previously worked only by the accident of O_APPEND
+        # + GIL semantics; the lock makes writes and cache mutation correct by
+        # design (audit M5). Cheap: held only around file appends/cache ops.
+        self._lock = threading.RLock()
 
     def _append_jsonl(self, path: Path, obj: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        with self._lock:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
     def _read_jsonl(self, path: Path) -> List[Dict[str, Any]]:
         if not path.exists():
@@ -120,26 +150,38 @@ class PerformanceTracker:
                     continue
         return rows
 
+    _EVALS_MAX_BYTES = 50_000_000
+
     def log_evaluation(self, record: EvalRecord) -> None:
-        self._append_jsonl(self.evals_path, asdict(record))
+        # evaluations.jsonl gains ~universe-size records per cycle forever;
+        # roll it once per size cap (single .1 generation) so the disk and the
+        # summarize_recent full-file read stay bounded. Diagnostics only —
+        # trades/outcomes are never rotated (attribution reads them in full).
+        with self._lock:
+            try:
+                if self.evals_path.exists() and self.evals_path.stat().st_size > self._EVALS_MAX_BYTES:
+                    self.evals_path.replace(self.evals_path.with_suffix(".jsonl.1"))
+            except OSError:
+                pass
+            self._append_jsonl(self.evals_path, asdict(record))
 
     def log_trade(self, record: TradeRecord) -> None:
         self._append_jsonl(self.trades_path, asdict(record))
 
     def _get_outcomes(self) -> List[Dict[str, Any]]:
-        if self._outcomes_cache is None:
-            self._outcomes_cache = self._read_jsonl(self.outcomes_path)
-        return self._outcomes_cache
+        with self._lock:
+            if self._outcomes_cache is None:
+                self._outcomes_cache = self._read_jsonl(self.outcomes_path)
+            return self._outcomes_cache
 
     def log_outcome(self, record: OutcomeRecord) -> None:
         """Call when a position CLOSES (fill reconciliation in main.py is the
         natural place). Without outcomes, threshold adaptation stays inert."""
         d = asdict(record)
-        self._append_jsonl(self.outcomes_path, d)
-        if self._outcomes_cache is not None:
-            self._outcomes_cache.append(d)
-        else:
-            self._outcomes_cache = None  # force reload on next access
+        with self._lock:
+            self._append_jsonl(self.outcomes_path, d)
+            if self._outcomes_cache is not None:
+                self._outcomes_cache.append(d)
 
     def recent_loss_exit(self, symbol: str, now: datetime, within_minutes: int) -> bool:
         """True if this symbol's most recent CLOSED trade was a loss within
@@ -158,22 +200,29 @@ class PerformanceTracker:
             return False
         sym = str(symbol).upper()
         latest = None
-        latest_ts = ""
+        latest_dt = None
         for r in self._get_outcomes():
             if str(r.get("symbol", "")).upper() != sym:
                 continue
-            ts = str(r.get("timestamp") or "")
-            if ts >= latest_ts:                 # ISO timestamps sort lexically
-                latest_ts, latest = ts, r
-        if latest is None:
+            # Parsed comparison: mixed formats ('Z' vs '+00:00' vs space
+            # separator) mis-order lexically, so the "latest" outcome could be
+            # hours stale (audit M4).
+            dt = parse_ts(r.get("timestamp"))
+            if dt is None:
+                continue
+            if latest_dt is None or dt >= latest_dt:
+                latest_dt, latest = dt, r
+        if latest is None or latest_dt is None:
             return False
         try:
             if float(latest.get("realized_pnl", 0.0)) >= 0:
                 return False                    # last close was a win/scratch
-            exit_dt = datetime.fromisoformat(latest_ts.replace("Z", "+00:00"))
+            # parse_ts always returns tz-aware, so this comparison can no
+            # longer raise on a naive stored timestamp (which used to kill the
+            # symbol's whole evaluation for the cycle).
+            return now <= latest_dt + timedelta(minutes=within_minutes)
         except (TypeError, ValueError):
             return False
-        return now <= exit_dt + timedelta(minutes=within_minutes)
 
     def _read_outcomes_cursor(self) -> str:
         try:
@@ -209,32 +258,42 @@ class PerformanceTracker:
             return 0
 
         cursor = self._read_outcomes_cursor()
+        cursor_dt = parse_ts(cursor)
         # Newest entry per symbol wins when several precede a close; entries are
-        # logged at decision time so an entry's timestamp <= its exit's time.
-        entries = sorted(
-            (e for e in self._read_jsonl(self.trades_path) if e.get("symbol")),
-            key=lambda e: str(e.get("timestamp") or ""),
-        )
+        # logged at submit time so an entry's timestamp <= its exit's time.
+        # All comparisons use PARSED datetimes: broker fill times ('Z' / space
+        # separated) and our own ISO ('+00:00') mis-order lexically (audit M4).
+        entries = []
+        for e in self._read_jsonl(self.trades_path):
+            if not e.get("symbol"):
+                continue
+            dt = parse_ts(e.get("timestamp"))
+            if dt is not None:
+                entries.append((dt, e))
+        entries.sort(key=lambda t: t[0])
 
-        def attribute(symbol: str, when: str):
+        def attribute(symbol: str, when_dt):
             sym = str(symbol).upper()
             best = None
-            for e in entries:
+            for dt, e in entries:
                 if str(e.get("symbol")).upper() != sym:
                     continue
-                if str(e.get("timestamp") or "") <= when:
+                if when_dt is None or dt <= when_dt:
                     best = e            # entries are time-sorted -> last match is newest
                 else:
                     break
             return best
 
         logged = 0
-        newest = cursor
+        newest, newest_dt = cursor, cursor_dt
         for ev in events:
             when = ev["time"]
-            if cursor and when <= cursor:
+            when_dt = parse_ts(when)
+            if cursor_dt is not None and when_dt is not None and when_dt <= cursor_dt:
                 continue                # already booked on a prior reconcile
-            entry = attribute(ev["symbol"], when)
+            if cursor and when_dt is None and str(when) <= cursor:
+                continue                # unparseable: legacy lexical fallback
+            entry = attribute(ev["symbol"], when_dt)
             if entry is None:
                 continue                # no entry to attribute style/regime to
             self.log_outcome(
@@ -249,8 +308,8 @@ class PerformanceTracker:
                 )
             )
             logged += 1
-            if when > newest:
-                newest = when
+            if when_dt is not None and (newest_dt is None or when_dt > newest_dt):
+                newest_dt, newest = when_dt, when
 
         if newest and newest != cursor:
             self._write_outcomes_cursor(newest)
@@ -290,6 +349,7 @@ class PerformanceTracker:
         baseline_threshold: float,
         min_samples: int,
         max_adj: float,
+        recency_limit: int = 200,
     ) -> float:
         # REWRITTEN: the old version adapted the threshold from the average
         # entry-time trade_score of past trades — a feedback loop on the
@@ -302,6 +362,12 @@ class PerformanceTracker:
             if o.get("entry_style") == entry_style and o.get("regime") == regime
             and o.get("realized_pnl") is not None
         ]
+        # Recency window: learn from the LAST recency_limit outcomes in this
+        # (style, regime) cell, not everything ever logged — 20+ losers from a
+        # long-dead config used to pin the cell at +max_adj forever, even
+        # after the underlying bug was fixed (audit M6-adaptive).
+        if recency_limit > 0:
+            matching = matching[-recency_limit:]
         if len(matching) < min_samples:
             return baseline_threshold
 

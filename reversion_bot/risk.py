@@ -111,14 +111,19 @@ class RiskManager:
                 f"Risk/reward below minimum threshold: {rr_ratio:.2f} < {self.config.min_rr:.2f}"
             )
 
+        # NOTE: the boost deliberately scales the risk budget UP TO +35% over
+        # RISK_PER_TRADE_PCT for high-conviction signals (conviction 0.85+).
+        # The min_qty rejection below therefore guards the BOOSTED budget, not
+        # the bare risk_per_trade_pct — worst case per trade is
+        # 1.35 x risk_per_trade_pct of equity.
         conviction_boost = min(max(conviction_score - 0.50, 0.0), 0.35)
         risk_budget = account_equity * self.config.risk_per_trade_pct * (1.0 + conviction_boost)
 
         raw_qty = floor(risk_budget / max(risk_per_share, 1e-9))
-        # Never floor UP to min_qty: if the risk budget can't afford even min_qty
-        # shares at this stop distance, forcing min_qty would risk MORE than
-        # risk_per_trade_pct on the trade (a wide-stop / high-priced name). Reject
-        # instead so no position ever exceeds the per-trade risk budget.
+        # Never floor UP to min_qty: if the (boosted) risk budget can't afford
+        # even min_qty shares at this stop distance, forcing min_qty would risk
+        # more still (a wide-stop / high-priced name). Reject instead so no
+        # position ever exceeds the boosted per-trade risk budget above.
         if raw_qty < self.config.min_qty:
             raise ValueError(
                 f"Risk budget {risk_budget:.2f} affords {raw_qty} < min_qty "

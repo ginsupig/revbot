@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, Dict
 from zoneinfo import ZoneInfo
 import json
+import logging
+import os
 
 
 # Circuit-breaker drawdown is measured per trading *session*. The bot flattens
@@ -25,8 +27,14 @@ class PositionSnapshot:
 
 
 class PortfolioState:
-    def __init__(self, state_dir: str = "state/portfolio") -> None:
-        self.state_dir = Path(state_dir)
+    # Anchored to the CHECKOUT (like main.py's lock/heartbeat paths), not the
+    # launch cwd: a cron start from a different directory used to silently
+    # begin with EMPTY state — cooldowns, trail anchors, position meta, and
+    # the session drawdown peak all reset while positions were open.
+    DEFAULT_STATE_DIR = Path(__file__).resolve().parent.parent / "state" / "portfolio"
+
+    def __init__(self, state_dir: "str | None" = None) -> None:
+        self.state_dir = Path(state_dir) if state_dir else self.DEFAULT_STATE_DIR
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.state_dir / "portfolio_state.json"
         self._cache: Dict[str, Any] | None = None
@@ -53,7 +61,15 @@ class PortfolioState:
             return self._cache
         try:
             self._cache = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
+            # A corrupt state file silently resetting to defaults wipes every
+            # cooldown/trail anchor while positions may be open — at least say
+            # so loudly instead of pretending it's a fresh install.
+            logging.error(
+                "PortfolioState: %s is unreadable (%s) — falling back to EMPTY "
+                "state; cooldowns, trail anchors and the drawdown peak are lost.",
+                self.state_path, exc,
+            )
             self._cache = self._default_state()
         return self._cache
 
@@ -63,7 +79,11 @@ class PortfolioState:
 
     def _save(self, data: Dict[str, Any]) -> None:
         self._cache = data
-        self.state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # Atomic replace: a crash mid-write used to leave a truncated JSON that
+        # the next start silently swallowed into default state (see _load).
+        tmp = self.state_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, self.state_path)
 
     def update_equity(self, account_equity: float, today: str | None = None) -> Dict[str, Any]:
         data = self._load()
@@ -264,6 +284,10 @@ class PortfolioState:
         try:
             last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
         except Exception:
+            # Fail OPEN by design (a corrupt stamp must not freeze trading
+            # forever) — but say so, since it silently disables the cooldown.
+            logging.warning("in_symbol_cooldown: unparseable timestamp %r for %s "
+                            "— cooldown skipped.", last_ts, symbol)
             return False
         return now <= last_dt + timedelta(minutes=cooldown_minutes)
 
@@ -289,5 +313,9 @@ class PortfolioState:
         try:
             last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
         except Exception:
+            # Fail OPEN by design (a corrupt stamp must not freeze trading
+            # forever) — but say so, since it silently disables the cooldown.
+            logging.warning("in_symbol_cooldown: unparseable timestamp %r for %s "
+                            "— cooldown skipped.", last_ts, symbol)
             return False
         return now <= last_dt + timedelta(minutes=cooldown_minutes)

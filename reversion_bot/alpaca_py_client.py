@@ -88,6 +88,9 @@ def _build_order_request(kwargs: dict):
         "side": side,
         "time_in_force": tif,
     }
+    # Bot-ownership tag: lets the EOD cancel target only revbot's own orders.
+    if kwargs.get("client_order_id"):
+        common["client_order_id"] = kwargs["client_order_id"]
 
     if kwargs.get("order_class") == "bracket":
         common["order_class"] = OrderClass.BRACKET

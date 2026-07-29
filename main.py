@@ -27,7 +27,7 @@ from reversion_bot.allowlist import (
 )
 from reversion_bot.symbol_params import load_symbol_params, build_symbol_configs
 from reversion_bot.single_instance import acquire_lock, release_lock
-from reversion_bot.schedule import session_done, within_minutes_before_close
+from reversion_bot.schedule import session_done
 from reversion_bot.heartbeat import write_heartbeat
 from reversion_bot.market_regime import (
     is_risk_off,
@@ -35,7 +35,7 @@ from reversion_bot.market_regime import (
     suppress_longs_by_sector,
 )
 from reversion_bot.sectors import sector_for, etf_for_sector
-from reversion_bot.universe import select_base_universe, broad_reversion_universe
+from reversion_bot.universe import select_base_universe
 from reversion_bot.swing import is_moc_entry_window, should_block_entry_now, holds_overnight
 from reversion_bot.channel import select_breakout_exits, select_breakdown_exits
 from run_real_backtest import fetch_alpaca_bars, fetch_alpaca_bars_batch
@@ -343,7 +343,7 @@ async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor,
         print(f"[ERROR] {symbol}: {e}\n{traceback.format_exc()}")
         return None
 
-async def execute_candidates(governor, executor, portfolio_state, candidates):
+async def execute_candidates(governor, executor, portfolio_state, candidates, service=None):
     if not candidates:
         print("[INFO] No candidates to execute.")
         return
@@ -361,10 +361,22 @@ async def execute_candidates(governor, executor, portfolio_state, candidates):
         # update. Previously one exception unwound the whole loop.
         symbol = candidate.get("symbol", "?")
         try:
-            if governor.approve(candidate, executor=executor, trades_executed_this_cycle=trades_this_cycle):
+            approved = await asyncio.to_thread(
+                governor.approve, candidate, executor, trades_this_cycle
+            )
+            if approved:
                 print(f"[INFO] Executing trade for {symbol}.")
                 await asyncio.to_thread(executor.submit_order, candidate)
                 portfolio_state.update(candidate)
+                # Book the TradeRecord ONLY after a successful submission —
+                # logging it at decision time filled trades.jsonl with vetoed/
+                # rejected signals that reconcile_outcomes then mis-attributed
+                # real closes to (audit M3).
+                if service is not None:
+                    try:
+                        service.record_submitted_trade(candidate)
+                    except Exception as e:
+                        print(f"[WARN] trade-record log failed for {symbol}: {e}")
                 trades_this_cycle += 1
             else:
                 print(f"[INFO] Candidate {symbol} not approved by governor.")
@@ -373,17 +385,53 @@ async def execute_candidates(governor, executor, portfolio_state, candidates):
 
 # --- EOD Liquidation ---
 
+def _minutes_env(name: str, default: int) -> int:
+    """Parse a minutes env var without ever raising.
+
+    These are read inside the trading loop; a malformed value ('10.5',
+    '15 min') used to raise ValueError mid-session -> loop death -> supervisor
+    restart -> immediate re-crash, a crash loop that started exactly at the
+    market open. Malformed values warn once per value and use the default.
+    """
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        if raw not in _minutes_env._warned:  # type: ignore[attr-defined]
+            print(f"[CONFIG] Ignoring malformed {name}={raw!r}; using {default}.")
+            _minutes_env._warned.add(raw)    # type: ignore[attr-defined]
+        return default
+
+
+_minutes_env._warned = set()  # type: ignore[attr-defined]
+
+# Last close time successfully fetched from the broker, per CT date. On a
+# clock-API blip we fall back to TODAY'S cached value (correct on half-days)
+# before the last-resort 15:00 CT guess — the guess is wrong on a 12:00 CT
+# early close, where it would let entries through after the real close.
+_CLOSE_CT_CACHE: dict = {}
+
+
 def _get_close_ct(executor) -> datetime:
     """Get today's close time from the broker clock (handles half-days).
 
-    Falls back to the standard 15:00 CT if the API call fails.
+    Falls back to the day's cached value, then to the standard 15:00 CT.
     """
     ct = ZoneInfo("America/Chicago")
     now_ct = datetime.now(ct)
+    today = now_ct.date().isoformat()
     try:
         clock = executor.client.get_clock()
-        return clock.next_close.astimezone(ct)
+        close_ct = clock.next_close.astimezone(ct)
+        _CLOSE_CT_CACHE.clear()
+        _CLOSE_CT_CACHE[today] = close_ct
+        return close_ct
     except Exception:
+        cached = _CLOSE_CT_CACHE.get(today)
+        if cached is not None:
+            return cached
         return now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
 
 
@@ -393,7 +441,7 @@ def is_eod_liquidation_window(executor) -> bool:
     Uses the broker clock so it fires correctly on half-day early closes
     (e.g. day before July 4th, day after Thanksgiving).
     """
-    lead_minutes = int(os.getenv("EOD_LIQUIDATION_MINUTES", 10))
+    lead_minutes = _minutes_env("EOD_LIQUIDATION_MINUTES", 10)
     now_ct = datetime.now(ZoneInfo("America/Chicago"))
     close_ct = _get_close_ct(executor)
     start_ct = close_ct - timedelta(minutes=lead_minutes)
@@ -406,13 +454,32 @@ def is_eod_entry_cutoff(executor) -> bool:
     Uses the broker clock so it fires correctly on half-day early closes.
     Set EOD_ENTRY_CUTOFF_MINUTES=0 to disable.
     """
-    minutes = int(os.getenv("EOD_ENTRY_CUTOFF_MINUTES", 20))
+    minutes = _minutes_env("EOD_ENTRY_CUTOFF_MINUTES", 20)
     if minutes <= 0:
         return False
     now_ct = datetime.now(ZoneInfo("America/Chicago"))
     close_ct = _get_close_ct(executor)
     start_ct = close_ct - timedelta(minutes=minutes)
     return start_ct <= now_ct < close_ct
+
+
+def validate_eod_windows(poll_interval: int) -> None:
+    """Warn at startup about EOD window configs that silently misbehave.
+
+    - cutoff < liquidation: an entry can be opened that can't be flattened
+      before the bell (the live orphaned-short failure).
+    - poll_interval >= the liquidation window: a sleeping loop can hop clean
+      over the flatten and never liquidate.
+    """
+    liq = _minutes_env("EOD_LIQUIDATION_MINUTES", 10)
+    cut = _minutes_env("EOD_ENTRY_CUTOFF_MINUTES", 20)
+    if 0 < cut < liq:
+        print(f"[CONFIG] WARNING: EOD_ENTRY_CUTOFF_MINUTES={cut} < "
+              f"EOD_LIQUIDATION_MINUTES={liq} — entries may open too late to flatten.")
+    if liq > 0 and poll_interval >= liq * 60:
+        print(f"[CONFIG] WARNING: TRADE_POLL_INTERVAL={poll_interval}s >= the "
+              f"{liq}-minute liquidation window — the loop can sleep straight "
+              f"past the EOD flatten.")
 
 
 # Once-per-day stamp so the carryover flatten runs on the day's FIRST open cycle
@@ -487,13 +554,6 @@ async def liquidate_all_positions(executor) -> bool:
     """
     print("[EOD] Starting end-of-day liquidation...")
 
-    # Cancel all open orders first so stops/limits don't interfere
-    try:
-        await asyncio.to_thread(executor.client.cancel_all_orders)
-        print("[EOD] All open orders cancelled.")
-    except Exception as e:
-        print(f"[EOD] Failed to cancel orders: {e}")
-
     # Market-close every open position
     try:
         positions = await asyncio.to_thread(executor.client.list_positions)
@@ -501,6 +561,19 @@ async def liquidate_all_positions(executor) -> bool:
         # Unknown state: never report success on a blind read.
         print(f"[EOD] Failed to fetch positions: {e}")
         return False
+
+    # Cancel the BOT'S working orders first so bracket legs don't hold the
+    # shares (scoped by client_order_id prefix + position symbols — the old
+    # account-wide cancel_all_orders also nuked manual/other-strategy orders
+    # sharing the account).
+    try:
+        n = await asyncio.to_thread(
+            executor.cancel_bot_orders,
+            [str(getattr(p, "symbol", "")) for p in positions],
+        )
+        print(f"[EOD] Cancelled {n} bot order(s).")
+    except Exception as e:
+        print(f"[EOD] Failed to cancel orders: {e}")
 
     if not positions:
         print("[EOD] No open positions to liquidate.")
@@ -785,6 +858,7 @@ async def main():
     timeframe = os.getenv("TRADE_TIMEFRAME", "5Min")
     lookback = int(os.getenv("TRADE_LOOKBACK", 160))
     poll_interval = int(os.getenv("TRADE_POLL_INTERVAL", 30))
+    validate_eod_windows(poll_interval)
 
     # Market-regime filter: when the benchmark is below its trend EMA (risk-off),
     # suppress NEW long entries. Dip-buying every oversold name in a market-wide
@@ -1079,6 +1153,7 @@ async def main():
 
     cycle = 0
     last_booked_date = None      # persistent mode: book outcomes once per closed session
+    post_close_flatten_date = None  # persistent mode: flatten once per closed session
     try:
         while True:
             market_open = await asyncio.to_thread(is_market_open, executor)
@@ -1106,9 +1181,12 @@ async def main():
                 session_over = await asyncio.to_thread(is_session_over, executor)
                 if session_over:
                     # Swing mode holds overnight (the ATR trail manages positions);
-                    # only flatten at session end in intraday mode.
-                    if not holds_overnight(swing_mode):
-                        await liquidate_all_positions(executor)
+                    # only flatten at session end in intraday mode. Once per
+                    # closed session — persistent mode used to re-run the whole
+                    # cancel-all/list/close churn every wake, all night.
+                    if not holds_overnight(swing_mode) and post_close_flatten_date != _today_ct():
+                        if await liquidate_all_positions(executor):
+                            post_close_flatten_date = _today_ct()
                     today_ct = _today_ct()
                     if today_ct != last_booked_date:        # book once per closed session
                         await reconcile_trade_outcomes(service, api_key, api_secret, base_url, outcome_reconcile_days)
@@ -1124,7 +1202,7 @@ async def main():
                 await asyncio.sleep(nap)
                 continue
 
-            if is_eod_liquidation_window(executor) and not holds_overnight(swing_mode):
+            if (await asyncio.to_thread(is_eod_liquidation_window, executor)) and not holds_overnight(swing_mode):
                 await liquidate_all_positions(executor)
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] EOD liquidation done. Sleeping...")
                 await asyncio.sleep(poll_interval)
@@ -1213,7 +1291,7 @@ async def main():
                         print(f"[SWING] Outside the MOC entry window — holding {len(candidates)} "
                               f"candidate(s) for the close.")
                         candidates = []
-                elif is_eod_entry_cutoff(executor):
+                elif await asyncio.to_thread(is_eod_entry_cutoff, executor):
                     print(f"[EOD] Entry cutoff — blocking {len(candidates)} new entr(ies) near the close.")
                     candidates = []
 
@@ -1250,7 +1328,7 @@ async def main():
             except Exception:
                 pass
 
-            await execute_candidates(governor, executor, portfolio_state, candidates)
+            await execute_candidates(governor, executor, portfolio_state, candidates, service=service)
 
             # Trailing stop: ratchet each open long's stop up toward the trailing
             # level (the validated edge). On by default.

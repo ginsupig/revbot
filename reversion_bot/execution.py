@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from uuid import uuid4
 
 from alpaca_trade_api.rest import REST
 from time import sleep
@@ -84,6 +85,43 @@ class AlpacaExecutor:
         else:
             limit_price = entry_price * (1.0 - offset)
         return {"type": "limit", "limit_price": round(limit_price, 2)}
+
+    # Every order the bot submits carries this client_order_id prefix, so the
+    # EOD cancel can target ONLY revbot's orders instead of nuking manual /
+    # other-strategy orders sharing the account.
+    CLIENT_ORDER_PREFIX = "revbot-"
+
+    @classmethod
+    def _make_client_order_id(cls) -> str:
+        return f"{cls.CLIENT_ORDER_PREFIX}{uuid4().hex[:20]}"
+
+    def cancel_bot_orders(self, position_symbols=()) -> int:
+        """Cancel the bot's own working orders: anything tagged with our
+        client_order_id prefix, plus any order on a symbol we hold a position
+        in (covers pre-tagging legacy brackets). Returns the cancel count;
+        never raises — the per-symbol cancel in the flatten loop is the
+        second line of defense."""
+        held = {str(s).upper() for s in position_symbols}
+        cancelled = 0
+        try:
+            orders = self.list_open_orders()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("cancel_bot_orders: order list failed: %s", e)
+            return 0
+        for o in orders:
+            coid = str(getattr(o, "client_order_id", "") or "")
+            sym = str(getattr(o, "symbol", "") or "").upper()
+            if not (coid.startswith(self.CLIENT_ORDER_PREFIX) or sym in held):
+                continue
+            oid = getattr(o, "id", None)
+            if not oid:
+                continue
+            try:
+                self.client.cancel_order(oid)
+                cancelled += 1
+            except Exception as e:  # noqa: BLE001
+                logging.warning("cancel_bot_orders: cancel failed for %s: %s", sym, e)
+        return cancelled
 
     def _tune_connection_pool(self, maxsize: int) -> None:
         """Widen the REST session's HTTP connection pool.
@@ -205,6 +243,7 @@ class AlpacaExecutor:
             "order_class": "bracket",
             "take_profit": {"limit_price": round(plan.target_price, 2)},
             "stop_loss": {"stop_price": round(plan.stop_price, 2)},
+            "client_order_id": self._make_client_order_id(),
             **self._entry_order_type(plan.entry_price, "buy"),
         }
 
@@ -233,6 +272,7 @@ class AlpacaExecutor:
             # On a short, profit is taken *below* entry and the stop sits *above*.
             "take_profit": {"limit_price": round(plan.target_price, 2)},
             "stop_loss": {"stop_price": round(plan.stop_price, 2)},
+            "client_order_id": self._make_client_order_id(),
             **self._entry_order_type(plan.entry_price, "sell"),
         }
 
@@ -311,6 +351,7 @@ class AlpacaExecutor:
                 type="stop",
                 stop_price=round(stop_price, 2),
                 time_in_force="gtc",
+                client_order_id=self._make_client_order_id(),
             )
             logging.warning(
                 "Re-armed emergency %s stop for %s: qty=%d stop=%.2f (close failed after bracket cancel)",

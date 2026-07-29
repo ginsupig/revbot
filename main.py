@@ -343,7 +343,7 @@ async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor,
         print(f"[ERROR] {symbol}: {e}\n{traceback.format_exc()}")
         return None
 
-async def execute_candidates(governor, executor, portfolio_state, candidates):
+async def execute_candidates(governor, executor, portfolio_state, candidates, service=None):
     if not candidates:
         print("[INFO] No candidates to execute.")
         return
@@ -365,6 +365,15 @@ async def execute_candidates(governor, executor, portfolio_state, candidates):
                 print(f"[INFO] Executing trade for {symbol}.")
                 await asyncio.to_thread(executor.submit_order, candidate)
                 portfolio_state.update(candidate)
+                # Book the TradeRecord ONLY after a successful submission —
+                # logging it at decision time filled trades.jsonl with vetoed/
+                # rejected signals that reconcile_outcomes then mis-attributed
+                # real closes to (audit M3).
+                if service is not None:
+                    try:
+                        service.record_submitted_trade(candidate)
+                    except Exception as e:
+                        print(f"[WARN] trade-record log failed for {symbol}: {e}")
                 trades_this_cycle += 1
             else:
                 print(f"[INFO] Candidate {symbol} not approved by governor.")
@@ -1250,7 +1259,7 @@ async def main():
             except Exception:
                 pass
 
-            await execute_candidates(governor, executor, portfolio_state, candidates)
+            await execute_candidates(governor, executor, portfolio_state, candidates, service=service)
 
             # Trailing stop: ratchet each open long's stop up toward the trailing
             # level (the validated edge). On by default.

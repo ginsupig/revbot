@@ -13,7 +13,9 @@ detected as stale via a process-liveness check and reclaimed on next start.
 from __future__ import annotations
 
 import atexit
+import logging
 import os
+import time
 from pathlib import Path
 from typing import Tuple
 
@@ -107,6 +109,11 @@ def _pid_start_time(pid: int) -> "float | None":
 # a reboot differs by minutes-to-days.
 _START_TIME_TOLERANCE_S = 3.0
 
+# A lock file whose pid isn't readable yet is presumed to be a racer's in-flight
+# write (see acquire_lock); re-read a few times before calling it corrupt.
+_INFLIGHT_RETRIES = 5
+_INFLIGHT_WAIT_S = 0.05
+
 
 def _read_lock(path: Path) -> Tuple[int, "float | None"]:
     """Parse the lock file: line 1 = pid, line 2 (optional) = start time.
@@ -169,6 +176,25 @@ def acquire_lock(lock_path: "str | os.PathLike") -> Tuple[bool, int]:
             fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             holder, recorded_start = _read_lock(path)
+            if not holder:
+                # The file exists but carries no readable pid. The overwhelmingly
+                # likely cause is a racer that just won the exclusive create and
+                # hasn't written its pid yet (open and write are not atomic) —
+                # treating that as "stale" would unlink the winner's fresh lock
+                # and let BOTH instances run, double-placing orders. Give the
+                # writer a moment to finish; only a lock that STAYS unreadable is
+                # genuinely corrupt and reclaimable.
+                for _ in range(_INFLIGHT_RETRIES):
+                    time.sleep(_INFLIGHT_WAIT_S)
+                    holder, recorded_start = _read_lock(path)
+                    if holder:
+                        break
+                if not holder:
+                    logging.warning(
+                        "Lock file %s has no readable pid after %.2fs — treating "
+                        "as corrupt and reclaiming.",
+                        path, _INFLIGHT_RETRIES * _INFLIGHT_WAIT_S,
+                    )
             if holder == mypid:
                 # Already ours (e.g. re-entrant call) — treat as held.
                 atexit.register(release_lock, str(path))

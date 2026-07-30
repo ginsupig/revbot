@@ -110,6 +110,82 @@ def get_account_equity(executor):
     return float(account.equity)
 
 
+def resolve_universe(executor, strategy_config, verbose: bool = True):
+    """Resolve the symbol universe: scanner -> fallback/broad -> watchlist -> allowlist.
+
+    Factored out of startup so RUN_PERSISTENT can REFRESH it on each new trading
+    day. A daemon left up for weeks otherwise trades the snapshot taken at
+    process start: delisted/halted names keep failing every cycle and newly
+    liquid names never enter.
+    """
+    def _say(msg):
+        if verbose:
+            print(msg)
+
+    # Attempt dynamic scan
+    symbols = executor.scan_symbols(
+        min_price=strategy_config.min_price,
+        min_dollar_volume=strategy_config.min_dollar_volume,
+        max_count=20
+    )
+
+    # Fallback watchlist = the names that cleared the walk-forward gate in the
+    # last 90-day autotune (PF >= 1.10, Sharpe >= 0 out of sample). Keeping the
+    # fallback in sync with the allowlist means a scanner whiff still trades only
+    # vetted symbols. Re-run autotune_run.py to refresh both this list and
+    # TRADE_ALLOWLIST.
+    scanned_symbols = list(symbols)
+    fallback_watchlist = [
+        "AMD", "NVDA", "SMCI", "META", "ARM",
+        "CRWD", "FCX", "OXY", "CLF", "HIMS",
+    ]
+    # USE_BROAD_REVERSION_UNIVERSE: trade the validated neutral large-cap basket
+    # (research/portfolio_sim.py — two-window OOS under live ATR-risk sizing,
+    # ~+20%/window at <7% MTM drawdown at the 4-cap) instead of the scanner/curated
+    # watchlist. Default OFF = today's behavior. Occupancy cap, ATR sizing and the
+    # trailing stop stay as-is; this only swaps the universe the engine scans.
+    use_broad_universe = parse_bool(os.getenv("USE_BROAD_REVERSION_UNIVERSE", "False"), default=False)
+    symbols = select_base_universe(scanned_symbols, fallback_watchlist, use_broad_universe)
+    if use_broad_universe:
+        _say(f"[BROAD] USE_BROAD_REVERSION_UNIVERSE on — trading the neutral large-cap "
+              f"reversion universe ({len(symbols)} names); scanner/fallback overridden.")
+    elif not scanned_symbols:
+        _say("[WARN] Scanner returned no symbols. Using fallback watchlist.")
+
+    # 3a-bis. Force-include watchlist / force-exclude blocklist. These wrap the
+    # scanner (and run before the allowlist gate) so curated names trade even if
+    # the liquidity scan misses them, and chronic losers never trade even if the
+    # scan keeps surfacing them. Both are optional comma-separated .env values.
+    include = parse_symbol_csv(os.getenv("TRADE_WATCHLIST"))
+    exclude = parse_symbol_csv(os.getenv("TRADE_BLOCKLIST"))
+    if include or exclude:
+        before = {str(s).upper() for s in symbols}
+        symbols = apply_watchlist(symbols, include, exclude)
+        added = [s for s in symbols if str(s).upper() not in before]
+        if added:
+            _say(f"[WATCHLIST] Force-including {len(added)} name(s): {', '.join(added)}")
+        if exclude:
+            _say(f"[BLOCKLIST] Excluding: {', '.join(sorted(exclude))}")
+
+    # 3b. Per-symbol allowlist gate (autotune_run.py writes TRADE_ALLOWLIST with
+    # only the names whose OOS profit factor cleared the threshold). Unset means
+    # gating is off; explicitly empty means nothing qualified -> trade nothing.
+    # The per-symbol allowlist is the curated path's vetting gate; in broad-reversion
+    # mode the neutral universe IS the filter, so applying it would collapse the
+    # basket to a handful of names. Skip it (with a note) when broad mode is on.
+    allowlist = parse_allowlist(os.getenv("TRADE_ALLOWLIST"))
+    if allowlist is not None and use_broad_universe:
+        _say("[BROAD] TRADE_ALLOWLIST ignored in broad-reversion mode (the universe is the filter).")
+    elif allowlist is not None:
+        symbols, dropped = filter_symbols(symbols, allowlist)
+        if dropped:
+            _say(f"[ALLOWLIST] Skipping {len(dropped)} name(s) not in TRADE_ALLOWLIST: {', '.join(dropped)}")
+        if not symbols:
+            _say("[ALLOWLIST] No symbols passed the allowlist gate — nothing to trade this session.")
+
+    return symbols
+
+
 def preflight_check(executor, paper: bool) -> bool:
     """Validate credentials + connectivity before the trading loop starts.
 
@@ -1080,66 +1156,7 @@ async def main():
         release_lock(LOCK_PATH)
         return 0
 
-    # Attempt dynamic scan
-    symbols = executor.scan_symbols(
-        min_price=strategy_config.min_price,
-        min_dollar_volume=strategy_config.min_dollar_volume,
-        max_count=20
-    )
-
-    # Fallback watchlist = the names that cleared the walk-forward gate in the
-    # last 90-day autotune (PF >= 1.10, Sharpe >= 0 out of sample). Keeping the
-    # fallback in sync with the allowlist means a scanner whiff still trades only
-    # vetted symbols. Re-run autotune_run.py to refresh both this list and
-    # TRADE_ALLOWLIST.
-    scanned_symbols = list(symbols)
-    fallback_watchlist = [
-        "AMD", "NVDA", "SMCI", "META", "ARM",
-        "CRWD", "FCX", "OXY", "CLF", "HIMS",
-    ]
-    # USE_BROAD_REVERSION_UNIVERSE: trade the validated neutral large-cap basket
-    # (research/portfolio_sim.py — two-window OOS under live ATR-risk sizing,
-    # ~+20%/window at <7% MTM drawdown at the 4-cap) instead of the scanner/curated
-    # watchlist. Default OFF = today's behavior. Occupancy cap, ATR sizing and the
-    # trailing stop stay as-is; this only swaps the universe the engine scans.
-    use_broad_universe = parse_bool(os.getenv("USE_BROAD_REVERSION_UNIVERSE", "False"), default=False)
-    symbols = select_base_universe(scanned_symbols, fallback_watchlist, use_broad_universe)
-    if use_broad_universe:
-        print(f"[BROAD] USE_BROAD_REVERSION_UNIVERSE on — trading the neutral large-cap "
-              f"reversion universe ({len(symbols)} names); scanner/fallback overridden.")
-    elif not scanned_symbols:
-        print("[WARN] Scanner returned no symbols. Using fallback watchlist.")
-
-    # 3a-bis. Force-include watchlist / force-exclude blocklist. These wrap the
-    # scanner (and run before the allowlist gate) so curated names trade even if
-    # the liquidity scan misses them, and chronic losers never trade even if the
-    # scan keeps surfacing them. Both are optional comma-separated .env values.
-    include = parse_symbol_csv(os.getenv("TRADE_WATCHLIST"))
-    exclude = parse_symbol_csv(os.getenv("TRADE_BLOCKLIST"))
-    if include or exclude:
-        before = {str(s).upper() for s in symbols}
-        symbols = apply_watchlist(symbols, include, exclude)
-        added = [s for s in symbols if str(s).upper() not in before]
-        if added:
-            print(f"[WATCHLIST] Force-including {len(added)} name(s): {', '.join(added)}")
-        if exclude:
-            print(f"[BLOCKLIST] Excluding: {', '.join(sorted(exclude))}")
-
-    # 3b. Per-symbol allowlist gate (autotune_run.py writes TRADE_ALLOWLIST with
-    # only the names whose OOS profit factor cleared the threshold). Unset means
-    # gating is off; explicitly empty means nothing qualified -> trade nothing.
-    # The per-symbol allowlist is the curated path's vetting gate; in broad-reversion
-    # mode the neutral universe IS the filter, so applying it would collapse the
-    # basket to a handful of names. Skip it (with a note) when broad mode is on.
-    allowlist = parse_allowlist(os.getenv("TRADE_ALLOWLIST"))
-    if allowlist is not None and use_broad_universe:
-        print("[BROAD] TRADE_ALLOWLIST ignored in broad-reversion mode (the universe is the filter).")
-    elif allowlist is not None:
-        symbols, dropped = filter_symbols(symbols, allowlist)
-        if dropped:
-            print(f"[ALLOWLIST] Skipping {len(dropped)} name(s) not in TRADE_ALLOWLIST: {', '.join(dropped)}")
-        if not symbols:
-            print("[ALLOWLIST] No symbols passed the allowlist gate — nothing to trade this session.")
+    symbols = resolve_universe(executor, strategy_config)
 
     # 4. Initialize Remaining Services
     perf_config = PerformanceConfig(
@@ -1233,6 +1250,7 @@ async def main():
     cycle = 0
     last_booked_date = None      # persistent mode: book outcomes once per closed session
     post_close_flatten_date = None  # persistent mode: flatten once per closed session
+    universe_date = _today_ct()     # persistent mode: rescan the universe once per day
     try:
         while True:
             market_open = await asyncio.to_thread(is_market_open, executor)
@@ -1292,6 +1310,31 @@ async def main():
             # mode — there, overnight positions are intended holds, not orphans.
             if not holds_overnight(swing_mode):
                 await reconcile_carryover(executor)
+
+            # Refresh the universe once per trading day in persistent mode. A
+            # daemon left up for weeks otherwise trades the snapshot taken at
+            # process start: delisted/halted names keep failing every cycle and
+            # newly liquid names never enter. A failed refresh keeps the
+            # previous list (better a stale universe than none).
+            if run_persistent and universe_date != _today_ct():
+                try:
+                    refreshed = await asyncio.to_thread(
+                        resolve_universe, executor, strategy_config, False)
+                    if refreshed:
+                        added = sorted(set(refreshed) - set(symbols))
+                        removed = sorted(set(symbols) - set(refreshed))
+                        symbols = refreshed
+                        if added or removed:
+                            print(f"[UNIVERSE] Daily refresh: {len(symbols)} names "
+                                  f"(+{len(added)} {', '.join(added) or '-'} / "
+                                  f"-{len(removed)} {', '.join(removed) or '-'}).")
+                    else:
+                        print("[UNIVERSE] Daily refresh returned nothing — keeping "
+                              "the previous universe.")
+                    universe_date = _today_ct()
+                except Exception as e:
+                    print(f"[UNIVERSE] Daily refresh failed ({e}) — keeping the "
+                          f"previous universe.")
 
             # Optional configurable launch time: sit out until SESSION_START (CT)
             # even if the market is already open. Disabled when SESSION_START is unset.
@@ -1376,8 +1419,12 @@ async def main():
             # cutoff (no entries that can't be flattened before the bell).
             if candidates:
                 if swing_mode:
+                    # Derive the MOC deadline from the session's real close so
+                    # the window lands correctly on half-day early closes.
+                    swing_close_ct = await asyncio.to_thread(_get_close_ct, executor)
                     in_moc = is_moc_entry_window(
-                        datetime.now(ZoneInfo("America/Chicago")), moc_window_min)
+                        datetime.now(ZoneInfo("America/Chicago")), moc_window_min,
+                        close_ct=swing_close_ct)
                     if should_block_entry_now(swing_mode, in_moc):
                         print(f"[SWING] Outside the MOC entry window — holding {len(candidates)} "
                               f"candidate(s) for the close.")

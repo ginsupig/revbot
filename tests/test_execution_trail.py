@@ -58,3 +58,40 @@ def test_update_trailing_noop_when_not_in_profit():
 def test_update_trailing_noop_when_no_stop_leg():
     ex = _exec([_Order("WDC", "lim", stop_price=None)])
     assert ex.update_trailing_stop("WDC", 100.0, 1.2, 103.0, 103.0, 1.2, 1.5) is None
+
+
+# --- short-side wiring (audit: the short executor path had no broker test) ---
+
+def test_update_trailing_stop_short_lowers_the_stop_when_in_profit():
+    """Mirror of the long path: a short in profit ratchets its stop DOWN.
+
+    entry 100, stop_dist 1.2 (ATR 1.0 at 1.2x), low_water 97 -> desired stop
+    97 + 1.5*1.0 = 98.5, which is below the existing 101.2 and above the market.
+    """
+    ex = _exec([_Order("WDC", "stp", stop_price=101.2)])
+    new_stop = ex.update_trailing_stop_short(
+        "WDC", entry_price=100.0, stop_distance=1.2, low_water=97.0,
+        last_price=97.0, stop_mult=1.2, trail_mult=1.5,
+    )
+    assert new_stop == pytest.approx(98.5)
+    assert ex.client.replaced == [("stp", 98.5, None)]
+
+
+def test_update_trailing_stop_short_never_raises_the_stop():
+    """A short's stop must only move DOWN — a higher 'trail' would widen risk."""
+    ex = _exec([_Order("WDC", "stp", stop_price=98.0)])
+    new_stop = ex.update_trailing_stop_short(
+        "WDC", entry_price=100.0, stop_distance=1.2, low_water=99.5,
+        last_price=99.5, stop_mult=1.2, trail_mult=1.5,
+    )
+    assert new_stop is None
+    assert ex.client.replaced == []
+
+
+def test_update_trailing_stop_short_no_stop_leg_is_a_noop():
+    ex = _exec([_Order("WDC", "lim", stop_price=None)])
+    assert ex.update_trailing_stop_short(
+        "WDC", entry_price=100.0, stop_distance=1.2, low_water=97.0,
+        last_price=97.0, stop_mult=1.2, trail_mult=1.5,
+    ) is None
+    assert ex.client.replaced == []

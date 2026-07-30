@@ -288,3 +288,48 @@ def test_executor_replace_stop_order_works_through_alpaca_py():
     assert name == "replace_order_by_id"
     assert oid == "oid-4"
     assert order_data.stop_price == 101.24     # rounded to cents
+
+
+# --- standalone protective stop (audit: type="stop" became a market order) ---
+
+def test_stop_order_builds_a_stop_request_not_a_market_order():
+    """rearm_protective_stop submits type="stop" with a stop_price. The builder
+    only special-cased "limit", so the emergency backstop for a position whose
+    EOD close failed silently became an immediate GTC MARKET exit."""
+    from alpaca.trading.requests import StopOrderRequest
+
+    req = _build_order_request({
+        "symbol": "WDC",
+        "qty": 10,
+        "side": "sell",
+        "type": "stop",
+        "stop_price": 98.75,
+        "time_in_force": "gtc",
+        "client_order_id": "revbot-abc123",
+    })
+    assert isinstance(req, StopOrderRequest)
+    assert not isinstance(req, MarketOrderRequest)
+    assert float(req.stop_price) == 98.75
+    assert req.side == OrderSide.SELL
+    assert req.time_in_force == TimeInForce.GTC
+    assert req.client_order_id == "revbot-abc123"
+
+
+def test_short_side_stop_is_a_buy_stop():
+    from alpaca.trading.requests import StopOrderRequest
+
+    req = _build_order_request({
+        "symbol": "WDC", "qty": 5, "side": "buy", "type": "stop",
+        "stop_price": 101.25, "time_in_force": "gtc",
+    })
+    assert isinstance(req, StopOrderRequest)
+    assert req.side == OrderSide.BUY
+    assert float(req.stop_price) == 101.25
+
+
+def test_unknown_order_type_raises_instead_of_silently_becoming_market():
+    with pytest.raises(ValueError, match="cannot build order type"):
+        _build_order_request({
+            "symbol": "WDC", "qty": 1, "side": "buy",
+            "type": "trailing_stop", "time_in_force": "day",
+        })

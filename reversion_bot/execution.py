@@ -26,6 +26,9 @@ class AlpacaExecutor:
         else:
             self.client = REST(api_key, secret_key, exec_config.base_url)
         self._tif = getattr(exec_config, "tif", "day") or "day"
+        # Warn at construction if the configured TIF can't ride a bracket (the
+        # coercion itself happens per-order via the bracket_tif property).
+        self._bracket_safe_tif(self._tif)
         # Marketable-limit entries cap entry slippage: the entry leg is priced a
         # few bps through the planned entry so it still crosses and fills, rather
         # than a plain market order that pays whatever the book offers.
@@ -37,6 +40,37 @@ class AlpacaExecutor:
         except (TypeError, ValueError):
             http_timeout = 15.0
         self._apply_http_timeout(http_timeout)
+
+    @property
+    def bracket_tif(self) -> str:
+        """TIF to put on bracket orders.
+
+        Alpaca accepts only day/gtc on brackets. Swing mode documents pairing
+        SWING_OVERNIGHT_MODE with TIF=cls (market-on-close), which the broker
+        rejects with a 422 on the bracket parent — silently producing zero
+        entries every session. The configured TIF still governs any plain-order
+        path; only the bracket legs are coerced.
+        """
+        return self._bracket_safe_tif(getattr(self, "_tif", "day"))
+
+    @staticmethod
+    def _bracket_safe_tif(tif: str) -> str:
+        """Map a configured TIF onto one a bracket order can carry.
+
+        Alpaca accepts only ``day`` and ``gtc`` on bracket orders. Anything else
+        (notably ``cls``/``opg``) is coerced to ``day`` with a warning so the
+        entry is still submitted rather than 422-ing per candidate.
+        """
+        normalized = str(tif or "day").strip().lower()
+        if normalized in ("day", "gtc"):
+            return normalized
+        logging.warning(
+            "TIF %r is not valid on bracket orders (Alpaca allows day/gtc only) "
+            "— using 'day' for the bracket legs. Entry timing is still governed "
+            "by the MOC entry window when swing mode is on.",
+            tif,
+        )
+        return "day"
 
     def _apply_http_timeout(self, timeout: float) -> None:
         """Bound every trading-API HTTP call with a default timeout.
@@ -239,7 +273,7 @@ class AlpacaExecutor:
             "symbol": symbol,
             "qty": plan.qty,
             "side": "buy",
-            "time_in_force": self._tif,
+            "time_in_force": self.bracket_tif,
             "order_class": "bracket",
             "take_profit": {"limit_price": round(plan.target_price, 2)},
             "stop_loss": {"stop_price": round(plan.stop_price, 2)},
@@ -267,7 +301,7 @@ class AlpacaExecutor:
             "symbol": symbol,
             "qty": plan.qty,
             "side": "sell",
-            "time_in_force": self._tif,
+            "time_in_force": self.bracket_tif,
             "order_class": "bracket",
             # On a short, profit is taken *below* entry and the stop sits *above*.
             "take_profit": {"limit_price": round(plan.target_price, 2)},
@@ -338,6 +372,23 @@ class AlpacaExecutor:
                     symbol, qty, reference_price,
                 )
                 return None
+            # The close may have failed *because the position no longer exists*
+            # (closed manually, or its stop leg filled just before the cancel).
+            # Arming a GTC stop then leaves a naked resting order that nothing
+            # owns: a gap through it sells shares the account doesn't hold.
+            # Re-check against the broker before arming.
+            try:
+                if not self._position_exists(symbol):
+                    logging.warning(
+                        "Skipping emergency stop for %s: broker reports no open "
+                        "position (close likely already completed).", symbol,
+                    )
+                    return None
+            except Exception as e:  # noqa: BLE001 - verification is best-effort
+                logging.warning(
+                    "Could not verify %s position before re-arming stop (%s) — "
+                    "arming anyway to avoid leaving it unprotected.", symbol, e,
+                )
             if str(side).lower() == "long":
                 order_side = "sell"
                 stop_price = px * (1.0 - float(stop_pct))
@@ -526,10 +577,12 @@ class AlpacaExecutor:
 
     def has_open_long_position(self, symbol: str) -> bool:
         positions = self.get_positions()
+        symbol = symbol.strip().upper()
         return any(str(p.symbol).upper() == symbol and float(p.qty) > 0 for p in positions)
 
     def has_open_short_position(self, symbol: str) -> bool:
         positions = self.get_positions()
+        symbol = symbol.strip().upper()
         return any(str(p.symbol).upper() == symbol and float(p.qty) < 0 for p in positions)
 
     def has_open_position(self, symbol: str) -> bool:
@@ -539,7 +592,33 @@ class AlpacaExecutor:
         of an existing one in either direction.
         """
         positions = self.get_positions()
+        symbol = symbol.strip().upper()
         return any(str(p.symbol).upper() == symbol and float(p.qty) != 0 for p in positions)
+
+    def open_position_symbols(self) -> set:
+        """Every symbol with a non-zero position, as one API call.
+
+        The per-symbol ``has_open_position`` guard costs one full positions fetch
+        per name per cycle: on the 90-name broad universe at a 30s poll that is
+        ~180 trading-API requests/minute before get_clock/get_account/get_orders,
+        which trips Alpaca's 200/min limit and makes symbols silently drop out
+        (429 -> exception -> candidate skipped). Callers fetch this once per
+        cycle and test membership instead. Raises on API error so callers can
+        fail CLOSED rather than trade on a stale view.
+        """
+        return {str(p.symbol).upper() for p in self.get_positions()
+                if getattr(p, "symbol", None) and float(p.qty) != 0}
+
+    def _position_exists(self, symbol: str) -> bool:
+        """Broker-truth position check that RAISES on API error.
+
+        ``has_open_position`` is the same query but callers there treat failure
+        as "no position"; the emergency-stop path must distinguish "confirmed
+        flat" from "couldn't ask".
+        """
+        symbol = symbol.strip().upper()
+        return any(str(p.symbol).upper() == symbol and float(p.qty) != 0
+                   for p in self.client.list_positions())
 
     @staticmethod
     def _validate_plan(plan: PositionPlan) -> None:

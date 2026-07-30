@@ -17,6 +17,7 @@ from reversion_bot.config import (
 from reversion_bot.service import ReversionService
 from reversion_bot.execution import AlpacaExecutor
 from reversion_bot.models import PositionPlan
+from reversion_bot.risk import style_multiples
 from reversion_bot.governor import ExecutionGovernor
 from reversion_bot.portfolio import PortfolioState
 from reversion_bot.allowlist import (
@@ -251,11 +252,16 @@ async def fetch_bars_for_symbols(symbols, timeframe: str, lookback: int,
     return out
 
 
-async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int) -> bool:
+async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int,
+                                 return_status: bool = False):
     """Fetch the benchmark and decide if the market is risk-off (below trend).
 
     Fail-open: any fetch error or thin data returns False (risk-on) so a
     benchmark hiccup never blocks trading.
+
+    With ``return_status=True`` returns ``(risk_off, measured)`` where
+    ``measured`` is False when the value is the fail-open default — callers that
+    cache must not store an unmeasured result (see evaluate_sector_regime).
     """
     try:
         now_utc = datetime.now(timezone.utc)
@@ -265,14 +271,15 @@ async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int) -
         start = (now_utc - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         end = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
         bars = await asyncio.to_thread(fetch_alpaca_bars, symbol, start, end, timeframe)
-        return is_risk_off(
+        risk_off = is_risk_off(
             bars, ema_length,
             buffer_pct=float(os.getenv("REGIME_BUFFER_PCT", 0.005)),
             confirm_bars=int(os.getenv("REGIME_CONFIRM_BARS", 3)),
         )
+        return (risk_off, True) if return_status else risk_off
     except Exception as e:
         print(f"[REGIME] benchmark fetch failed ({e}); treating as risk-on.")
-        return False
+        return (False, False) if return_status else False
 
 
 # Sector-regime cache: the gate is a DAILY EMA, so a sector ETF's risk-off state
@@ -305,10 +312,15 @@ async def evaluate_sector_regime(active_sectors, timeframe: str, ema_length: int
 
     if stale:
         results = await asyncio.gather(*[
-            evaluate_market_regime(etf, timeframe, ema_length) for etf in stale
+            evaluate_market_regime(etf, timeframe, ema_length, return_status=True)
+            for etf in stale
         ])
-        for etf, ro in zip(stale, results):
-            _SECTOR_REGIME_CACHE[etf] = (now, ro)
+        for etf, (ro, ok) in zip(stale, results):
+            # Only cache a REAL measurement. evaluate_market_regime fails open
+            # ("risk-on") on a data error; caching that would disable the
+            # sector gate for the full hour on one transient fetch failure.
+            if ok:
+                _SECTOR_REGIME_CACHE[etf] = (now, ro)
             fresh[etf] = ro
 
     regime = {}
@@ -319,9 +331,17 @@ async def evaluate_sector_regime(active_sectors, timeframe: str, ema_length: int
     return regime
 
 async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor,
-                               short_bias=False, account_equity=None, prefetched_bars=None):
+                               short_bias=False, account_equity=None, prefetched_bars=None,
+                               open_symbols=None):
     try:
-        if await asyncio.to_thread(executor.has_open_position, symbol):
+        # open_symbols is the cycle's single positions snapshot (see
+        # executor.open_position_symbols). Falling back to the per-symbol query
+        # keeps older callers/tests working, but the loop passes the snapshot so
+        # a broad universe doesn't fire one positions request per name.
+        if open_symbols is not None:
+            if symbol.strip().upper() in open_symbols:
+                return None
+        elif await asyncio.to_thread(executor.has_open_position, symbol):
             return None
 
         # Use the batched pre-fetch when present; otherwise fetch this one symbol
@@ -523,6 +543,17 @@ async def reconcile_carryover(executor) -> None:
         print(f"[STARTUP] carryover check skipped (position fetch failed: {e}).")
         return  # don't stamp; retry next cycle
     if not positions:
+        # Flat, but a prior session may have left one of OUR orders resting —
+        # notably the emergency GTC stop armed when an EOD close failed, or a
+        # GTC bracket leg whose position closed by other means. An orphan stop
+        # on a name we no longer hold can gap through and open a naked position,
+        # so sweep bot-tagged orders before stamping the day done.
+        try:
+            n = await asyncio.to_thread(executor.cancel_bot_orders)
+            if n:
+                print(f"[STARTUP] Cancelled {n} orphaned bot order(s) while flat.")
+        except Exception as e:
+            print(f"[STARTUP] Orphan order sweep failed: {e}")
         _mark_reconciled_today()
         return
     names = ", ".join(f"{getattr(p, 'symbol', '?')}x{getattr(p, 'qty', '?')}" for p in positions)
@@ -601,7 +632,9 @@ async def liquidate_all_positions(executor) -> bool:
         # broker-atomic close a few times, mirroring execution.close_long, so the
         # flatten actually completes before the bell.
         try:
-            executor._cancel_orders_for_symbol(symbol)
+            # Offloaded: a synchronous HTTP cancel here blocks the event loop
+            # during the flatten, the one moment latency actually costs money.
+            await asyncio.to_thread(executor._cancel_orders_for_symbol, symbol)
         except Exception as e:
             print(f"[EOD] Per-symbol cancel failed for {symbol}: {e}")
         last_exc = None
@@ -722,6 +755,12 @@ async def manage_trailing_stops(executor, portfolio_state, risk_config):
         if last_price <= 0:
             continue
 
+        # The stored stop_distance was built with this position's STYLE multiple;
+        # backing ATR out with the mean-reversion multiple would mis-scale the
+        # trail for trend/trendfail entries.
+        entry_style = portfolio_state.get_entry_style(symbol)
+        stop_mult, _ = style_multiples(risk_config, entry_style or "mean_reversion")
+
         if qty > 0:
             # Long trailing stop: ratchet UP
             state = portfolio_state.get_trail_state(symbol)
@@ -733,7 +772,7 @@ async def manage_trailing_stops(executor, portfolio_state, risk_config):
                 continue
             new_stop = await asyncio.to_thread(
                 executor.update_trailing_stop, symbol, entry_price, stop_distance, hw,
-                last_price, risk_config.stop_atr_multiple, risk_config.trail_atr_multiple,
+                last_price, stop_mult, risk_config.trail_atr_multiple,
             )
             if new_stop is not None:
                 print(f"[TRAIL] {symbol} long stop -> {new_stop:.2f} (high-water {hw:.2f})")
@@ -748,7 +787,7 @@ async def manage_trailing_stops(executor, portfolio_state, risk_config):
                 continue
             new_stop = await asyncio.to_thread(
                 executor.update_trailing_stop_short, symbol, entry_price, stop_distance,
-                lw, last_price, risk_config.stop_atr_multiple, risk_config.trail_atr_multiple,
+                lw, last_price, stop_mult, risk_config.trail_atr_multiple,
             )
             if new_stop is not None:
                 print(f"[TRAIL] {symbol} short stop -> {new_stop:.2f} (low-water {lw:.2f})")
@@ -1269,10 +1308,22 @@ async def main():
             except Exception:
                 cycle_equity = None
 
+            # Positions once per cycle, not once per symbol: the per-name guard
+            # otherwise blows through Alpaca's rate limit on the broad universe.
+            # On failure fall back to the per-symbol check (open_symbols=None)
+            # rather than trading blind to existing positions.
+            try:
+                cycle_open_symbols = await asyncio.to_thread(executor.open_position_symbols)
+            except Exception as e:
+                print(f"[WARN] positions snapshot failed ({e}); "
+                      f"falling back to per-symbol position checks.")
+                cycle_open_symbols = None
+
             eval_tasks = [
                 evaluate_symbol_only(s, lookback, timeframe, service, executor,
                                      short_bias, account_equity=cycle_equity,
-                                     prefetched_bars=prefetched.get(s))
+                                     prefetched_bars=prefetched.get(s),
+                                     open_symbols=cycle_open_symbols)
                 for s in symbols
             ]
             raw_results = await asyncio.gather(*eval_tasks)
@@ -1320,11 +1371,16 @@ async def main():
                 except Exception:
                     pass
 
-            # Prune stale position_meta for symbols no longer held
+            # Prune stale position_meta for symbols neither held NOR pending.
+            # Symbols with working orders must be kept: a resting bracket entry
+            # is not yet a position, but its meta holds the trail state the
+            # fill needs (pruning it would silently disable the trailing stop
+            # for that position's whole life).
             try:
                 positions = await asyncio.to_thread(executor.client.list_positions)
                 open_syms = [str(p.symbol).upper() for p in positions]
-                portfolio_state.prune_closed_positions(open_syms)
+                working_syms = await asyncio.to_thread(executor.open_order_symbols)
+                portfolio_state.prune_closed_positions(open_syms, working_syms)
             except Exception:
                 pass
 

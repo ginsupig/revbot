@@ -132,6 +132,10 @@ class PortfolioState:
         daily.append(timestamp_iso)
         data["daily_new_positions"] = daily
         data.setdefault("last_trade_ts_by_symbol", {})[symbol.upper()] = timestamp_iso
+        # Side is stamped separately from position_meta because the meta is
+        # pruned as soon as the position closes — the direction-flip cooldown
+        # must keep working *after* the close (that's the whole point of it).
+        data.setdefault("last_side_by_symbol", {})[symbol.upper()] = side
         meta = {
             "entry_style": entry_style,
             "regime": regime,
@@ -203,6 +207,19 @@ class PortfolioState:
             return None
         return float(meta["entry_price"]), float(meta["stop_distance"]), float(meta["low_water"])
 
+    def get_entry_style(self, symbol: str) -> str | None:
+        """The entry style stored for an open position, or None.
+
+        The trailing-stop manager needs this to back ATR out of the stored stop
+        distance with the SAME multiple that built it (styles use different
+        stop multiples).
+        """
+        meta = self._load().get("position_meta", {}).get(symbol.upper())
+        if not meta:
+            return None
+        style = meta.get("entry_style")
+        return str(style) if style else None
+
     def get_all_position_metadata(self) -> Dict[str, Any]:
         """Return a copy of the full position_meta dict."""
         return dict(self._load().get("position_meta", {}))
@@ -215,15 +232,20 @@ class PortfolioState:
             meta["stop_price"] = float(new_stop)
             self._save(data)
 
-    def prune_closed_positions(self, open_symbols) -> int:
+    def prune_closed_positions(self, open_symbols, working_order_symbols=()) -> int:
         """Remove position_meta entries for symbols no longer held.
 
-        Call periodically (e.g. each cycle) with the live open-symbol set.
+        Call periodically (e.g. each cycle) with the live open-symbol set AND
+        the set of symbols with working orders. A bracket submitted last cycle
+        whose limit entry hasn't filled yet is not a position, but pruning its
+        meta would permanently destroy the trail state (entry price, stop
+        distance, high-water) that the fill is about to need.
         Returns the number of pruned entries.
         """
         data = self._load()
         meta = data.get("position_meta", {})
         open_set = {str(s).upper() for s in open_symbols}
+        open_set |= {str(s).upper() for s in working_order_symbols}
         stale = [sym for sym in meta if sym not in open_set]
         if stale:
             for sym in stale:
@@ -304,10 +326,16 @@ class PortfolioState:
             return False
         data = self._load()
         last_ts = data.get("last_trade_ts_by_symbol", {}).get(symbol.upper())
-        meta = data.get("position_meta", {}).get(symbol.upper())
-        if not last_ts or not meta:
+        if not last_ts:
             return False
-        last_side = meta.get("side")
+        # The durable side stamp survives position close; position_meta is only
+        # a fallback for state files written before last_side_by_symbol existed
+        # (meta is pruned the cycle after a close, which is exactly when this
+        # guard matters — short -> stopped -> immediately long).
+        last_side = data.get("last_side_by_symbol", {}).get(symbol.upper())
+        if not last_side:
+            meta = data.get("position_meta", {}).get(symbol.upper()) or {}
+            last_side = meta.get("side")
         if not last_side or last_side == side:
             return False  # same direction (or unknown) -> not a flip
         try:

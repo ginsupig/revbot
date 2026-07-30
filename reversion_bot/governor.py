@@ -254,12 +254,19 @@ class ExecutionGovernor:
         live_buying_power = None
         for attr in ("daytrading_buying_power", "buying_power"):
             val = getattr(account, attr, None)
-            if val is not None:
-                try:
-                    live_buying_power = float(val)
-                    break
-                except (TypeError, ValueError):
-                    continue
+            if val is None:
+                continue
+            try:
+                parsed = float(val)
+            except (TypeError, ValueError):
+                continue
+            # Non-PDT accounts (equity < $25k) report daytrading_buying_power
+            # as "0" even with ample regular buying power — zero here means
+            # "not applicable", not "broke". Fall through to buying_power.
+            if attr == "daytrading_buying_power" and parsed <= 0.0:
+                continue
+            live_buying_power = parsed
+            break
         if live_buying_power is not None and new_position_value > live_buying_power:
             print(
                 f"[GOVERNOR] {symbol} rejected: insufficient buying power "

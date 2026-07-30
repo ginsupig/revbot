@@ -21,6 +21,10 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
+
+# Resolve main.py next to this file, not relative to the launch cwd.
+_MAIN_SCRIPT = Path(__file__).resolve().parent / "main.py"
 
 
 def _log(msg: str) -> None:
@@ -38,7 +42,11 @@ def main() -> int:
     while True:
         started = time.monotonic()
         try:
-            rc = subprocess.run([sys.executable, "main.py"]).returncode
+            # Absolute path: launching "main.py" relative to the cwd is exactly
+            # the wrong-start-dir failure this supervisor exists to survive —
+            # it would exit rc=2 ("can't open file"), be classified a crash, and
+            # relaunch nothing every 60s forever.
+            rc = subprocess.run([sys.executable, str(_MAIN_SCRIPT)]).returncode
         except KeyboardInterrupt:
             _log("Ctrl+C — stopping supervisor.")
             return 0

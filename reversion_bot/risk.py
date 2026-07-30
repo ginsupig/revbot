@@ -6,6 +6,26 @@ from .config import RiskConfig
 from .models import PositionPlan, ReversionDecision
 
 
+def style_multiples(config: RiskConfig, entry_style: str) -> tuple[float, float]:
+    """``(stop_atr_multiple, target_atr_multiple)`` for an entry style.
+
+    Module-level so the trailing-stop manager can recover the SAME stop multiple
+    that built a position's stop distance. Backing ATR out of that distance with
+    the mean-reversion multiple mis-scales every non-mean-reversion trail (a
+    trendfail stop of 1.10*ATR read as 1.20*ATR trails ~8% too tight at
+    defaults, and much worse under env overrides).
+    """
+    style = (entry_style or "mean_reversion").lower()
+
+    if style == "trend_following":
+        return (config.trend_stop_atr_multiple, config.trend_target_atr_multiple)
+
+    if style == "trendfail":
+        return (config.trendfail_stop_atr_multiple, config.trendfail_target_atr_multiple)
+
+    return (config.stop_atr_multiple, config.target_atr_multiple)
+
+
 class RiskManager:
     def __init__(self, config: RiskConfig | None = None) -> None:
         self.config = config or RiskConfig()
@@ -157,24 +177,7 @@ class RiskManager:
         )
 
     def _style_multiples(self, entry_style: str) -> tuple[float, float]:
-        style = (entry_style or "mean_reversion").lower()
-
-        if style == "trend_following":
-            return (
-                self.config.trend_stop_atr_multiple,
-                self.config.trend_target_atr_multiple,
-            )
-
-        if style == "trendfail":
-            return (
-                self.config.trendfail_stop_atr_multiple,
-                self.config.trendfail_target_atr_multiple,
-            )
-
-        return (
-            self.config.stop_atr_multiple,
-            self.config.target_atr_multiple,
-        )
+        return style_multiples(self.config, entry_style)
 
     def build_plan_for_style(
         self,

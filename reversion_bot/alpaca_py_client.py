@@ -33,6 +33,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
     LimitOrderRequest,
+    StopOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
     GetOrdersRequest,
@@ -74,10 +75,14 @@ def _build_order_request(kwargs: dict):
     """Translate a legacy ``submit_order(**kwargs)`` dict into an alpaca-py
     ``OrderRequest``.
 
-    Handles both shapes the bot submits:
+    Handles the shapes the bot submits:
       * bracket entries (``order_class="bracket"`` with take_profit/stop_loss,
-        ``type`` either "market" or marketable "limit"), and
-      * plain market exits (EOD liquidation: ``type="market"``, no order_class).
+        ``type`` either "market" or marketable "limit"),
+      * plain market exits (EOD liquidation: ``type="market"``, no order_class), and
+      * standalone protective stops (``type="stop"`` with ``stop_price``, used by
+        ``rearm_protective_stop`` when an EOD close fails). These MUST stay stops:
+        falling through to a market order would exit the position immediately
+        instead of leaving a resting backstop.
     """
     side = _ORDER_SIDE[str(kwargs["side"]).lower()]
     tif = _TIME_IN_FORCE[str(kwargs.get("time_in_force", "day")).lower()]
@@ -106,8 +111,16 @@ def _build_order_request(kwargs: dict):
                 sl_fields["limit_price"] = stop_loss["limit_price"]
             common["stop_loss"] = StopLossRequest(**sl_fields)
 
-    if str(kwargs.get("type", "market")).lower() == "limit":
+    order_type = str(kwargs.get("type", "market")).lower()
+    if order_type == "limit":
         return LimitOrderRequest(limit_price=kwargs["limit_price"], **common)
+    if order_type == "stop":
+        return StopOrderRequest(stop_price=kwargs["stop_price"], **common)
+    if order_type not in ("market", ""):
+        raise ValueError(
+            f"alpaca-py adapter cannot build order type {order_type!r} "
+            "(supported: market, limit, stop)"
+        )
     return MarketOrderRequest(**common)
 
 

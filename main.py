@@ -363,7 +363,29 @@ async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor,
         print(f"[ERROR] {symbol}: {e}\n{traceback.format_exc()}")
         return None
 
-async def execute_candidates(governor, executor, portfolio_state, candidates, service=None):
+async def _spread_blocks_entry(executor, symbol: str, max_spread_bps: float) -> bool:
+    """True if the live quoted spread exceeds max_spread_bps.
+
+    The engine's Spread_Too_Wide guard can never fire (no live spread_bps bar
+    column), so the configured limit is enforced here, at submit time, against
+    the real quote. Fails OPEN on missing quote data — consistent with the other
+    data-dependent gates — but says so, since that means the limit isn't active
+    for that name this cycle. Disable with SPREAD_GATE_AT_SUBMIT=false.
+    """
+    if max_spread_bps <= 0:
+        return False
+    spread = await asyncio.to_thread(executor.latest_spread_bps, symbol)
+    if spread is None:
+        print(f"[SPREAD] {symbol}: no quote — spread limit not enforced this cycle.")
+        return False
+    if spread > max_spread_bps:
+        print(f"[SPREAD] {symbol} skipped: {spread:.1f}bps > {max_spread_bps:.1f}bps limit.")
+        return True
+    return False
+
+
+async def execute_candidates(governor, executor, portfolio_state, candidates, service=None,
+                             max_spread_bps: float = 0.0):
     if not candidates:
         print("[INFO] No candidates to execute.")
         return
@@ -385,6 +407,8 @@ async def execute_candidates(governor, executor, portfolio_state, candidates, se
                 governor.approve, candidate, executor, trades_this_cycle
             )
             if approved:
+                if await _spread_blocks_entry(executor, symbol, max_spread_bps):
+                    continue
                 print(f"[INFO] Executing trade for {symbol}.")
                 await asyncio.to_thread(executor.submit_order, candidate)
                 portfolio_state.update(candidate)
@@ -907,6 +931,16 @@ async def main():
     # stop leg up toward high_water - TRAIL_ATR_MULTIPLE*ATR. The validated edge
     # (execution_tuning_backtest.py). Set USE_TRAILING_STOP=False to disable.
     use_trailing_stop = parse_bool(os.getenv("USE_TRAILING_STOP", "True"), default=True)
+    # Submit-time spread gate. MAX_SPREAD_BPS was dead config: the engine checks a
+    # spread_bps bar column that no live fetch populates, so wide-spread names
+    # passed the safety check and marketable-limit entries filled deep into the
+    # book. Enforced against the live quote here instead. SPREAD_GATE_AT_SUBMIT=false
+    # restores the previous (unenforced) behavior.
+    submit_spread_limit = (
+        float(os.getenv("MAX_SPREAD_BPS", 40.0))
+        if parse_bool(os.getenv("SPREAD_GATE_AT_SUBMIT", "True"), default=True)
+        else 0.0
+    )
     # Swing / overnight-hold mode (opt-in, default OFF = today's intraday flat-by-bell
     # behavior). The validated daily broad-reversion edge enters at the CLOSE
     # (market-on-close) and holds overnight/multi-day, the ATR trail riding winners.
@@ -958,11 +992,17 @@ async def main():
         ri_length=int(os.getenv("RI_LENGTH", 20)),
         rsi_length=int(os.getenv("RSI_LENGTH", 14)),
         adx_length=int(os.getenv("ADX_LENGTH", 14)),
+        # Same env var as RiskConfig.atr_length so the engine's ATR (which the
+        # bracket and trail distances are derived from) can't diverge from the
+        # value research was run with.
+        atr_length=int(os.getenv("ATR_LENGTH", 14)),
         trend_ema_length=int(os.getenv("TREND_EMA_LENGTH", 50)),
         # Long oversold gates.
         ri_threshold=float(os.getenv("RI_THRESHOLD", -0.5)),
         rsi_max=float(os.getenv("RSI_MAX", 40.0)),
-        oversold_gate=os.getenv("OVERSOLD_GATE", "and"),
+        # Normalized: "OR" / " or " used to fall through to the AND gate
+        # silently, quietly collapsing entry frequency with nothing in the logs.
+        oversold_gate=os.getenv("OVERSOLD_GATE", "and").strip().lower(),
         adx_max=float(os.getenv("ADX_MAX", 40.0)),
         adx_hard_max=float(os.getenv("ADX_HARD_MAX", 50.0)),
         rsi_hard_max=float(os.getenv("RSI_HARD_MAX", 70.0)),
@@ -1384,7 +1424,8 @@ async def main():
             except Exception:
                 pass
 
-            await execute_candidates(governor, executor, portfolio_state, candidates, service=service)
+            await execute_candidates(governor, executor, portfolio_state, candidates,
+                                     service=service, max_spread_bps=submit_spread_limit)
 
             # Trailing stop: ratchet each open long's stop up toward the trailing
             # level (the validated edge). On by default.

@@ -17,6 +17,11 @@ class ReversionConfig:
     ri_threshold: float = -0.5
 
     adx_length: int = 14
+    # ATR window used to enrich bars. Must track RiskConfig.atr_length (both are
+    # wired from ATR_LENGTH): the engine's ATR is what the bracket/trail
+    # distances are built from, so a divergence here means research validated
+    # one bracket size and live traded another.
+    atr_length: int = 14
     adx_max: float = 40.0
     adx_hard_max: float = 50.0
 
@@ -106,8 +111,11 @@ class RiskConfig:
     # Trailing stop (long): ratchet the stop up to high_water - trail_atr_multiple*ATR.
     # Validated (execution_tuning_backtest.py) as the load-bearing edge — it lets
     # winners run while holding the win rate, vs a fixed target that caps/gives back.
-    # 0 disables. Paired with the wider 3.0 target (target is the backstop the trail
-    # rides toward). Gated live by USE_TRAILING_STOP.
+    # 0 disables. Paired with the wider 3.50xATR target above (the target is the
+    # backstop the trail rides toward — NOT 3.0; the earlier "3.0" in this
+    # comment and in CLAUDE.md never matched the shipped default, so "restoring"
+    # TARGET_ATR_MULTIPLE=3.0 from the docs would tighten the live backstop
+    # ~14%). Gated live by USE_TRAILING_STOP.
     trail_atr_multiple: float = 1.50
 
     trend_stop_atr_multiple: float = 1.20

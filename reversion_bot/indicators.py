@@ -42,6 +42,12 @@ def calculate_rsi(df: pd.DataFrame, length: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
+    # Zero average loss is maximally overbought (RSI 100), not neutral: mapping
+    # it to 50 via the fillna below made a monotonically rising series read as
+    # neutral and silently softened the rsi_hard_max blow-off veto. Only genuine
+    # warm-up NaNs (both averages undefined) fall back to 50.
+    zero_loss = avg_loss.notna() & (avg_loss == 0.0) & avg_gain.notna() & (avg_gain > 0.0)
+    rsi = rsi.mask(zero_loss, 100.0)
     return rsi.fillna(50.0)
 
 

@@ -18,10 +18,15 @@ def test_ml_signal_learner_fit_predict():
     df = pd.DataFrame({'open': open_, 'high': high, 'low': low, 'close': close, 'volume': volume})
     learner = MLSignalLearner()
     learner.fit(df)
-    # Prepare features to get the number of valid rows after dropna
-    X, _ = learner.prepare_features(df)
+    # predict() scores through the PREDICT featurizer, which keeps the current
+    # bar (the one being decided on). The training featurizer drops it because
+    # its forward label is NaN, so scoring through that path silently returned
+    # the previous bar's prediction for anything reading preds[-1].
+    X_predict = learner.prepare_features_for_predict(df)
+    X_train, _ = learner.prepare_features(df)
     preds = learner.predict(df)
-    assert len(preds) == len(X)
+    assert len(preds) == len(X_predict)
+    assert len(X_predict) == len(X_train) + 1   # the current bar is included
     # Check that predictions are 0 or 1
     assert set(preds).issubset({0, 1})
 

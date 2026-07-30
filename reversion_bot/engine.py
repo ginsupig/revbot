@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Iterable
 
 import pandas as pd
@@ -59,7 +60,7 @@ class ReversionEngine:
         out["ri"] = normalized_reversion_index(close, self.config.ri_length)
         out["rsi"] = calculate_rsi(out, self.config.rsi_length)
         out["adx"] = calculate_adx(out, self.config.adx_length)
-        out["atr"] = calculate_atr(out, 14)
+        out["atr"] = calculate_atr(out, self.config.atr_length)
         out["vwap"] = calculate_vwap(out)
         out["trend_ema"] = calculate_ema(close, self.config.trend_ema_length)
 
@@ -74,6 +75,12 @@ class ReversionEngine:
             min_periods=self.config.volume_lookback,
         ).mean()
 
+        # Bar fetches return OHLCV only, so this column is all-NaN in the live
+        # path and the Spread_Too_Wide check below always fails open. The real
+        # spread limit is enforced at submit time from the live quote
+        # (main._spread_blocks_entry); the column stays so a caller that DOES
+        # supply per-bar spreads (tests, a future quote-enriched fetch) is still
+        # honored here.
         out["spread_bps"] = out.get("spread_bps", pd.Series(index=out.index, dtype=float))
 
         bb_sma, bb_upper, bb_lower = calculate_bollinger_bands(
@@ -206,20 +213,22 @@ class ReversionEngine:
                 or float(row["volume"]) >= avg_volume * config.volume_multiplier_min
             )
 
+            # NOTE ON NAMING: this is an *up-tick off the band*, not a full band
+            # reclaim. get_decision only reaches here when the current close is
+            # still INSIDE the reversion zone (close <= lb1 for longs), so a
+            # literal reclaim (close back above lb1) is unreachable by
+            # construction — the old first branch `prev_close <= prev_lb1 and
+            # close > lb1` could never be true and the second branch was doing
+            # all the work. Expressed directly so the rule matches its docs:
+            # the prior close was at/below the band and price is ticking up.
             if direction == "long":
                 prev_close = float(prev["close"])
                 prev_lb1 = float(prev["lb1"]) if pd.notna(prev["lb1"]) else float(row["lb1"])
-                lb1 = float(row["lb1"])
-                reclaim_ok = (prev_close <= prev_lb1 and close > lb1) or (
-                    close > prev_close and prev_close <= prev_lb1
-                )
+                reclaim_ok = prev_close <= prev_lb1 and close > prev_close
             else:  # short
                 prev_close = float(prev["close"])
                 prev_ub1 = float(prev["ub1"]) if pd.notna(prev["ub1"]) else float(row["ub1"])
-                ub1 = float(row["ub1"])
-                reclaim_ok = (prev_close >= prev_ub1 and close < ub1) or (
-                    close < prev_close and prev_close >= prev_ub1
-                )
+                reclaim_ok = prev_close >= prev_ub1 and close < prev_close
 
         # VWAP filter (same for both directions)
         vwap = float(row["vwap"]) if pd.notna(row["vwap"]) else None
@@ -302,7 +311,17 @@ class ReversionEngine:
         # rsi_max=48 and was the root cause of entries in strong trends.
         ri_oversold = ri <= self.config.ri_threshold
         rsi_oversold = current_rsi <= self.config.rsi_max
-        if self.config.oversold_gate == "or":
+        # Normalized here too: per-symbol configs and research harnesses build
+        # ReversionConfig directly, and an unnormalized "OR" silently selecting
+        # the AND gate is invisible in the logs.
+        gate_mode = str(self.config.oversold_gate or "and").strip().lower()
+        if gate_mode not in ("and", "or"):
+            logging.warning(
+                "oversold_gate=%r is not 'and'/'or' — using the AND gate.",
+                self.config.oversold_gate,
+            )
+            gate_mode = "and"
+        if gate_mode == "or":
             oversold = ri_oversold or rsi_oversold
         else:
             oversold = ri_oversold and rsi_oversold

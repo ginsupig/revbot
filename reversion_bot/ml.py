@@ -136,13 +136,17 @@ class MLSignalLearner:
             self.model.fit(X, y)
 
     def predict(self, bars):
-        X, _ = self.prepare_features(bars)
+        # prepare_features_for_predict keeps the newest bar; prepare_features
+        # drops it (its forward label is NaN), so scoring through the training
+        # featurizer silently returned the PREVIOUS bar's prediction for
+        # anything reading [-1]. Scoring must use the predict featurizer.
+        X = self.prepare_features_for_predict(bars)
         if len(X) == 0:
             return np.array([])
         return self.model.predict(X)
 
     def predict_proba(self, bars):
-        X, _ = self.prepare_features(bars)
+        X = self.prepare_features_for_predict(bars)
         if len(X) == 0:
             return np.array([])
         try:

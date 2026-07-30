@@ -595,6 +595,36 @@ class AlpacaExecutor:
         symbol = symbol.strip().upper()
         return any(str(p.symbol).upper() == symbol and float(p.qty) != 0 for p in positions)
 
+    def latest_spread_bps(self, symbol: str) -> float | None:
+        """Current quoted spread in basis points, or None if unavailable.
+
+        The engine's ``Spread_Too_Wide`` guard reads a ``spread_bps`` bar column
+        that NOTHING in the live path populates (bar fetches return OHLCV only),
+        so ``MAX_SPREAD_BPS`` was a permanent no-op: a 60bps-spread name passed
+        is_market_safe and marketable-limit entries filled deep into the book.
+        This measures it from the live quote at submit time instead. Returns
+        None (rather than raising) when the quote is missing or degenerate, so
+        callers can decide whether to fail open.
+        """
+        try:
+            quote = self.client.get_latest_quote(symbol.strip().upper())
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Spread check: quote fetch failed for %s: %s", symbol, e)
+            return None
+        bid = getattr(quote, "bid_price", None) or getattr(quote, "bp", None)
+        ask = getattr(quote, "ask_price", None) or getattr(quote, "ap", None)
+        try:
+            bid = float(bid)
+            ask = float(ask)
+        except (TypeError, ValueError):
+            return None
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        mid = (ask + bid) / 2.0
+        if mid <= 0:
+            return None
+        return (ask - bid) / mid * 10_000.0
+
     def open_position_symbols(self) -> set:
         """Every symbol with a non-zero position, as one API call.
 

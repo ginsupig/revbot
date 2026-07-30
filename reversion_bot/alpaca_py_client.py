@@ -49,7 +49,11 @@ from alpaca.trading.enums import (
     AssetClass,
 )
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
+from alpaca.data.requests import (
+    StockLatestTradeRequest,
+    StockLatestQuoteRequest,
+    StockBarsRequest,
+)
 from alpaca.data.timeframe import TimeFrame
 
 
@@ -226,6 +230,12 @@ class AlpacaPyClient:
             StockLatestTradeRequest(symbol_or_symbols=symbol)
         )
         # alpaca-py returns {symbol: Trade}; legacy returned the Trade directly.
+        return resp[symbol] if isinstance(resp, dict) else resp
+
+    def get_latest_quote(self, symbol: str):
+        resp = self._data.get_stock_latest_quote(
+            StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        )
         return resp[symbol] if isinstance(resp, dict) else resp
 
     def get_bars(self, symbol: str, timeframe: str, limit: int = 5):

@@ -51,7 +51,7 @@ These are the standards that separate a real edge from a mirage. Hold to them:
   (Alpaca orders), `governor.py`/`portfolio.py` (sizing, cooldowns, caps),
   `market_regime.py` (SPY risk-off gate), `trailing.py` (trailing stop).
 - **Validated, live defaults**: long-only, per-symbol trend filter, loss-aware
-  re-entry brake, market-regime gate, trailing stop (TP 3.0 + 1.5 ATR), carryover
+  re-entry brake, market-regime gate, trailing stop (TP 3.5 + 1.5 ATR), carryover
   guard (entry cutoff + EOD flatten). Toggle via env (see `main.py`).
 - **Reports**: `pnl_report.py` (`--daily`, `--scoreboard`) pulls realized PnL from
   Alpaca; account is selected by the `.env` API keys (live vs paper URL must match).

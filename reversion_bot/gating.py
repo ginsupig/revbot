@@ -37,8 +37,15 @@ def gate_decision(
     Mirrors ReversionService.evaluate_symbol's gating exactly, except the scalar
     compared to ``threshold`` is either the blended score ("blended") or the
     routed style's own component ("routed").
+
+    ``router_reason`` is accepted for call-site parity with the live service but
+    is deliberately NOT part of the gate: the (possibly adaptive) threshold is
+    the single authority (audit M1). Gating on it here would hard-block at the
+    baseline even when the adaptive threshold had loosened below it, so no
+    backtest could ever reproduce a loosened-threshold entry.
     """
     is_short = decision_signal == "SHORT_REVERSION"
+    is_long = decision_signal == "LONG_REVERSION"
 
     # Default is "routed": gate on the primary component, not the blend.
     if mode == "blended":
@@ -46,9 +53,16 @@ def gate_decision(
     else:
         gate_score = float(component_scores.get(entry_style, weighted_score))
 
-    passes = gate_score >= threshold and router_reason != "score_below_threshold"
+    passes = gate_score >= threshold
 
     go_long = passes and not is_short
+
+    # A mean-reversion LONG must be engine-validated: the mr component alone can
+    # clear the threshold on a WAIT decision, which live refuses
+    # (router_reason="mr_requires_engine_signal"). Trend/trendfail styles
+    # legitimately trade on WAIT — the engine only validates reversion setups.
+    if go_long and entry_style == "mean_reversion" and not is_long:
+        go_long = False
     mr_floor = 0.40 if short_bias else 0.45
     go_short = (
         passes

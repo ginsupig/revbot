@@ -49,8 +49,9 @@ def calculate_rsi(df: pd.DataFrame, length: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
-    loss_zero = avg_loss == 0.0
-    gain_zero = avg_gain == 0.0
+    eps = np.finfo(float).eps
+    loss_zero = avg_loss <= eps
+    gain_zero = avg_gain <= eps
     mask = loss_zero | gain_zero
     rsi = rsi.mask(
         mask,

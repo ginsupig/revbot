@@ -42,6 +42,11 @@ def calculate_rsi(df: pd.DataFrame, length: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
+    loss_zero = avg_loss == 0.0
+    gain_zero = avg_gain == 0.0
+    rsi = rsi.where(~(loss_zero & ~gain_zero), 100.0)
+    rsi = rsi.where(~(gain_zero & ~loss_zero), 0.0)
+    rsi = rsi.where(~(gain_zero & loss_zero), 50.0)
     return rsi.fillna(50.0)
 
 

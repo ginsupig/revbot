@@ -34,6 +34,13 @@ def calculate_bollinger_bands(df: pd.DataFrame, length: int = 20, num_std: float
 
 
 def calculate_rsi(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    """Wilder RSI with explicit handling for one-sided and flat windows.
+
+    Conventions used here:
+    - no losses (avg_loss == 0, avg_gain > 0) -> RSI 100
+    - no gains  (avg_gain == 0, avg_loss > 0) -> RSI 0
+    - flat tape (avg_gain == avg_loss == 0)   -> RSI 50 (neutral)
+    """
     close = df['close'].astype(float)
     delta = close.diff()
     gain = delta.clip(lower=0.0)
@@ -44,9 +51,15 @@ def calculate_rsi(df: pd.DataFrame, length: int = 14) -> pd.Series:
     rsi = 100.0 - (100.0 / (1.0 + rs))
     loss_zero = avg_loss == 0.0
     gain_zero = avg_gain == 0.0
-    rsi = rsi.where(~(loss_zero & ~gain_zero), 100.0)
-    rsi = rsi.where(~(gain_zero & ~loss_zero), 0.0)
-    rsi = rsi.where(~(gain_zero & loss_zero), 50.0)
+    mask = loss_zero | gain_zero
+    rsi = rsi.mask(
+        mask,
+        np.select(
+            [loss_zero & ~gain_zero, gain_zero & ~loss_zero, gain_zero & loss_zero],
+            [100.0, 0.0, 50.0],
+            default=np.nan,
+        ),
+    )
     return rsi.fillna(50.0)
 
 

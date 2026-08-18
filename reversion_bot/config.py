@@ -54,6 +54,9 @@ class ReversionConfig:
     # short_bias flag threaded from main.py through the engine.
     risk_off_rsi_min: float = 55.0
     risk_off_ri_short_threshold: float = 0.30
+    require_short_reject: bool = True
+    require_short_bearish_close: bool = True
+    short_trend_filter_band_pct: float = 0.0
 
     min_history: int = 160
 
@@ -90,6 +93,7 @@ class ReversionConfig:
     loss_reentry_cooldown_minutes: int = 90
 
     max_spread_bps: float = 40.0
+    require_spread_data: bool = False
     min_dollar_volume: float = 750_000.0
     min_price: float = 2.0
 
@@ -148,6 +152,7 @@ class ExecutionConfig:
     # OFF = today's static-bracket behavior. Pair with a WIDE TARGET_ATR_MULTIPLE
     # so the bracket target acts as a backstop the active exit beats.
     use_channel_exit: bool = False
+    use_median_exit: bool = True
     channel_exit_threshold: float = 0.80
     channel_lookback: int = 80
     channel_k: float = 2.0

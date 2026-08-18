@@ -148,6 +148,7 @@ class ReversionService:
         hard_wait_reasons = {
             "Dollar_Volume_Too_Low",
             "Spread_Too_Wide",
+            "Spread_Data_Missing",
             "Price_Too_Low",
             "Momentum_Too_Extended",
             "Downtrend_Too_Extended",
@@ -182,7 +183,10 @@ class ReversionService:
         gate_score = float(component_scores.get(entry_style, weighted_score))
         passes_score = gate_score >= threshold and router_reason != "score_below_threshold"
 
-        go_long = passes_score and not is_short_signal
+        # Only engine-validated mean-reversion signals may create trades.
+        go_long = passes_score and is_long_signal and entry_style == "mean_reversion"
+        if entry_style == "mean_reversion" and not is_long_signal and not is_short_signal:
+            router_reason = "mr_requires_engine_signal"
 
         # A mean-reversion LONG must be engine-validated. The mr component
         # score alone can clear the threshold on a WAIT decision (base 0.15 +
@@ -203,12 +207,6 @@ class ReversionService:
             and component_scores["mean_reversion"] >= mr_floor
         )
 
-        if entry_style == "trend_following" and component_scores["trend_following"] < 0.55:
-            go_long = False
-            router_reason = "trend_following_below_min"
-        if entry_style == "trendfail" and component_scores["trendfail"] < 0.60:
-            go_long = False
-            router_reason = "trendfail_below_min"
 
         # Loss-aware re-entry brake: don't re-buy a name that just stopped us out
         # at a loss and may still be falling (the WDC failure mode). Longs only —

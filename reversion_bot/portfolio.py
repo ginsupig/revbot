@@ -14,6 +14,13 @@ import json
 # without an immortal all-time peak that can latch the bot off permanently.
 _SESSION_TZ = ZoneInfo("America/Chicago")
 
+# A real intraday session slide can never exceed the drawdown breaker (2.5%) by anywhere
+# near this much, so a persisted session peak more than this far above real equity is
+# stale state carried across an account switch (e.g. a paper->live promotion mid-session),
+# not a drawdown. Guarded in update_equity so a bogus high-water mark can't silently pause
+# the bot with a fake catastrophic drawdown.
+_STALE_PEAK_MAX_DD = 0.30
+
 
 @dataclass(frozen=True)
 class PositionSnapshot:
@@ -39,6 +46,7 @@ class PortfolioState:
             "last_equity": None,
             "daily_new_positions": [],
             "last_trade_ts_by_symbol": {},
+            "last_side_by_symbol": {},
             # symbol -> {"entry_style","regime"} for each position we opened.
             # Broker positions don't carry these tags, so we persist them here to
             # reconstruct per-style / per-regime open counts for the governor.
@@ -69,9 +77,22 @@ class PortfolioState:
         data = self._load()
         today = today or self._session_today()
 
+        # [GUARD] A session/all-time peak far above real equity is stale state carried across
+        # an account switch (paper->live promotion mid-session), not a real intraday drawdown —
+        # it would fake a catastrophic drawdown and silently pause the bot. Reset before the
+        # breaker reads it. Threshold is ~10x the breaker, so this never fires on a real slide.
+        sp = data.get("session_peak_equity")
+        if sp and sp > 0 and account_equity < sp * (1 - _STALE_PEAK_MAX_DD):
+            print(f"[portfolio] GUARD: session_peak ${sp:,.0f} vs equity ${account_equity:,.0f} "
+                  f"({100 * (sp - account_equity) / sp:.0f}% dd, implausible) -> reset "
+                  f"(account switch?)", flush=True)
+            data["session_peak_equity"] = account_equity
+
         # All-time peak — retained for reporting; no longer drives the breaker.
         peak = data.get("peak_equity")
         if peak is None or account_equity > peak:
+            peak = account_equity
+        if peak > 2 * account_equity:          # stale all-time peak from an account switch
             peak = account_equity
         data["peak_equity"] = peak
 
@@ -112,6 +133,7 @@ class PortfolioState:
         daily.append(timestamp_iso)
         data["daily_new_positions"] = daily
         data.setdefault("last_trade_ts_by_symbol", {})[symbol.upper()] = timestamp_iso
+        data.setdefault("last_side_by_symbol", {})[symbol.upper()] = side
         meta = {
             "entry_style": entry_style,
             "regime": regime,
@@ -280,11 +302,10 @@ class PortfolioState:
             return False
         data = self._load()
         last_ts = data.get("last_trade_ts_by_symbol", {}).get(symbol.upper())
-        meta = data.get("position_meta", {}).get(symbol.upper())
-        if not last_ts or not meta:
+        last_side = data.get("last_side_by_symbol", {}).get(symbol.upper())
+        if not last_ts or not last_side:
             return False
-        last_side = meta.get("side")
-        if not last_side or last_side == side:
+        if last_side == side:
             return False  # same direction (or unknown) -> not a flip
         try:
             last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))

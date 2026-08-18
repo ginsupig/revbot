@@ -45,10 +45,14 @@ def test_short_vetoed_when_trend_too_strong():
     # ADX 45 > adx_max 40: the long side would say ADX_Trend_Too_Strong;
     # the short side used to fire here (RSI 75 doesn't trip the hard guard,
     # which needs RSI <= rsi_hard_min).
-    assert _short_eval(adx=45.0) is None
+    decision = _short_eval(adx=45.0)
+    assert decision.signal == "WAIT"
+    assert decision.reason == "Short_ADX_Trend_Too_Strong"
 
 
 def test_short_vetoed_at_adx_hard_range_too():
     # Even past adx_hard_max with a HIGH RSI the reflected hard guard never
     # applied (it requires RSI <= 30); the new adx_max veto covers it.
-    assert _short_eval(adx=55.0, rsi=75.0) is None
+    decision = _short_eval(adx=55.0, rsi=75.0)
+    assert decision.signal == "WAIT"
+    assert decision.reason == "Short_ADX_Trend_Too_Strong"

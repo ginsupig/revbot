@@ -102,6 +102,17 @@ def suppress_longs_if_risk_off(
     return kept, dropped
 
 
+def suppress_shorts_unless_risk_off(
+    candidates: List[Dict], risk_off: bool
+) -> Tuple[List[Dict], List[Dict]]:
+    """Fail closed for shorts: keep them only in a confirmed risk-off tape."""
+    if risk_off:
+        return candidates, []
+    kept = [c for c in candidates if not c.get("go_short")]
+    dropped = [c for c in candidates if c.get("go_short")]
+    return kept, dropped
+
+
 def resolve_sector_regime(
     sectors,
     fetch_bars: Callable[[str], Optional[pd.DataFrame]],

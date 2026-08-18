@@ -309,7 +309,9 @@ NEUTRAL_SECTOR_OF = {
     "AAPL": "XLK", "MSFT": "XLK", "NVDA": "XLK", "AVGO": "XLK", "ORCL": "XLK",
     "CRM": "XLK", "CSCO": "XLK", "ACN": "XLK", "ADBE": "XLK", "AMD": "XLK",
     "INTC": "XLK", "QCOM": "XLK", "TXN": "XLK", "IBM": "XLK", "MU": "XLK",
-    "AMAT": "XLK", "LRCX": "XLK", "ADI": "XLK",
+    "AMAT": "XLK", "LRCX": "XLK", "ADI": "XLK", "CRWD": "XLK",
+    "WDC": "XLK", "SNDK": "XLK", "SKHY": "XLK", "MRVL": "XLK",
+    "NOW": "XLK", "SMCI": "XLK", "ARM": "XLK",
     # XLC communication services
     "GOOGL": "XLC", "META": "XLC", "NFLX": "XLC", "DIS": "XLC", "CMCSA": "XLC",
     "T": "XLC", "VZ": "XLC", "TMUS": "XLC",
@@ -330,7 +332,7 @@ NEUTRAL_SECTOR_OF = {
     "OXY": "XLE", "MPC": "XLE",
     # XLI industrials
     "CAT": "XLI", "BA": "XLI", "HON": "XLI", "UPS": "XLI", "GE": "XLI",
-    "RTX": "XLI", "LMT": "XLI", "DE": "XLI", "UNP": "XLI",
+    "RTX": "XLI", "LMT": "XLI", "DE": "XLI", "UNP": "XLI", "GEV": "XLI",
     # XLB materials
     "LIN": "XLB", "FCX": "XLB", "NEM": "XLB", "APD": "XLB", "SHW": "XLB",
     "DOW": "XLB", "CLF": "XLB",

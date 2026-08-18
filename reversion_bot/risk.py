@@ -26,10 +26,10 @@ class RiskManager:
         atr_floor = entry * self.config.atr_floor_pct
         atr = max(atr, atr_floor)
 
-        stop_mult, target_mult = self._style_multiples(entry_style)
+        stop_mult, _ = self._style_multiples(entry_style)
 
         stop = round(entry - atr * stop_mult, 2)
-        target = round(entry + atr * target_mult, 2)
+        target = round(float(decision.sma or 0.0), 2)
 
         if stop >= entry or target <= entry:
             raise ValueError(
@@ -67,10 +67,10 @@ class RiskManager:
         atr_floor = entry * self.config.atr_floor_pct
         atr = max(atr, atr_floor)
 
-        stop_mult, target_mult = self._style_multiples(entry_style)
+        stop_mult, _ = self._style_multiples(entry_style)
 
         stop = round(entry + atr * stop_mult, 2)
-        target = round(entry - atr * target_mult, 2)
+        target = round(float(decision.sma or 0.0), 2)
 
         if stop <= entry or target >= entry:
             raise ValueError(

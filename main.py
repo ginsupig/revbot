@@ -33,6 +33,7 @@ from reversion_bot.market_regime import (
     is_risk_off,
     suppress_longs_if_risk_off,
     suppress_longs_by_sector,
+    suppress_shorts_unless_risk_off,
 )
 from reversion_bot.sectors import sector_for, etf_for_sector
 from reversion_bot.universe import select_base_universe, broad_reversion_universe
@@ -222,6 +223,36 @@ async def fetch_bars_for_symbol(symbol: str, timeframe: str, lookback: int):
     return await asyncio.to_thread(fetch_alpaca_bars, symbol, start, end, timeframe)
 
 
+def completed_bars_only(bars, timeframe: str, now_utc: datetime | None = None):
+    """Drop a still-forming intraday candle before evaluating a signal."""
+    if bars is None or getattr(bars, "empty", True) or "date" not in bars.columns:
+        return bars
+    match = re.match(r"(\d*)\s*(min|hour)", str(timeframe).strip().lower())
+    if not match:
+        return bars  # daily MOC signals intentionally use today's daily bar
+    count = int(match.group(1) or 1)
+    seconds = count * (60 if match.group(2) == "min" else 3600)
+    now = now_utc or datetime.now(timezone.utc)
+    import pandas as pd
+    timestamps = pd.to_datetime(bars["date"], utc=True, errors="coerce")
+    return bars.loc[timestamps <= now - timedelta(seconds=seconds)].reset_index(drop=True)
+
+
+def attach_quote_spread(bars, quote):
+    """Attach latest NBBO spread in basis points to the final bar."""
+    if bars is None or getattr(bars, "empty", True) or quote is None:
+        return bars
+    bid = float(getattr(quote, "bid_price", 0) or 0)
+    ask = float(getattr(quote, "ask_price", 0) or 0)
+    mid = (bid + ask) / 2.0
+    if bid <= 0 or ask < bid or mid <= 0:
+        return bars
+    out = bars.copy()
+    out["spread_bps"] = float("nan")
+    out.loc[out.index[-1], "spread_bps"] = (ask - bid) / mid * 10_000.0
+    return out
+
+
 async def fetch_bars_for_symbols(symbols, timeframe: str, lookback: int,
                                  chunk_size: int = 50, retries: int = 2) -> dict:
     """Pre-fetch bars for many symbols in a few batched requests (not one per name).
@@ -251,7 +282,7 @@ async def fetch_bars_for_symbols(symbols, timeframe: str, lookback: int,
     return out
 
 
-async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int) -> bool:
+async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int) -> bool | None:
     """Fetch the benchmark and decide if the market is risk-off (below trend).
 
     Fail-open: any fetch error or thin data returns False (risk-on) so a
@@ -271,8 +302,8 @@ async def evaluate_market_regime(symbol: str, timeframe: str, ema_length: int) -
             confirm_bars=int(os.getenv("REGIME_CONFIRM_BARS", 3)),
         )
     except Exception as e:
-        print(f"[REGIME] benchmark fetch failed ({e}); treating as risk-on.")
-        return False
+        print(f"[REGIME] benchmark fetch failed ({e}); regime unavailable.")
+        return None
 
 
 # Sector-regime cache: the gate is a DAILY EMA, so a sector ETF's risk-off state
@@ -329,10 +360,16 @@ async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor,
         bars = prefetched_bars
         if bars is None:
             bars = await fetch_bars_for_symbol(symbol, timeframe, lookback)
+        bars = completed_bars_only(bars, timeframe)
         if bars is None or len(bars) < lookback:
             return None
 
         bars = bars.tail(lookback)
+        try:
+            quote = await asyncio.to_thread(executor.client.get_latest_quote, symbol)
+            bars = attach_quote_spread(bars, quote)
+        except Exception:
+            pass  # live strategy config fails closed on the missing spread
         if account_equity is None:
             account_equity = await asyncio.to_thread(get_account_equity, executor)
         result = await asyncio.to_thread(service.evaluate_symbol, symbol, bars, account_equity, short_bias)
@@ -417,6 +454,8 @@ def is_eod_entry_cutoff(executor) -> bool:
 
 # Once-per-day stamp so the carryover flatten runs on the day's FIRST open cycle
 # but a same-day crash-restart does NOT flatten positions opened earlier today.
+from reversion_bot.ownership import cancel_our_open_orders, owned_symbols
+
 _RECONCILE_STAMP = Path(__file__).resolve().parent / "state" / "last_reconcile.date"
 
 
@@ -487,20 +526,42 @@ async def liquidate_all_positions(executor) -> bool:
     """
     print("[EOD] Starting end-of-day liquidation...")
 
-    # Cancel all open orders first so stops/limits don't interfere
-    try:
-        await asyncio.to_thread(executor.client.cancel_all_orders)
-        print("[EOD] All open orders cancelled.")
-    except Exception as e:
-        print(f"[EOD] Failed to cancel orders: {e}")
+    # OWNER-SCOPED. This used to call cancel_all_orders() and then close EVERY
+    # row of list_positions() -- no owner filter -- three times a session. It was
+    # harmless only because revbot is the sole occupant of its account; on a
+    # shared one it cancels other bots' brackets and liquidates their positions.
+    # Ownership is by client_order_id prefix, the pattern rotation ('rot-') and
+    # gapbot ('gapbot-') already use.
+    ours = await asyncio.to_thread(owned_symbols, executor.client)
+    if ours is None:
+        # UNKNOWN, not "none". Never fall back to flattening the account: that
+        # is the original bug wearing a broker outage as a disguise.
+        print("[EOD] Ownership UNKNOWN (order lookup failed); "
+              "flattening nothing this pass and reporting failure so we retry.")
+        return False
+    if not ours:
+        print("[EOD] revbot owns no symbols this session; nothing to flatten.")
+        return True
 
-    # Market-close every open position
+    try:
+        n = await asyncio.to_thread(cancel_our_open_orders, executor.client)
+        print(f"[EOD] Cancelled {n} revbot order(s) (other bots' orders untouched).")
+    except Exception as e:
+        print(f"[EOD] Failed to cancel our orders: {e}")
+
+    # Market-close only the positions we opened
     try:
         positions = await asyncio.to_thread(executor.client.list_positions)
     except Exception as e:
         # Unknown state: never report success on a blind read.
         print(f"[EOD] Failed to fetch positions: {e}")
         return False
+    skipped = [str(p.symbol).upper() for p in positions
+               if str(p.symbol).upper() not in ours]
+    if skipped:
+        print(f"[EOD] Leaving {len(skipped)} position(s) we do not own: "
+              f"{', '.join(sorted(skipped))}")
+    positions = [p for p in positions if str(p.symbol).upper() in ours]
 
     if not positions:
         print("[EOD] No open positions to liquidate.")
@@ -622,6 +683,34 @@ async def manage_channel_exits(executor, exec_config, lookback, timeframe):
             print(f"[CHANNEL-EXIT] {symbol} reached the lower channel — covering short.")
         except Exception as e:
             print(f"[CHANNEL-EXIT] {symbol} short cover failed: {e}")
+
+
+async def manage_median_exits(executor, lookback: int, timeframe: str, band_length: int):
+    """Close either side as soon as price reaches the current rolling center."""
+    try:
+        positions = await asyncio.to_thread(executor.client.list_positions)
+    except Exception as e:
+        print(f"[MEDIAN-EXIT] Could not list positions: {e}")
+        return
+    for position in positions:
+        symbol = str(getattr(position, "symbol", "")).upper()
+        qty = _safe_qty(position)
+        if not symbol or qty == 0:
+            continue
+        try:
+            bars = await fetch_bars_for_symbol(symbol, timeframe, max(lookback, band_length))
+            bars = completed_bars_only(bars, timeframe)
+            if bars is None or len(bars) < band_length:
+                continue
+            median = float(bars["close"].astype(float).tail(band_length).mean())
+            price = float(getattr(position, "current_price", 0) or bars["close"].iloc[-1])
+            reached = (qty > 0 and price >= median) or (qty < 0 and price <= median)
+            if reached:
+                closer = executor.close_long if qty > 0 else executor.close_short
+                await asyncio.to_thread(closer, symbol)
+                print(f"[MEDIAN-EXIT] {symbol} reached rolling center {median:.2f}; closed.")
+        except Exception as e:
+            print(f"[MEDIAN-EXIT] {symbol} check failed: {e}")
 
 
 async def manage_trailing_stops(executor, portfolio_state, risk_config):
@@ -824,6 +913,9 @@ async def main():
     # Lean short in risk-off tapes when shorts are enabled. Off by default
     # (shorts are off); turn on with ENABLE_SHORTS + this flag.
     favor_shorts_risk_off = parse_bool(os.getenv("FAVOR_SHORTS_IN_RISK_OFF", "False"))
+    require_risk_off_for_shorts = parse_bool(
+        os.getenv("REQUIRE_RISK_OFF_FOR_SHORTS", "True"), default=True
+    )
     # Sector-aware regime gate (opt-in): judge each long against ITS sector ETF's
     # trend (SMH/XLK/XLE/...), not just SPY — so a semis selloff suppresses semis
     # longs even while SPY holds. Default off = today's SPY-only behavior.
@@ -837,6 +929,7 @@ async def main():
         min_dollar_volume=float(os.getenv("MIN_DOLLAR_VOLUME", 750000.0)),
         min_price=float(os.getenv("MIN_PRICE", 2.0)),
         max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", 40.0)),
+        require_spread_data=parse_bool(os.getenv("REQUIRE_SPREAD_DATA", "True"), default=True),
         # Bollinger band entry zone (lb1/lb2 = sma -/+ band_std * std).
         band_length=int(os.getenv("BAND_LENGTH", 20)),
         band_std_1=float(os.getenv("BAND_STD_1", 1.0)),
@@ -877,6 +970,11 @@ async def main():
         rsi_hard_min=float(os.getenv("RSI_HARD_MIN", 30.0)),
         risk_off_rsi_min=float(os.getenv("RISK_OFF_RSI_MIN", 55.0)),
         risk_off_ri_short_threshold=float(os.getenv("RISK_OFF_RI_SHORT_THRESHOLD", 0.30)),
+        require_short_reject=parse_bool(os.getenv("REQUIRE_SHORT_REJECT", "True"), default=True),
+        require_short_bearish_close=parse_bool(
+            os.getenv("REQUIRE_SHORT_BEARISH_CLOSE", "True"), default=True
+        ),
+        short_trend_filter_band_pct=float(os.getenv("SHORT_TREND_FILTER_BAND_PCT", 0.0)),
     )
 
     risk_config = RiskConfig(
@@ -910,6 +1008,7 @@ async def main():
         # Opt-in breakout exit (default off). Pair with a WIDE TARGET_ATR_MULTIPLE
         # so the bracket target is just a backstop the active channel exit beats.
         use_channel_exit=parse_bool(os.getenv("USE_CHANNEL_EXIT", "False")),
+        use_median_exit=parse_bool(os.getenv("USE_MEDIAN_EXIT", "True"), default=True),
         channel_exit_threshold=float(os.getenv("CHANNEL_EXIT_THRESHOLD", 0.80)),
         channel_lookback=int(os.getenv("CHANNEL_LOOKBACK", 80)),
         channel_k=float(os.getenv("CHANNEL_K", 2.0)),
@@ -1152,11 +1251,12 @@ async def main():
             # Resolve the market regime once per cycle, up front, so the
             # short-bias relaxation can be applied during evaluation (not just
             # the long suppression afterwards).
-            risk_off = False
-            if use_market_filter or favor_shorts_risk_off:
+            risk_off = None
+            if (use_market_filter or favor_shorts_risk_off
+                    or (strategy_config.enable_shorts and require_risk_off_for_shorts)):
                 risk_off = await evaluate_market_regime(regime_symbol, regime_timeframe, regime_ema)
-            short_bias = risk_off and favor_shorts_risk_off
-            if risk_off:
+            short_bias = risk_off is True and favor_shorts_risk_off
+            if risk_off is True:
                 tag = "risk-off (favoring shorts)" if short_bias else "risk-off"
                 print(f"[REGIME] {regime_symbol} {regime_timeframe} below EMA{regime_ema} — {tag}.")
 
@@ -1228,11 +1328,20 @@ async def main():
                     fallback_risk_off=(risk_off if use_market_filter else False),
                     combine=sector_combine,
                 )
-            elif use_market_filter and risk_off:
+            elif use_market_filter and risk_off is True:
                 candidates, dropped = suppress_longs_if_risk_off(candidates, True)
             if dropped:
                 names = ', '.join(c['symbol'] for c in dropped)
                 print(f"[REGIME] suppressed {len(dropped)} long(s): {names}")
+
+            if require_risk_off_for_shorts:
+                candidates, dropped_shorts = suppress_shorts_unless_risk_off(
+                    candidates, risk_off is True
+                )
+                if dropped_shorts:
+                    names = ', '.join(c['symbol'] for c in dropped_shorts)
+                    state = "unavailable" if risk_off is None else "risk-on"
+                    print(f"[REGIME] suppressed {len(dropped_shorts)} short(s) ({state}): {names}")
 
             # Keep equity tracking current for drawdown checks
             if all_results:
@@ -1245,12 +1354,18 @@ async def main():
             # Prune stale position_meta for symbols no longer held
             try:
                 positions = await asyncio.to_thread(executor.client.list_positions)
-                open_syms = [str(p.symbol).upper() for p in positions]
+                open_syms = {str(p.symbol).upper() for p in positions}
+                open_syms.update(await asyncio.to_thread(executor.open_order_symbols))
                 portfolio_state.prune_closed_positions(open_syms)
             except Exception:
                 pass
 
             await execute_candidates(governor, executor, portfolio_state, candidates)
+
+            if exec_config.use_median_exit:
+                await manage_median_exits(
+                    executor, lookback, timeframe, strategy_config.band_length
+                )
 
             # Trailing stop: ratchet each open long's stop up toward the trailing
             # level (the validated edge). On by default.

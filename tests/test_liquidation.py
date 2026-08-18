@@ -53,7 +53,23 @@ class FakeClient:
         return self._positions
 
     def list_orders(self, status=None, limit=None):
-        return []
+        # liquidate_all_positions is now OWNER-SCOPED: it only flattens symbols
+        # whose orders carry revbot's client_order_id prefix. This fixture used
+        # to return [], which under the new contract means "revbot owns
+        # nothing" and correctly flattens nothing -- so every test here failed.
+        # These stubs exist to say "yes, revbot opened these", keeping each
+        # test aimed at what it was written for (flatten failure handling)
+        # rather than at ownership. Ownership itself is covered in
+        # tests/test_order_ownership.py, including a foreign position that must
+        # be left alone.
+        if status == "open":
+            return []
+        return [
+            types.SimpleNamespace(symbol=p.symbol,
+                                  client_order_id=f"revbot-{p.symbol}",
+                                  id=f"oid-{p.symbol}")
+            for p in self._positions
+        ]
 
     def cancel_order(self, order_id):
         pass
@@ -89,8 +105,24 @@ def test_liquidate_no_positions_returns_true():
 
 
 def test_liquidate_position_fetch_failure_returns_false():
-    ex = make_executor(fail_list=True)
+    # Needs a position we OWN, otherwise ownership short-circuits to "nothing to
+    # flatten" and we never reach the position read this test is about. The
+    # point is unchanged: a blind read must never be reported as success.
+    ex = make_executor([FakePosition("AAPL", "10")], fail_list=True)
     assert asyncio.run(main.liquidate_all_positions(ex)) is False
+
+
+def test_unknown_ownership_is_not_reported_as_success():
+    # Ownership lookup down => we cannot tell what is ours => flatten nothing
+    # AND return False so the caller retries, rather than stamping the session
+    # reconciled. Fail-closed: the old code would have flattened the account.
+    ex = make_executor([FakePosition("AAPL", "10")])
+    def _boom(status=None, limit=None):
+        raise RuntimeError("order lookup down")
+    ex.client.list_orders = _boom
+    assert asyncio.run(main.liquidate_all_positions(ex)) is False
+    assert ex.client.closed == []
+    assert ex.client.cancel_all_calls == 0
 
 
 def test_fractional_position_is_still_closed():

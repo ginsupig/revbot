@@ -48,7 +48,7 @@ from alpaca.trading.enums import (
     AssetClass,
 )
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
+from alpaca.data.requests import StockLatestTradeRequest, StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 
@@ -63,6 +63,8 @@ _TIME_IN_FORCE = {
 }
 # The bot only ever asks for daily bars (scan_symbols dollar-volume estimate);
 # map the handful of legacy timeframe strings it might pass through.
+from reversion_bot.ownership import tag_client_order_id
+
 _TIMEFRAME = {
     "1day": TimeFrame.Day,
     "1hour": TimeFrame.Hour,
@@ -87,6 +89,11 @@ def _build_order_request(kwargs: dict):
         "qty": kwargs["qty"],
         "side": side,
         "time_in_force": tif,
+        # Ownership tag. liquidate_all_positions is fail-closed on ownership:
+        # an UNTAGGED order is invisible to owned_symbols, so the EOD flatten
+        # would skip that position and carry it overnight. Tagging every order
+        # is therefore required for correctness, not just for attribution.
+        "client_order_id": tag_client_order_id(kwargs.get("client_order_id")),
     }
 
     if kwargs.get("order_class") == "bracket":
@@ -210,6 +217,12 @@ class AlpacaPyClient:
             StockLatestTradeRequest(symbol_or_symbols=symbol)
         )
         # alpaca-py returns {symbol: Trade}; legacy returned the Trade directly.
+        return resp[symbol] if isinstance(resp, dict) else resp
+
+    def get_latest_quote(self, symbol: str):
+        resp = self._data.get_stock_latest_quote(
+            StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        )
         return resp[symbol] if isinstance(resp, dict) else resp
 
     def get_bars(self, symbol: str, timeframe: str, limit: int = 5):

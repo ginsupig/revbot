@@ -48,6 +48,7 @@ from alpaca.trading.enums import (
     AssetClass,
 )
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.enums import Adjustment
 from alpaca.data.requests import StockLatestTradeRequest, StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
@@ -228,6 +229,9 @@ class AlpacaPyClient:
     def get_bars(self, symbol: str, timeframe: str, limit: int = 5):
         tf = _TIMEFRAME.get(str(timeframe).lower(), TimeFrame.Day)
         barset = self._data.get_stock_bars(
-            StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, limit=limit)
+            StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, limit=limit,
+                             # SDK default is RAW: a split then reads as a real
+                             # -90% move and poisons every z-score built on it.
+                             adjustment=Adjustment.SPLIT)
         )
         return _BarsResult(barset.df)

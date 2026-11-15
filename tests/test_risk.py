@@ -42,10 +42,22 @@ def test_build_short_plan_inverts_stop_and_target():
 
 def test_short_and_long_plans_size_identically():
     # Same entry/atr/equity -> identical risk budget and share count either way.
-    long_dec = ReversionDecision(signal='LONG_REVERSION', reason='x', close=100.0, atr=0.8)
-    short_dec = ReversionDecision(signal='SHORT_REVERSION', reason='x', close=100.0, atr=0.8)
+    long_dec = ReversionDecision(signal='LONG_REVERSION', reason='x', close=100.0, sma=102.0, atr=0.8)
+    short_dec = ReversionDecision(signal='SHORT_REVERSION', reason='x', close=100.0, sma=98.0, atr=0.8)
     rm = RiskManager()
     long_plan = rm.build_long_plan(account_equity=100000, decision=long_dec)
     short_plan = rm.build_short_plan(account_equity=100000, decision=short_dec)
     assert long_plan.qty == short_plan.qty
     assert long_plan.risk_per_share == short_plan.risk_per_share
+
+
+def test_targets_are_signal_median_not_atr_multiple():
+    rm = RiskManager()
+    long_plan = rm.build_long_plan(
+        100000, ReversionDecision(signal='LONG_REVERSION', reason='x', close=100, sma=101.75, atr=0.8)
+    )
+    short_plan = rm.build_short_plan(
+        100000, ReversionDecision(signal='SHORT_REVERSION', reason='x', close=100, sma=98.25, atr=0.8)
+    )
+    assert long_plan.target_price == 101.75
+    assert short_plan.target_price == 98.25

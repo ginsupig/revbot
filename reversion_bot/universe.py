@@ -23,7 +23,9 @@ from typing import List, Sequence
 NEUTRAL_LARGECAP: List[str] = [
     # info technology
     "AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "CSCO", "ACN", "ADBE", "AMD",
-    "INTC", "QCOM", "TXN", "IBM", "MU", "AMAT", "LRCX", "ADI",
+    "INTC", "QCOM", "TXN", "IBM", "MU", "AMAT", "LRCX", "ADI", "CRWD",
+    # ai and memory
+    "WDC", "SNDK", "SKHY", "MRVL", "NOW", "SMCI", "ARM",
     # communication services
     "GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
     # consumer discretionary
@@ -35,7 +37,7 @@ NEUTRAL_LARGECAP: List[str] = [
     # health care
     "UNH", "JNJ", "LLY", "PFE", "MRK", "ABBV", "TMO", "ABT", "BMY", "AMGN",
     # energy
-    "XOM", "CVX", "COP", "SLB", "EOG", "OXY", "MPC",
+    "XOM", "CVX", "COP", "SLB", "EOG", "OXY", "MPC", "GEV",
     # industrials
     "CAT", "BA", "HON", "UPS", "GE", "RTX", "LMT", "DE", "UNP",
     # materials

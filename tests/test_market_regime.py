@@ -10,6 +10,7 @@ from reversion_bot.market_regime import (
     suppress_longs_if_risk_off,
     resolve_sector_regime,
     suppress_longs_by_sector,
+    suppress_shorts_unless_risk_off,
 )
 
 
@@ -49,6 +50,18 @@ def test_suppress_drops_longs_keeps_shorts():
 def test_suppress_noop_when_risk_on():
     cands = [{"symbol": "AAA", "go_long": True}]
     kept, dropped = suppress_longs_if_risk_off(cands, risk_off=False)
+    assert kept == cands and dropped == []
+
+
+def test_shorts_require_confirmed_risk_off():
+    cands = [
+        {"symbol": "AAA", "go_long": True},
+        {"symbol": "BBB", "go_short": True},
+    ]
+    kept, dropped = suppress_shorts_unless_risk_off(cands, risk_off=False)
+    assert [c["symbol"] for c in kept] == ["AAA"]
+    assert [c["symbol"] for c in dropped] == ["BBB"]
+    kept, dropped = suppress_shorts_unless_risk_off(cands, risk_off=True)
     assert kept == cands and dropped == []
 
 

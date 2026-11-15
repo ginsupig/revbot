@@ -71,6 +71,10 @@ def _env_example() -> dict:
 # main.py and .env.example — this test exists to force that.
 EXPECTED_DEFAULTS = {
     "ENABLE_SHORTS": "false",
+    "REQUIRE_RISK_OFF_FOR_SHORTS": "true",
+    "REQUIRE_SHORT_REJECT": "true",
+    "REQUIRE_SHORT_BEARISH_CLOSE": "true",
+    "SHORT_TREND_FILTER_BAND_PCT": "0.0",
     "USE_TREND_FILTER": "True",
     "USE_TRAILING_STOP": "true",
     "USE_MARKET_REGIME_FILTER": "true",

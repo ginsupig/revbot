@@ -145,6 +145,16 @@ class ReversionEngine:
                 dollar_volume=dollar_volume,
             )
 
+        if self.config.require_spread_data and spread_bps is None:
+            return SafetyDecision(
+                False,
+                "Spread_Data_Missing",
+                adx=adx,
+                rsi=rsi,
+                spread_bps=None,
+                dollar_volume=dollar_volume,
+            )
+
         if adx is not None and adx >= self.config.adx_hard_max and rsi >= self.config.rsi_hard_max:
             return SafetyDecision(
                 False,
@@ -232,7 +242,9 @@ class ReversionEngine:
             if direction == "long":
                 trend_ok = close >= trend_ema * (1.0 - config.trend_filter_band_pct)
             else:  # short
-                trend_ok = close <= trend_ema * (1.0 + config.trend_filter_band_pct)
+                trend_ok = close <= trend_ema * (
+                    1.0 + config.short_trend_filter_band_pct
+                )
 
         return reclaim_ok, volume_ok, vwap_ok, trend_ok
 
@@ -366,7 +378,8 @@ class ReversionEngine:
         # Long setup did not validate. The long and short zones are mutually
         # exclusive (price can't be at/below lb1 and at/above ub1 at once), so
         # we only reach a short setup when there was no long to begin with.
-        if self.config.enable_shorts and ub1 is not None and ub2 is not None:
+        if (self.config.enable_shorts and ub1 is not None and ub2 is not None
+                and close >= ub1):
             short_decision = self._evaluate_short(
                 row=row,
                 prev=prev,
@@ -440,10 +453,18 @@ class ReversionEngine:
         """
         adx = float(row["adx"])
 
+        def rejected(reason: str) -> ReversionDecision:
+            return ReversionDecision(
+                signal="WAIT", reason=reason, symbol=symbol, close=close,
+                lb1=lb1, lb2=lb2, ub1=ub1, ub2=ub2, sma=sma, ri=ri,
+                rsi=current_rsi, adx=adx, atr=atr, vwap=vwap,
+                spread_bps=safety.spread_bps, dollar_volume=safety.dollar_volume,
+            )
+
         # Reflected hard guard: don't short a capitulation that is also strongly
         # trending down (mirror of the long blow-off-top block in is_market_safe).
         if adx >= self.config.adx_hard_max and current_rsi <= self.config.rsi_hard_min:
-            return None
+            return rejected("Short_Downtrend_Too_Extended")
 
         # ADX trend-strength veto — the exact mirror of the long side's
         # ADX_Trend_Too_Strong gate. Shorting an "overbought rip" inside a
@@ -451,12 +472,12 @@ class ReversionEngine:
         # way the short side bleeds; the long side already refused entries at
         # this trend strength while the short side had no equivalent check.
         if adx > self.config.adx_max:
-            return None
+            return rejected("Short_ADX_Trend_Too_Strong")
 
         # Price must be at or above ub1 (or inside the ub1–ub2 band).
         in_short_zone = close >= ub1
         if not in_short_zone:
-            return None
+            return rejected("Not_In_Short_Reversion_Zone")
 
         rsi_min = self.config.risk_off_rsi_min if short_bias else self.config.rsi_min
         ri_short_threshold = (
@@ -469,7 +490,7 @@ class ReversionEngine:
             and current_rsi >= rsi_min
         )
         if not overbought:
-            return None
+            return rejected("RI_Not_Overbought")
 
         bearish_close = True
         if prev is not None:
@@ -484,14 +505,14 @@ class ReversionEngine:
             direction="short"
         )
 
-        if self.config.require_reclaim_lb1 and not reject_ub1:
-            return None
-        if self.config.require_bullish_close and not bearish_close:
-            return None
+        if (self.config.require_reclaim_lb1 or self.config.require_short_reject) and not reject_ub1:
+            return rejected("No_Upper_Band_Reject_Trigger")
+        if (self.config.require_bullish_close or self.config.require_short_bearish_close) and not bearish_close:
+            return rejected("No_Bearish_Confirmation")
         if self.config.require_volume_expansion and not volume_ok:
-            return None
+            return rejected("No_Short_Volume_Expansion")
         if not vwap_ok or not trend_ok:
-            return None
+            return rejected("Short_Confirmation_Filter_Failed")
 
         return ReversionDecision(
             signal="SHORT_REVERSION",

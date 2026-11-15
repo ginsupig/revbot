@@ -48,7 +48,7 @@ from alpaca.trading.enums import (
     AssetClass,
 )
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.enums import Adjustment
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.requests import StockLatestTradeRequest, StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
@@ -220,9 +220,11 @@ class AlpacaPyClient:
         # alpaca-py returns {symbol: Trade}; legacy returned the Trade directly.
         return resp[symbol] if isinstance(resp, dict) else resp
 
-    def get_latest_quote(self, symbol: str):
+    def get_latest_quote(self, symbol: str, feed: str | None = None):
+        # Same signature as the legacy REST client: feed=None is the SDK default.
+        kwargs = {"feed": DataFeed(feed)} if feed else {}
         resp = self._data.get_stock_latest_quote(
-            StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            StockLatestQuoteRequest(symbol_or_symbols=symbol, **kwargs)
         )
         return resp[symbol] if isinstance(resp, dict) else resp
 

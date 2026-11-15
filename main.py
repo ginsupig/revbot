@@ -29,6 +29,7 @@ from reversion_bot.symbol_params import load_symbol_params, build_symbol_configs
 from reversion_bot.single_instance import acquire_lock, release_lock
 from reversion_bot.schedule import session_done, within_minutes_before_close
 from reversion_bot.heartbeat import write_heartbeat
+from reversion_bot.live_config import parse_bool, risk_config_from_env, strategy_config_from_env
 from reversion_bot.market_regime import (
     is_risk_off,
     suppress_longs_if_risk_off,
@@ -157,25 +158,6 @@ def preflight_check(executor, paper: bool) -> bool:
               "short signals will be rejected by the broker.")
     return True
 
-def parse_bool(value: str, default: bool = False) -> bool:
-    """Parse an env-style boolean, falling back to `default` for empty or
-    unrecognized values. The old version returned False for anything outside
-    the truthy set — so a blanked line (`USE_TRAILING_STOP=`) or a typo
-    ("Ture") silently disabled default-ON safety features (regime gate,
-    trailing stop, carryover flatten, trend filter).
-    """
-    if value is None:
-        return default
-    s = str(value).strip().lower()
-    if s == "":
-        return default
-    if s in {"1", "true", "yes", "y", "on"}:
-        return True
-    if s in {"0", "false", "no", "n", "off"}:
-        return False
-    print(f"[CONFIG] Unrecognized boolean {value!r} — using default={default}.")
-    return default
-
 def bars_per_trading_day(timeframe: str) -> int:
     """Regular-session bars per trading day for an Alpaca timeframe string.
 
@@ -236,6 +218,25 @@ def completed_bars_only(bars, timeframe: str, now_utc: datetime | None = None):
     import pandas as pd
     timestamps = pd.to_datetime(bars["date"], utc=True, errors="coerce")
     return bars.loc[timestamps <= now - timedelta(seconds=seconds)].reset_index(drop=True)
+
+
+def spread_quote_feed() -> str | None:
+    """Quote feed for the spread gate (env SPREAD_QUOTE_FEED; unset = SDK default).
+
+    On the free data plan the default feed is IEX, whose quote is IEX's own book,
+    not the NBBO: on 2026-11-13 the median IEX spread was 1609 bps on ARM and
+    699 on CRWD against 12 on SIP, so the 40 bps gate rejected liquid names all
+    day. "delayed_sip" is the 15-minute-delayed NBBO that plan allows: stale,
+    but a real market spread, and entries are limit orders, so a fresh spread
+    blowout can't fill far from the plan.
+    """
+    feed = (os.getenv("SPREAD_QUOTE_FEED") or "").strip().lower()
+    return feed or None
+
+
+def fetch_spread_quote(client, symbol: str):
+    feed = spread_quote_feed()
+    return client.get_latest_quote(symbol, feed=feed) if feed else client.get_latest_quote(symbol)
 
 
 def attach_quote_spread(bars, quote):
@@ -366,7 +367,7 @@ async def evaluate_symbol_only(symbol, lookback, timeframe, service, executor,
 
         bars = bars.tail(lookback)
         try:
-            quote = await asyncio.to_thread(executor.client.get_latest_quote, symbol)
+            quote = await asyncio.to_thread(fetch_spread_quote, executor.client, symbol)
             bars = attach_quote_spread(bars, quote)
         except Exception:
             pass  # live strategy config fails closed on the missing spread
@@ -924,74 +925,8 @@ async def main():
     sector_combine = (os.getenv("SECTOR_REGIME_COMBINE", "or") or "or").strip().lower()
 
     # 2. INITIALIZE CONFIGURATIONS FIRST
-    strategy_config = ReversionConfig(
-        min_history=lookback,
-        min_dollar_volume=float(os.getenv("MIN_DOLLAR_VOLUME", 750000.0)),
-        min_price=float(os.getenv("MIN_PRICE", 2.0)),
-        max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", 40.0)),
-        require_spread_data=parse_bool(os.getenv("REQUIRE_SPREAD_DATA", "True"), default=True),
-        # Bollinger band entry zone (lb1/lb2 = sma -/+ band_std * std).
-        band_length=int(os.getenv("BAND_LENGTH", 20)),
-        band_std_1=float(os.getenv("BAND_STD_1", 1.0)),
-        band_std_2=float(os.getenv("BAND_STD_2", 2.0)),
-        # Indicator lookbacks.
-        ri_length=int(os.getenv("RI_LENGTH", 20)),
-        rsi_length=int(os.getenv("RSI_LENGTH", 14)),
-        adx_length=int(os.getenv("ADX_LENGTH", 14)),
-        trend_ema_length=int(os.getenv("TREND_EMA_LENGTH", 50)),
-        # Long oversold gates.
-        ri_threshold=float(os.getenv("RI_THRESHOLD", -0.5)),
-        rsi_max=float(os.getenv("RSI_MAX", 40.0)),
-        oversold_gate=os.getenv("OVERSOLD_GATE", "and"),
-        adx_max=float(os.getenv("ADX_MAX", 40.0)),
-        adx_hard_max=float(os.getenv("ADX_HARD_MAX", 50.0)),
-        rsi_hard_max=float(os.getenv("RSI_HARD_MAX", 70.0)),
-        max_vwap_extension_pct=float(os.getenv("MAX_VWAP_EXTENSION_PCT", 0.012)),
-        require_reclaim_lb1=parse_bool(os.getenv("REQUIRE_RECLAIM_LB1", "False")),
-        require_bullish_close=parse_bool(os.getenv("REQUIRE_BULLISH_CLOSE", "False")),
-        require_volume_expansion=parse_bool(os.getenv("REQUIRE_VOLUME_EXPANSION", "False")),
-        use_vwap_filter=parse_bool(os.getenv("USE_VWAP_FILTER", "False")),
-        use_trend_filter=parse_bool(os.getenv("USE_TREND_FILTER", "True")),
-        trend_filter_band_pct=float(os.getenv("TREND_FILTER_BAND_PCT", 0.02)),
-        loss_reentry_cooldown_minutes=int(os.getenv("LOSS_REENTRY_COOLDOWN_MINUTES", 90)),
-        # Volume confirmation.
-        volume_lookback=int(os.getenv("VOLUME_LOOKBACK", 20)),
-        volume_multiplier_min=float(os.getenv("VOLUME_MULTIPLIER_MIN", 1.0)),
-        # Trend-fail strategy.
-        trendfail_window=int(os.getenv("TRENDFAIL_WINDOW", 20)),
-        trendfail_threshold=float(os.getenv("TRENDFAIL_THRESHOLD", 0.005)),
-        # Short side (mirror) gates. Off by default: OOS backtest showed shorts
-        # bleeding on daily large-caps (8% WR). Enable with ENABLE_SHORTS=True
-        # paired with USE_MARKET_REGIME_FILTER + FAVOR_SHORTS_IN_RISK_OFF to
-        # only short in confirmed downtrends.
-        enable_shorts=parse_bool(os.getenv("ENABLE_SHORTS", "False"), default=False),
-        ri_short_threshold=float(os.getenv("RI_SHORT_THRESHOLD", 0.5)),
-        rsi_min=float(os.getenv("RSI_MIN", 65.0)),
-        rsi_hard_min=float(os.getenv("RSI_HARD_MIN", 30.0)),
-        risk_off_rsi_min=float(os.getenv("RISK_OFF_RSI_MIN", 55.0)),
-        risk_off_ri_short_threshold=float(os.getenv("RISK_OFF_RI_SHORT_THRESHOLD", 0.30)),
-        require_short_reject=parse_bool(os.getenv("REQUIRE_SHORT_REJECT", "True"), default=True),
-        require_short_bearish_close=parse_bool(
-            os.getenv("REQUIRE_SHORT_BEARISH_CLOSE", "True"), default=True
-        ),
-        short_trend_filter_band_pct=float(os.getenv("SHORT_TREND_FILTER_BAND_PCT", 0.0)),
-    )
-
-    risk_config = RiskConfig(
-        risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", 0.005)),
-        max_position_value_pct=float(os.getenv("MAX_POSITION_VALUE_PCT", 0.15)),
-        min_rr=float(os.getenv("MIN_RR", 1.5)),
-        # Per-style ATR stop/target multiples.
-        stop_atr_multiple=float(os.getenv("STOP_ATR_MULTIPLE", 1.20)),
-        target_atr_multiple=float(os.getenv("TARGET_ATR_MULTIPLE", 3.50)),
-        trail_atr_multiple=float(os.getenv("TRAIL_ATR_MULTIPLE", 1.50)),
-        trend_stop_atr_multiple=float(os.getenv("TREND_STOP_ATR_MULTIPLE", 1.20)),
-        trend_target_atr_multiple=float(os.getenv("TREND_TARGET_ATR_MULTIPLE", 3.00)),
-        trendfail_stop_atr_multiple=float(os.getenv("TRENDFAIL_STOP_ATR_MULTIPLE", 1.10)),
-        trendfail_target_atr_multiple=float(os.getenv("TRENDFAIL_TARGET_ATR_MULTIPLE", 2.20)),
-        atr_length=int(os.getenv("ATR_LENGTH", 14)),
-        atr_floor_pct=float(os.getenv("ATR_FLOOR_PCT", 0.0035)),
-    )
+    strategy_config = strategy_config_from_env(lookback)
+    risk_config = risk_config_from_env()
 
     if not base_url:
         raise ValueError("Missing APCA_API_BASE_URL in .env file.")
